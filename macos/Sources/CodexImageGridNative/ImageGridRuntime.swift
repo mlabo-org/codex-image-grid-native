@@ -634,6 +634,43 @@ enum ImageGridJobSelection {
     }
 }
 
+struct ImageGridFailureNoticeTracker {
+    private var observedActiveJobIDs: Set<String> = []
+    private var unacknowledgedFailureIDs: Set<String> = []
+
+    var unacknowledgedCount: Int {
+        unacknowledgedFailureIDs.count
+    }
+
+    mutating func observe(previous: ImageGridJob?, incoming: ImageGridJob) {
+        if incoming.isActive {
+            observedActiveJobIDs.insert(incoming.id)
+            return
+        }
+
+        if incoming.status == "error",
+           previous?.isActive == true || observedActiveJobIDs.contains(incoming.id)
+        {
+            unacknowledgedFailureIDs.insert(incoming.id)
+        }
+        observedActiveJobIDs.remove(incoming.id)
+    }
+
+    mutating func acknowledgeFailures() {
+        unacknowledgedFailureIDs.removeAll()
+    }
+
+    mutating func removeJobs(withIDs jobIDs: Set<String>) {
+        observedActiveJobIDs.subtract(jobIDs)
+        unacknowledgedFailureIDs.subtract(jobIDs)
+    }
+
+    mutating func retainJobs(withIDs jobIDs: Set<String>) {
+        observedActiveJobIDs.formIntersection(jobIDs)
+        unacknowledgedFailureIDs.formIntersection(jobIDs)
+    }
+}
+
 @MainActor
 final class ImageGridStore: ObservableObject {
     @Published private(set) var jobs: [String: ImageGridJob] = [:]
@@ -641,6 +678,7 @@ final class ImageGridStore: ObservableObject {
     @Published private(set) var generatedDirectory: URL?
     @Published private(set) var isSubmitting = false
     @Published private(set) var isAnalyzing = false
+    @Published private(set) var unacknowledgedFailureCount = 0
     @Published var generationMessage: String?
     @Published var referenceAnalysisMessage: String?
 
@@ -653,6 +691,7 @@ final class ImageGridStore: ObservableObject {
     private var clearedJobIDs: Set<String> = []
     private var retainedCompletedLimit: Int? = ImageGridJobSelection.maximumCompletedJobs
     private var connectivityMessage: String?
+    private var failureNoticeTracker = ImageGridFailureNoticeTracker()
 
     init(
         client: ImageGridAPIClient = ImageGridAPIClient(),
@@ -791,13 +830,21 @@ final class ImageGridStore: ObservableObject {
     func clearTerminalJobs() {
         clearedBefore = Int64(Date().timeIntervalSince1970 * 1_000)
         let terminal = jobs.values.filter { !$0.isActive }
+        let terminalIDs = Set(terminal.map(\.id))
         for job in terminal {
             clearedJobIDs.insert(job.id)
             jobs.removeValue(forKey: job.id)
         }
+        failureNoticeTracker.removeJobs(withIDs: terminalIDs)
+        synchronizeFailureNoticeCount()
         if clearedJobIDs.count > 512 {
             clearedJobIDs = Set(clearedJobIDs.suffix(512))
         }
+    }
+
+    func acknowledgeFailureNotice() {
+        failureNoticeTracker.acknowledgeFailures()
+        synchronizeFailureNoticeCount()
     }
 
     func openGeneratedDirectory() {
@@ -923,6 +970,7 @@ final class ImageGridStore: ObservableObject {
             if existing == job {
                 continue
             }
+            failureNoticeTracker.observe(previous: existing, incoming: job)
             mergedJobs[job.id] = job
         }
         let retained = ImageGridJobSelection.retained(
@@ -931,6 +979,8 @@ final class ImageGridStore: ObservableObject {
         )
         let retainedIDs = Set(retained.map(\.id))
         mergedJobs = mergedJobs.filter { retainedIDs.contains($0.key) }
+        failureNoticeTracker.retainJobs(withIDs: retainedIDs)
+        synchronizeFailureNoticeCount()
         guard mergedJobs != jobs else { return }
 
         jobs = mergedJobs
@@ -944,8 +994,17 @@ final class ImageGridStore: ObservableObject {
         )
         let retainedIDs = Set(retained.map(\.id))
         let prunedJobs = jobs.filter { retainedIDs.contains($0.key) }
+        failureNoticeTracker.retainJobs(withIDs: retainedIDs)
+        synchronizeFailureNoticeCount()
         if prunedJobs != jobs {
             jobs = prunedJobs
+        }
+    }
+
+    private func synchronizeFailureNoticeCount() {
+        let count = failureNoticeTracker.unacknowledgedCount
+        if unacknowledgedFailureCount != count {
+            unacknowledgedFailureCount = count
         }
     }
 
