@@ -3947,7 +3947,7 @@ done
                 retry_base: Duration::ZERO,
                 rate_limit_cooldown: Duration::ZERO,
                 rate_limit_cooldown_max: Duration::ZERO,
-                job_timeout: Duration::from_secs(1),
+                job_timeout: Duration::from_secs(5),
             },
         );
         let (_, response) = runtime
@@ -3955,7 +3955,7 @@ done
                 &json!({
                     "prompts": ["recover missing output"],
                     "count": 1,
-                    "waitMs": 2000
+                    "waitMs": 7000
                 }),
                 true,
                 None,
@@ -4022,7 +4022,7 @@ done
                 retry_base: Duration::ZERO,
                 rate_limit_cooldown: Duration::from_millis(15),
                 rate_limit_cooldown_max: Duration::from_millis(15),
-                job_timeout: Duration::from_secs(1),
+                job_timeout: Duration::from_secs(5),
             },
         );
         let (_, response) = runtime
@@ -4030,7 +4030,7 @@ done
                 &json!({
                     "prompts": ["recover rate limit"],
                     "count": 1,
-                    "waitMs": 2000
+                    "waitMs": 7000
                 }),
                 true,
                 None,
@@ -4089,6 +4089,11 @@ done
                 rate_limit_cooldown_max: Duration::ZERO,
                 job_timeout: Duration::from_secs(1),
             },
+        );
+        let diagnostics = runtime.inner.app_server.ensure_ready().await;
+        assert!(
+            diagnostics.ready,
+            "timeout fixture App Server must initialize before the attempt deadline: {diagnostics:?}"
         );
         let (_, response) = runtime
             .create_run(
