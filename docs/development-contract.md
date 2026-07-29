@@ -44,5 +44,6 @@ The first runnable native release must contain one semantic bundle covering:
 5. parity of status, artifacts, diagnostics, and error semantics against the
    frozen baseline.
 
-The plugin `.mcp.json` remains intentionally unconnected until the MCP binary
-and launch route pass the first runnable slice.
+The plugin `.mcp.json` was connected after the provider-free HTTP/MCP bundle
+and one live MCP-to-App-Server-to-SwiftUI primary path passed. It targets the
+release Rust binaries on the separate native development port 4322.

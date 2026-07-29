@@ -8,10 +8,9 @@ observable behavior will match the frozen Electron baseline at:
 `/Users/suzukimakoto/plugins/codex-image-grid`
 
 The old repository remains the baseline and is not edited by this project.
-This repository is not activated as a Codex runtime until the Rust server and
-MCP binary implement the declared contract. The empty `.mcp.json` is
-intentional during this preparation phase: an incomplete MCP route must not be
-advertised as runnable.
+The Rust server, MCP binary, and SwiftUI primary path have passed the
+provider-free and live App Server acceptance slices. `.mcp.json` now connects
+the validated native release binaries on the separate development port 4322.
 
 The detailed baseline contract is [docs/frozen-baseline-spec.md](docs/frozen-baseline-spec.md).
 It records the frozen source commit, observable API/MCP/job/artifact behavior,
@@ -63,20 +62,27 @@ The provider-free first runnable slice now includes:
   generation-option, reference-image, and result-filter controls, plus
   health/preflight/run calls, SSE progress, validated/downscaled
   choose/drop/paste references, reference analysis states, native file
-  actions, and adaptive result cards.
+  actions, and adaptive result cards;
+- persisted draft/reference restoration, bounded long-session result
+  retention, restart-safe run restoration, Finder-compatible host routes, and
+  graceful owned-runtime shutdown with joined-runtime preservation.
 
 The provider-free fixture now completes real HTTP and MCP runs through the
 owned App Server transport and validates generated images, local reference
 copy staging, compatible MCP handoff fields, run responses, manifests,
 history, artifact routes, bounded recovery, and reference analysis.
-Live-provider confirmation, restart restoration, and the full native launch
-handoff remain in progress. `.mcp.json` remains intentionally empty until the
-live primary path and native UI launch route are smoke-validated.
+The live acceptance slice completed one real MCP-launched App Server image run,
+then restored that run in the SwiftUI app. It also exercised native
+choose/clear reference handling, language/theme and engine switches,
+single/batch prompts, flexible two-column and narrow one-column layouts, and
+owned/joined runtime shutdown. `.mcp.json` is connected only after those checks.
 
-## First checks
+## Build and checks
 
 ```bash
 scripts/check.sh
+cargo build --release --workspace
+swift build -c release --package-path macos
 ```
 
 The check script validates the Rust workspace and Swift package scaffold. It
@@ -85,6 +91,10 @@ analysis, complete one-image run/artifact, and MCP process smoke with an
 isolated temporary native data root. It does not start a provider, launch or
 modify the frozen Electron app, refresh plugin cache, connect `.mcp.json`, or
 write runtime state into this repository.
+
+The release builds materialize the binaries referenced by `.mcp.json` and the
+native app executable. Runtime data remains under
+`~/Library/Application Support/codex-image-grid-native`.
 
 ## Runtime identity during migration
 
