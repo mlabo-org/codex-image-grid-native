@@ -34,15 +34,18 @@ printf '%s\n' \
   'while IFS= read -r line; do' \
   '  case "$line" in' \
   '    *'"'"'"method":"initialize"'"'"'*)' \
-  '      printf '"'"'%s\n'"'"' '"'"'{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'"'"'' \
+  '      request_id="$(printf "%s" "$line" | jq --raw-output ".id")"' \
+  '      printf '"'"'{"id":%s,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}\n'"'"' "$request_id"' \
   '      ;;' \
   '    *'"'"'"method":"initialized"'"'"'*)' \
   '      ;;' \
   '    *'"'"'"method":"thread/start"'"'"'*)' \
-  '      printf '"'"'%s\n'"'"' '"'"'{"id":2,"result":{"thread":{"id":"fixture-thread"}}}'"'"'' \
+  '      request_id="$(printf "%s" "$line" | jq --raw-output ".id")"' \
+  '      printf '"'"'{"id":%s,"result":{"thread":{"id":"fixture-thread"}}}\n'"'"' "$request_id"' \
   '      ;;' \
   '    *'"'"'"method":"turn/start"'"'"'*)' \
-  '      printf '"'"'%s\n'"'"' '"'"'{"id":3,"result":{"turn":{"id":"fixture-turn"}}}'"'"'' \
+  '      request_id="$(printf "%s" "$line" | jq --raw-output ".id")"' \
+  '      printf '"'"'{"id":%s,"result":{"turn":{"id":"fixture-turn"}}}\n'"'"' "$request_id"' \
   '      printf '"'"'%s\n'"'"' '"'"'{"method":"item/completed","params":{"threadId":"fixture-thread","turnId":"fixture-turn","item":{"type":"imageGeneration","id":"fixture-image","status":"completed","revisedPrompt":null,"result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}}'"'"'' \
   '      printf '"'"'%s\n'"'"' '"'"'{"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'"'"'' \
   '      ;;' \
@@ -50,6 +53,13 @@ printf '%s\n' \
   'done' \
   >"$fake_codex"
 chmod 755 "$fake_codex"
+
+expected_image_path="$temporary_root/expected.png"
+reference_image="$temporary_root/reference.jpeg"
+printf '%s' \
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=' \
+  | /usr/bin/base64 -D >"$expected_image_path"
+cp "$expected_image_path" "$reference_image"
 
 IMAGE_GRID_CODEX_BIN="$fake_codex" "$repo_root/target/debug/image-grid-server" \
   --bind 127.0.0.1:0 \
@@ -145,10 +155,23 @@ jq --exit-status \
   ' "$ready_health_json" >/dev/null
 
 run_json="$temporary_root/run.json"
+run_request="$temporary_root/run-request.json"
+jq --null-input \
+  --arg referenceImagePath "$reference_image" \
+  '{
+    prompts: ["fixture prompt"],
+    count: 1,
+    mood: "warm-mascot",
+    engine: "app-server-image",
+    aspectRatio: "16:9",
+    referenceImagePath: $referenceImagePath,
+    waitMs: 5000
+  }' \
+  >"$run_request"
 curl --fail --silent --show-error \
   --request POST \
   --header 'content-type: application/json' \
-  --data '{"prompts":["fixture prompt"],"count":1,"mood":"warm-mascot","engine":"app-server-image","aspectRatio":"16:9","waitMs":5000}' \
+  --data-binary @"$run_request" \
   "$server_url/api/run-batch" \
   >"$run_json"
 jq --exit-status \
@@ -161,6 +184,8 @@ jq --exit-status \
     and .outputs[0].filename == "variant-01.png"
     and .outputs[0].threadId == "fixture-thread"
     and .outputs[0].turnId == "fixture-turn"
+    and (.outputs[0].referenceImagePath | endswith("/reference.jpg"))
+    and (.outputs[0].referenceImageUrl | endswith("/reference.jpg"))
   ' "$run_json" >/dev/null
 
 image_url="$(jq --raw-output '.outputs[0].imageUrl' "$run_json")"
@@ -168,12 +193,9 @@ manifest_url="$(jq --raw-output '.manifestUrl' "$run_json")"
 handoff_url="$(jq --raw-output '.handoffUrl' "$run_json")"
 run_id="$(jq --raw-output '.runId' "$run_json")"
 image_path="$temporary_root/generated.png"
-expected_image_path="$temporary_root/expected.png"
 curl --fail --silent --show-error "$server_url$image_url" >"$image_path"
-printf '%s' \
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=' \
-  | /usr/bin/base64 -D >"$expected_image_path"
 cmp "$expected_image_path" "$image_path"
+cmp "$reference_image" "$data_root/generated/$run_id/reference.jpg"
 
 manifest_path="$temporary_root/manifest.json"
 handoff_path="$temporary_root/handoff.md"
@@ -198,17 +220,41 @@ for route in \
   curl --fail --silent --show-error "$server_url$route" >/dev/null
 done
 
-mcp_output="$temporary_root/mcp.jsonl"
+mcp_input="$temporary_root/mcp-input.jsonl"
+mcp_output="$temporary_root/mcp-output.jsonl"
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"native-smoke","version":"0.1.0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"generate_image_grid","arguments":{"prompts":[]}}}' \
-  | "$repo_root/target/debug/image-grid-mcp" >"$mcp_output"
+  >"$mcp_input"
+jq --compact-output --null-input \
+  --arg referenceImagePath "$reference_image" \
+  '{
+    jsonrpc: "2.0",
+    id: 4,
+    method: "tools/call",
+    params: {
+      name: "generate_image_grid",
+      arguments: {
+        prompts: ["MCP fixture prompt"],
+        count: 1,
+        mood: "warm-mascot",
+        engine: "app-server-image",
+        aspectRatio: "16:9",
+        referenceImagePath: $referenceImagePath,
+        waitMs: 5000
+      }
+    }
+  }' \
+  >>"$mcp_input"
+IMAGE_GRID_URL="$server_url" \
+  "$repo_root/target/debug/image-grid-mcp" <"$mcp_input" >"$mcp_output"
 
 jq --slurp --exit-status \
+  --arg serverUrl "$server_url" \
   '
-    length == 3
+    length == 4
     and .[0].id == 1
     and .[0].result.protocolVersion == "2025-06-18"
     and .[0].result.serverInfo.name == "codex-image-grid-native"
@@ -230,6 +276,30 @@ jq --slurp --exit-status \
         "isError": true
       }
     }
+    and .[3].id == 4
+    and .[3].result.isError == false
+    and .[3].result.structuredContent.status == "done"
+    and .[3].result.structuredContent.completed == true
+    and .[3].result.structuredContent.serverStarted == false
+    and .[3].result.structuredContent.health.app == "codex-image-grid-native"
+    and .[3].result.structuredContent.health.appServerImageReady == true
+    and .[3].result.structuredContent.server.app == "codex-image-grid-native"
+    and .[3].result.structuredContent.statusUrl
+      == ($serverUrl + "/api/runs/" + .[3].result.structuredContent.runId)
+    and (.[3].result.structuredContent.outputPaths | length) == 1
+    and (.[3].result.structuredContent.imageUrls | length) == 1
+    and (.[3].result.structuredContent.imageUrls[0] | startswith($serverUrl + "/generated/"))
+    and (.[3].result.structuredContent.codexMarkdown | contains($serverUrl + "/generated/"))
+    and (.[3].result.structuredContent.outputs[0].referenceImagePath
+      | endswith("/reference.jpg"))
+    and (.[3].result.content[0].text | contains("runId: "))
   ' "$mcp_output" >/dev/null
+
+mcp_run_id="$(jq --slurp --raw-output '.[3].result.structuredContent.runId' "$mcp_output")"
+mcp_image_url="$(jq --slurp --raw-output '.[3].result.structuredContent.imageUrls[0]' "$mcp_output")"
+mcp_image_path="$temporary_root/mcp-generated.png"
+curl --fail --silent --show-error "$mcp_image_url" >"$mcp_image_path"
+cmp "$expected_image_path" "$mcp_image_path"
+cmp "$reference_image" "$data_root/generated/$mcp_run_id/reference.jpg"
 
 echo "first runnable slice smoke: ok"
