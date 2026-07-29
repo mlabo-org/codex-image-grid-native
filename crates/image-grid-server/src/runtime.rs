@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const APP_SERVER_JOB_TIMEOUT: Duration = Duration::from_secs(900);
+const CODEX_SVG_CONCURRENCY: usize = 1;
 
 const MOODS: [&str; 5] = [
     "warm-mascot",
@@ -270,6 +271,7 @@ struct RuntimeInner {
     runs: RwLock<HashMap<String, RunRecord>>,
     events: broadcast::Sender<RuntimeEvent>,
     image_slots: Arc<Semaphore>,
+    svg_slots: Arc<Semaphore>,
     queued_jobs: AtomicUsize,
     artifact_write: Mutex<()>,
 }
@@ -290,6 +292,7 @@ impl GenerationRuntime {
                 runs: RwLock::new(HashMap::new()),
                 events,
                 image_slots: Arc::new(Semaphore::new(MAX_RUN_JOBS)),
+                svg_slots: Arc::new(Semaphore::new(CODEX_SVG_CONCURRENCY)),
                 queued_jobs: AtomicUsize::new(0),
                 artifact_write: Mutex::new(()),
             }),
@@ -474,12 +477,21 @@ impl GenerationRuntime {
         );
 
         for job in &created {
-            self.inner.queued_jobs.fetch_add(1, Ordering::Relaxed);
+            let is_svg = job.engine == "codex-svg";
+            if !is_svg {
+                self.inner.queued_jobs.fetch_add(1, Ordering::Relaxed);
+            }
             let runtime = self.clone();
             let job_id = job.id.clone();
             tokio::spawn(async move {
-                let permit = runtime.inner.image_slots.clone().acquire_owned().await;
-                runtime.inner.queued_jobs.fetch_sub(1, Ordering::Relaxed);
+                let permit = if is_svg {
+                    runtime.inner.svg_slots.clone().acquire_owned().await
+                } else {
+                    runtime.inner.image_slots.clone().acquire_owned().await
+                };
+                if !is_svg {
+                    runtime.inner.queued_jobs.fetch_sub(1, Ordering::Relaxed);
+                }
                 let Ok(_permit) = permit else {
                     runtime
                         .fail_job(
@@ -667,12 +679,7 @@ impl GenerationRuntime {
             return;
         };
         if job.engine == "codex-svg" {
-            self.fail_job(
-                job_id,
-                "CodexSvgNotImplemented",
-                "codex-svg generation is not implemented yet",
-            )
-            .await;
+            self.run_codex_svg_job(job_id).await;
             return;
         }
         self.update_job(job_id, |job, now| {
@@ -901,6 +908,309 @@ impl GenerationRuntime {
         }
     }
 
+    async fn run_codex_svg_job(&self, job_id: &str) {
+        self.update_job(job_id, |job, now| {
+            job.status = "starting".to_owned();
+            job.status_text = "Starting Codex thread...".to_owned();
+            job.timing.transition("starting", now);
+        })
+        .await;
+
+        let client = match self.inner.app_server.ready_client().await {
+            Ok(client) => client,
+            Err(diagnostics) => {
+                let error = diagnostics
+                    .error
+                    .unwrap_or_else(|| crate::AppServerDiagnosticError {
+                        code: "AppServerUnavailable".to_owned(),
+                        message: "Codex App Server is not ready".to_owned(),
+                    });
+                self.fail_job(job_id, &error.code, &error.message).await;
+                return;
+            }
+        };
+        let mut notifications = client.subscribe();
+        let thread_result = client
+            .request(
+                "thread/start",
+                json!({
+                    "cwd": display_path(&self.inner.config.workspace_dir),
+                    "approvalPolicy": "never",
+                    "sandbox": "workspace-write",
+                    "serviceName": "codex_image_grid",
+                    "ephemeral": true
+                }),
+                APP_SERVER_REQUEST_TIMEOUT,
+            )
+            .await;
+        let thread_result = match thread_result {
+            Ok(result) => result,
+            Err(error) => {
+                self.fail_job(job_id, &error.code, &error.message).await;
+                return;
+            }
+        };
+        let Some(thread_id) = thread_result
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            self.fail_job(
+                job_id,
+                "AppServerThreadStartFailed",
+                "thread/start response did not include thread.id",
+            )
+            .await;
+            return;
+        };
+        self.update_job(job_id, |job, now| {
+            job.thread_id = Some(thread_id.clone());
+            job.status = "running".to_owned();
+            job.status_text = "Generating...".to_owned();
+            job.timing.transition("running", now);
+        })
+        .await;
+
+        let Some(current_job) = self.job(job_id).await else {
+            return;
+        };
+        let turn_result = client
+            .request(
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "input": [{
+                        "type": "text",
+                        "text": build_svg_prompt(&current_job),
+                        "text_elements": []
+                    }],
+                    "cwd": display_path(&self.inner.config.workspace_dir),
+                    "approvalPolicy": "never",
+                    "sandboxPolicy": {
+                        "type": "workspaceWrite",
+                        "writableRoots": [display_path(&self.inner.config.data_dir)],
+                        "networkAccess": false,
+                        "excludeTmpdirEnvVar": false,
+                        "excludeSlashTmp": false
+                    },
+                    "effort": "medium"
+                }),
+                APP_SERVER_REQUEST_TIMEOUT,
+            )
+            .await;
+        let turn_result = match turn_result {
+            Ok(result) => result,
+            Err(error) => {
+                self.fail_job(job_id, &error.code, &error.message).await;
+                return;
+            }
+        };
+        let turn_id = turn_result
+            .get("turn")
+            .and_then(|turn| turn.get("id"))
+            .or_else(|| turn_result.get("id"))
+            .or_else(|| turn_result.get("turnId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(turn_id) = &turn_id {
+            self.update_job(job_id, |job, _| {
+                job.turn_id = Some(turn_id.clone());
+            })
+            .await;
+        }
+
+        let deadline = Instant::now() + APP_SERVER_JOB_TIMEOUT;
+        loop {
+            let message = match timeout_at(deadline, notifications.recv()).await {
+                Ok(Ok(message)) => message,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    self.fail_job(
+                        job_id,
+                        "AppServerClosed",
+                        "Codex App Server notification stream closed",
+                    )
+                    .await;
+                    return;
+                }
+                Err(_) => {
+                    if let Some(turn_id) = &turn_id {
+                        let _ = client
+                            .request(
+                                "turn/interrupt",
+                                json!({
+                                    "threadId": thread_id,
+                                    "turnId": turn_id
+                                }),
+                                Duration::from_secs(5),
+                            )
+                            .await;
+                    }
+                    self.fail_job(
+                        job_id,
+                        "CodexSvgTimeout",
+                        "App Server codex-svg generation timed out",
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if notification_thread_id(&message).as_deref() != Some(thread_id.as_str()) {
+                continue;
+            }
+            let method = message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match method {
+                "item/agentMessage/delta" => {
+                    let delta = message["params"]["delta"].as_str().unwrap_or_default();
+                    self.update_job(job_id, |job, _| {
+                        job.log.push_str(delta);
+                        if job.log.len() > 2400 {
+                            let mut split = job.log.len() - 2400;
+                            while !job.log.is_char_boundary(split) {
+                                split += 1;
+                            }
+                            job.log = job.log.split_off(split);
+                        }
+                        job.status_text = "Codex is writing the asset...".to_owned();
+                    })
+                    .await;
+                }
+                "item/completed" => {
+                    let item = &message["params"]["item"];
+                    match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+                        "commandExecution" => {
+                            let detail = item
+                                .get("command")
+                                .and_then(Value::as_str)
+                                .map(|command| format!("Command: {command}"))
+                                .unwrap_or_else(|| "Command completed".to_owned());
+                            self.update_job(job_id, |job, _| {
+                                job.status_text = detail;
+                            })
+                            .await;
+                        }
+                        "fileChange" => {
+                            self.update_job(job_id, |job, _| {
+                                job.status_text = "File change detected".to_owned();
+                            })
+                            .await;
+                        }
+                        _ => {}
+                    }
+                }
+                "turn/started" => {
+                    if let Some(started_turn_id) = message["params"]["turn"]["id"].as_str() {
+                        self.update_job(job_id, |job, _| {
+                            job.turn_id = Some(started_turn_id.to_owned());
+                            job.status_text = "Turn started".to_owned();
+                        })
+                        .await;
+                    }
+                }
+                "turn/completed" => {
+                    self.complete_svg_job(job_id, &message["params"]["turn"])
+                        .await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn complete_svg_job(&self, job_id: &str, turn: &Value) {
+        let Some(job) = self.job(job_id).await else {
+            return;
+        };
+        let turn_status = turn
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed");
+        let turn_id = turn
+            .get("id")
+            .or_else(|| turn.get("turnId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or(job.turn_id.clone());
+        let file_exists = self.job_output_exists(job_id).await;
+        let failed_upstream = is_failure_status(turn_status);
+        let turn_error = turn
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str);
+
+        if file_exists && !failed_upstream {
+            let image_url = format!("/generated/{}/{}", job.run_id, job.filename);
+            self.update_job(job_id, |job, now| {
+                job.status = "done".to_owned();
+                job.status_text = "Generated".to_owned();
+                job.image_url = Some(image_url);
+                job.turn_id = turn_id;
+                job.error_code = None;
+                job.error_message = None;
+                job.upstream_status = None;
+                job.timing.transition("done", now);
+            })
+            .await;
+            return;
+        }
+
+        if file_exists {
+            let image_url = format!("/generated/{}/{}", job.run_id, job.filename);
+            let status_text = turn_error
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Upstream image generation {turn_status}"));
+            self.update_job(job_id, |job, now| {
+                job.status = "error".to_owned();
+                job.status_text = status_text;
+                job.image_url = Some(image_url);
+                job.turn_id = turn_id;
+                job.error_code = None;
+                job.error_message = None;
+                job.upstream_status = Some(turn_status.to_owned());
+                job.diagnostic_log = format!(
+                    "[turn/completed] status={turn_status}{}",
+                    turn_error
+                        .map(|message| format!(" message={message}"))
+                        .unwrap_or_default()
+                );
+                job.timing.transition("error", now);
+            })
+            .await;
+            return;
+        }
+
+        let (error_code, error_message) = if failed_upstream {
+            (
+                "UpstreamImageGenerationFailed",
+                turn_error.unwrap_or("Upstream image generation failed"),
+            )
+        } else {
+            (
+                "ImageOutputMissing",
+                "App Server turn completed without writing the requested image file",
+            )
+        };
+        self.update_job(job_id, |job, now| {
+            job.status = "error".to_owned();
+            job.status_text = format!("{error_message}; No output file was written");
+            job.image_url = None;
+            job.turn_id = turn_id;
+            job.error_code = Some(error_code.to_owned());
+            job.error_message = Some(error_message.to_owned());
+            job.upstream_status = failed_upstream.then(|| turn_status.to_owned());
+            job.diagnostic_log = format!(
+                "[turn/completed] status={turn_status} message={error_message}; \
+                 [missing-output] code={error_code}"
+            );
+            job.timing.transition("error", now);
+        })
+        .await;
+    }
+
     async fn write_job_image(&self, job_id: &str, encoded: &str) -> Result<(), RunApiError> {
         let job = self
             .job(job_id)
@@ -931,7 +1241,7 @@ impl GenerationRuntime {
         let Some(job) = self.job(job_id).await else {
             return false;
         };
-        fs::metadata(&job.output_path)
+        fs::symlink_metadata(&job.output_path)
             .await
             .is_ok_and(|metadata| metadata.is_file())
     }
@@ -1492,6 +1802,41 @@ Composition requirements:\n\
     )
 }
 
+fn build_svg_prompt(job: &ImageGridJob) -> String {
+    let mood = mood_direction(&job.mood);
+    let premise = if job.reference_premise.is_empty() {
+        "No analyzed reference premise is provided."
+    } else {
+        &job.reference_premise
+    };
+    let prompt_label = if job.prompt_total > 1 {
+        format!(
+            "Prompt {} of {}; Variant {} of {}",
+            job.prompt_index, job.prompt_total, job.variant, job.total
+        )
+    } else {
+        format!("Variant {} of {}", job.variant, job.total)
+    };
+    format!(
+        "Create one polished thumbnail-like image as a self-contained SVG file.\n\n\
+Write the SVG to this exact absolute path:\n{}\n\n\
+User concept:\n{}\n\n\
+Reference premise:\n{premise}\n\n\
+Style direction:\n{mood}\n\n\
+Batch position:\n{prompt_label}\n\n\
+Hard requirements:\n\
+- Create exactly one valid SVG file at the path above.\n\
+- Use a 16:9 canvas: viewBox=\"0 0 1280 720\".\n\
+- Keep all assets inline. Do not use remote images, external fonts, or network downloads.\n\
+- Make the composition visibly different from the other variants: vary layout, focal object, accent color, and typographic rhythm.\n\
+- Use readable Japanese text only when useful; keep it short and non-overlapping.\n\
+- Include subtle texture, depth, and a clear focal hierarchy.\n\
+- Do not ask follow-up questions.\n\
+- Finish with one concise sentence that includes \"{}\".\n",
+        job.output_path, job.prompt, job.filename
+    )
+}
+
 fn mood_direction(mood: &str) -> &'static str {
     match mood {
         "clean-thumbnail" => {
@@ -1626,6 +1971,53 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_server::AppServerLaunchConfig;
+    use std::fs as std_fs;
+    use std::io::Write;
+
+    fn svg_fixture_job(run_id: &str, output_path: &Path, now: i64) -> ImageGridJob {
+        let run_directory = output_path.parent().expect("SVG run directory");
+        let artifacts = run_artifacts(run_directory.parent().expect("generated directory"), run_id);
+        ImageGridJob {
+            id: "svg-job".to_owned(),
+            run_id: run_id.to_owned(),
+            engine: "codex-svg".to_owned(),
+            model: "codex-app-server".to_owned(),
+            prompt: "A calm SVG mascot".to_owned(),
+            reference_premise: "Keep the round glasses and blue scarf.".to_owned(),
+            mood: "warm-mascot".to_owned(),
+            prompt_index: 1,
+            prompt_total: 1,
+            variant: 1,
+            total: 2,
+            filename: "variant-01.svg".to_owned(),
+            output_path: display_path(output_path),
+            aspect_ratio: "16:9".to_owned(),
+            reference_image_path: None,
+            reference_image_url: None,
+            manifest_path: artifacts.manifest_path,
+            manifest_url: artifacts.manifest_url,
+            manifest_view_url: artifacts.manifest_view_url,
+            handoff_path: artifacts.handoff_path,
+            handoff_url: artifacts.handoff_url,
+            handoff_view_url: artifacts.handoff_view_url,
+            output_format: "svg".to_owned(),
+            status: "queued".to_owned(),
+            status_text: "Queued".to_owned(),
+            image_url: None,
+            log: String::new(),
+            thread_id: None,
+            turn_id: None,
+            error_code: None,
+            error_message: None,
+            upstream_status: None,
+            diagnostic_log: String::new(),
+            retry_count: 0,
+            timing: JobTiming::queued(now),
+            created_at: now,
+            updated_at: now,
+        }
+    }
 
     #[test]
     fn request_validation_preserves_batch_limits_and_http_defaults() {
@@ -1710,6 +2102,200 @@ mod tests {
         assert!(prompt.contains("Batch position:\nVariant 1 of 2"));
         assert!(prompt.contains("Target aspect ratio: 16:9."));
         assert!(prompt.ends_with("- Do not ask follow-up questions.\n"));
+    }
+
+    #[test]
+    fn codex_svg_prompt_builder_matches_the_frozen_contract() {
+        let output_path = Path::new("/tmp/variant-01.svg");
+        let job = svg_fixture_job("feedface", output_path, now_millis());
+
+        assert_eq!(
+            build_svg_prompt(&job),
+            "Create one polished thumbnail-like image as a self-contained SVG file.\n\n\
+Write the SVG to this exact absolute path:\n/tmp/variant-01.svg\n\n\
+User concept:\nA calm SVG mascot\n\n\
+Reference premise:\nKeep the round glasses and blue scarf.\n\n\
+Style direction:\nwarm anime blog mascot portrait, soft desk lighting, charming and wholesome, gentle expression, polished illustration\n\n\
+Batch position:\nVariant 1 of 2\n\n\
+Hard requirements:\n\
+- Create exactly one valid SVG file at the path above.\n\
+- Use a 16:9 canvas: viewBox=\"0 0 1280 720\".\n\
+- Keep all assets inline. Do not use remote images, external fonts, or network downloads.\n\
+- Make the composition visibly different from the other variants: vary layout, focal object, accent color, and typographic rhythm.\n\
+- Use readable Japanese text only when useful; keep it short and non-overlapping.\n\
+- Include subtle texture, depth, and a clear focal hierarchy.\n\
+- Do not ask follow-up questions.\n\
+- Finish with one concise sentence that includes \"variant-01.svg\".\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_free_codex_svg_uses_workspace_write_and_finishes_artifacts() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let server_root = temporary.path().join("server");
+        let data_dir = temporary.path().join("data");
+        let workspace = temporary.path().join("workspace");
+        std_fs::create_dir_all(&server_root).expect("server root");
+        std_fs::create_dir_all(&workspace).expect("workspace");
+        let config = Arc::new(RuntimeConfig::new(
+            server_root,
+            data_dir.clone(),
+            Some(workspace.clone()),
+            "server".to_owned(),
+        ));
+        config.prepare_directories().expect("runtime directories");
+
+        let run_id = "feedface";
+        let run_directory = config.generated_dir.join(run_id);
+        std_fs::create_dir_all(&run_directory).expect("run directory");
+        let output_path = run_directory.join("variant-01.svg");
+        let request_log = temporary.path().join("requests.jsonl");
+        let expected_svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1280 720\"><rect width=\"1280\" height=\"720\" fill=\"#123456\"/></svg>\n";
+        let fake = temporary.path().join("fake-codex");
+        let script = r##"#!/bin/sh
+test "$1" = "app-server" || exit 2
+svg_path="__SVG_PATH__"
+request_log="__REQUEST_LOG__"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$request_log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"svg-thread"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720"><rect width="1280" height="720" fill="#123456"/></svg>' > "$svg_path"
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"svg-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"svg-thread","turnId":"svg-turn","completedAtMs":1,"item":{"type":"agentMessage","id":"message","text":"<svg>assistant text must not replace the requested file</svg>"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"svg-thread","turn":{"id":"svg-turn","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'
+      ;;
+  esac
+done
+"##
+        .replace("__SVG_PATH__", &display_path(&output_path))
+        .replace("__REQUEST_LOG__", &display_path(&request_log));
+        let mut fake_file = std_fs::File::create(&fake).expect("fake executable");
+        fake_file.write_all(script.as_bytes()).expect("fake source");
+        fake_file.flush().expect("fake source flushed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fake_file.metadata().expect("fake metadata").permissions();
+            permissions.set_mode(0o755);
+            std_fs::set_permissions(&fake, permissions).expect("fake executable permissions");
+        }
+
+        let app_server =
+            AppServerBridge::new(workspace, AppServerLaunchConfig::single("fixture", fake));
+        let runtime = GenerationRuntime::new(config.clone(), app_server);
+        let now = now_millis();
+        let job = svg_fixture_job(run_id, &output_path, now);
+        let artifacts = run_artifacts(&config.generated_dir, run_id);
+        let request = RunRequestRecord {
+            prompts: vec![PromptRecord {
+                index: 1,
+                prompt: job.prompt.clone(),
+            }],
+            mood: job.mood.clone(),
+            engine: job.engine.clone(),
+            model: job.model.clone(),
+            aspect_ratio: job.aspect_ratio.clone(),
+            variants_per_prompt: job.total,
+            prompt_total: job.prompt_total,
+            reference_premise: job.reference_premise.clone(),
+            reference_image: None,
+        };
+        runtime
+            .inner
+            .jobs
+            .write()
+            .await
+            .insert(job.id.clone(), job.clone());
+        runtime.inner.runs.write().await.insert(
+            run_id.to_owned(),
+            RunRecord {
+                run_id: run_id.to_owned(),
+                job_ids: vec![job.id.clone()],
+                initial_jobs: vec![job.clone()],
+                request,
+                artifacts: artifacts.clone(),
+                created_at: now,
+                notify: Arc::new(Notify::new()),
+            },
+        );
+        runtime
+            .write_artifacts(run_id)
+            .await
+            .expect("initial artifacts");
+
+        runtime.run_job(&job.id).await;
+
+        let completed = runtime.job(&job.id).await.expect("completed SVG job");
+        assert_eq!(completed.status, "done");
+        assert_eq!(completed.status_text, "Generated");
+        assert_eq!(completed.thread_id.as_deref(), Some("svg-thread"));
+        assert_eq!(completed.turn_id.as_deref(), Some("svg-turn"));
+        assert_eq!(
+            completed.image_url.as_deref(),
+            Some("/generated/feedface/variant-01.svg")
+        );
+        assert_eq!(
+            std_fs::read_to_string(&output_path).expect("generated SVG"),
+            expected_svg
+        );
+
+        let requests = std_fs::read_to_string(&request_log).expect("App Server request log");
+        let requests = requests
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("request JSON"))
+            .collect::<Vec<_>>();
+        let thread_start = requests
+            .iter()
+            .find(|request| request["method"] == "thread/start")
+            .expect("thread/start request");
+        assert_eq!(thread_start["params"]["sandbox"], "workspace-write");
+        let turn_start = requests
+            .iter()
+            .find(|request| request["method"] == "turn/start")
+            .expect("turn/start request");
+        assert_eq!(
+            turn_start["params"]["sandboxPolicy"],
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": [display_path(&data_dir)],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            })
+        );
+        assert_eq!(
+            turn_start["params"]["input"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            turn_start["params"]["input"][0]["text"],
+            build_svg_prompt(&job)
+        );
+
+        let manifest: Value = serde_json::from_slice(
+            &std_fs::read(&artifacts.manifest_path).expect("manifest artifact"),
+        )
+        .expect("manifest JSON");
+        assert_eq!(manifest["request"]["engine"], "codex-svg");
+        assert_eq!(manifest["outputs"][0]["status"], "done");
+        assert_eq!(manifest["outputs"][0]["outputFormat"], "svg");
+        assert_eq!(
+            manifest["outputs"][0]["imageUrl"],
+            "/generated/feedface/variant-01.svg"
+        );
+        let handoff = std_fs::read_to_string(&artifacts.handoff_path).expect("handoff artifact");
+        assert!(handoff.contains("- Engine: codex-svg"));
+        assert!(handoff.contains("- Status: done (Generated)"));
+        assert!(handoff.contains(&display_path(&output_path)));
     }
 
     #[test]

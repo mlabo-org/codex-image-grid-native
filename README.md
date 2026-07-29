@@ -44,6 +44,8 @@ The provider-free first runnable slice now includes:
 - compatible `/api/run`, `/api/run-batch`, `/api/runs`, `/events`, generated
   file, manifest, handoff, and safe artifact-view routes for
   `app-server-image`;
+- a separate concurrency-one `codex-svg` App Server path that writes only to
+  its exact native run output and preserves the same job/artifact lifecycle;
 - the frozen `queued → starting → running → done|error` primary job state,
   global 24-slot image scheduler, exact output naming, prompt construction,
   stable App Server image notifications, and atomic image/artifact writes;
@@ -57,10 +59,10 @@ The provider-free first runnable slice now includes:
 The provider-free fixture now completes real HTTP and MCP runs through the
 owned App Server transport and validates generated images, local reference
 copy staging, compatible MCP handoff fields, run responses, manifests,
-history, and artifact routes. Live-provider confirmation, `codex-svg`, retry
-branches, reference analysis, and Native UI runtime binding remain in
-progress. `.mcp.json` remains intentionally empty until the live primary path
-and native UI launch route are smoke-validated.
+history, and artifact routes. Live-provider confirmation, retry branches,
+reference analysis, and Native UI runtime binding remain in progress.
+`.mcp.json` remains intentionally empty until the live primary path and native
+UI launch route are smoke-validated.
 
 ## First checks
 
