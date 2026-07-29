@@ -15,10 +15,14 @@ struct CodexImageGridNative {
 }
 
 struct CodexImageGridApp: App {
+    @NSApplicationDelegateAdaptor(CodexImageGridApplicationDelegate.self)
+    private var applicationDelegate
+
     var body: some Scene {
         WindowGroup("Codex Image Grid") {
             AppShellRoot {
                 ImageGridView()
+                    .environmentObject(applicationDelegate.runtimeLifecycle)
             }
         }
         .defaultSize(width: 1180, height: 820)
@@ -31,6 +35,19 @@ struct CodexImageGridApp: App {
                 AppShellPreferencesView()
             }
         }
+    }
+}
+
+@MainActor
+final class CodexImageGridApplicationDelegate: NSObject, NSApplicationDelegate {
+    let runtimeLifecycle = NativeRuntimeLifecycle()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        runtimeLifecycle.start()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        runtimeLifecycle.stop()
     }
 }
 
