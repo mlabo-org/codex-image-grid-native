@@ -180,6 +180,26 @@ private struct ImageGridRunEvent: Decodable {
     let jobs: [ImageGridJob]
 }
 
+private struct ImageGridDeleteRunsRequest: Encodable {
+    let runIds: [String]
+}
+
+struct ImageGridDeleteRunFailure: Decodable, Equatable, Sendable {
+    let runId: String
+    let error: String
+}
+
+struct ImageGridDeleteRunsResponse: Decodable, Equatable, Sendable {
+    let ok: Bool
+    let deletedRunIds: [String]
+    let deletedJobCount: Int
+    let failures: [ImageGridDeleteRunFailure]
+}
+
+private struct ImageGridRunsDeletedEvent: Decodable {
+    let runIds: [String]
+}
+
 struct ImageGridRuntimeIdentity: Decodable, Equatable, Sendable {
     let app: String?
     let serverRoot: String?
@@ -437,6 +457,15 @@ struct ImageGridAPIClient: Sendable {
         return response
     }
 
+    func deleteRuns(_ runIDs: [String]) async throws -> ImageGridDeleteRunsResponse {
+        _ = try await health()
+        return try await send(
+            path: "/api/delete-runs",
+            method: "POST",
+            body: ImageGridDeleteRunsRequest(runIds: runIDs)
+        )
+    }
+
     func analyze(referenceImagePath: String) async throws -> String {
         _ = try await health()
         let request = try analysisRequest(referenceImagePath: referenceImagePath)
@@ -634,6 +663,49 @@ enum ImageGridJobSelection {
     }
 }
 
+enum ImageGridRunSelection {
+    static func selectableRunIDs(jobs: some Sequence<ImageGridJob>) -> Set<String> {
+        grouped(jobs: jobs).reduce(into: Set<String>()) { selected, entry in
+            if !entry.value.contains(where: \.isActive) {
+                selected.insert(entry.key)
+            }
+        }
+    }
+
+    static func failedRunIDs(jobs: some Sequence<ImageGridJob>) -> Set<String> {
+        grouped(jobs: jobs).reduce(into: Set<String>()) { selected, entry in
+            if !entry.value.contains(where: \.isActive),
+               entry.value.contains(where: { $0.status == "error" })
+            {
+                selected.insert(entry.key)
+            }
+        }
+    }
+
+    static func affectedJobCount(
+        runIDs: Set<String>,
+        jobs: some Sequence<ImageGridJob>
+    ) -> Int {
+        jobs.filter { job in
+            job.runId.map(runIDs.contains) == true
+        }.count
+    }
+
+    static func isSelectable(_ job: ImageGridJob, jobs: some Sequence<ImageGridJob>) -> Bool {
+        guard let runID = job.runId else { return false }
+        return selectableRunIDs(jobs: jobs).contains(runID)
+    }
+
+    private static func grouped(
+        jobs: some Sequence<ImageGridJob>
+    ) -> [String: [ImageGridJob]] {
+        Dictionary(grouping: jobs.compactMap { job in
+            job.runId.map { ($0, job) }
+        }, by: { $0.0 })
+            .mapValues { entries in entries.map { $0.1 } }
+    }
+}
+
 struct ImageGridFailureNoticeTracker {
     private var observedActiveJobIDs: Set<String> = []
     private var unacknowledgedFailureIDs: Set<String> = []
@@ -674,13 +746,16 @@ struct ImageGridFailureNoticeTracker {
 @MainActor
 final class ImageGridStore: ObservableObject {
     @Published private(set) var jobs: [String: ImageGridJob] = [:]
+    @Published private(set) var deletionJobs: [String: ImageGridJob] = [:]
     @Published private(set) var runtimeState = RuntimeConnectionState.disconnected
     @Published private(set) var generatedDirectory: URL?
     @Published private(set) var isSubmitting = false
     @Published private(set) var isAnalyzing = false
+    @Published private(set) var isDeletingRuns = false
     @Published private(set) var unacknowledgedFailureCount = 0
     @Published var generationMessage: String?
     @Published var referenceAnalysisMessage: String?
+    @Published var deletionMessage: String?
 
     let client: ImageGridAPIClient
     private var lifecycleTask: Task<Void, Never>?
@@ -690,6 +765,7 @@ final class ImageGridStore: ObservableObject {
     private var clearedBefore: Int64 = 0
     private var clearedJobIDs: Set<String> = []
     private var retainedCompletedLimit: Int? = ImageGridJobSelection.maximumCompletedJobs
+    private var deletionWorkspaceActive = false
     private var connectivityMessage: String?
     private var failureNoticeTracker = ImageGridFailureNoticeTracker()
 
@@ -798,6 +874,55 @@ final class ImageGridStore: ObservableObject {
             referenceAnalysisMessage = error.localizedDescription
             return nil
         }
+    }
+
+    func deleteRuns(_ runIDs: Set<String>) async -> ImageGridDeleteRunsResponse? {
+        guard !isDeletingRuns else { return nil }
+        let selectionJobs = deletionWorkspaceActive ? deletionJobs.values : jobs.values
+        let selectableRunIDs = ImageGridRunSelection.selectableRunIDs(jobs: selectionJobs)
+        let requestedRunIDs = runIDs.intersection(selectableRunIDs).sorted()
+        guard !requestedRunIDs.isEmpty else { return nil }
+
+        isDeletingRuns = true
+        deletionMessage = nil
+        defer { isDeletingRuns = false }
+        do {
+            let response = try await client.deleteRuns(requestedRunIDs)
+            removeRuns(withIDs: Set(response.deletedRunIds))
+            if !response.failures.isEmpty {
+                deletionMessage = response.failures
+                    .map { "\($0.runId): \($0.error)" }
+                    .joined(separator: "\n")
+            }
+            return response
+        } catch {
+            deletionMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    func beginDeletionWorkspace() {
+        deletionWorkspaceActive = true
+        deletionJobs = jobs
+        deletionMessage = nil
+    }
+
+    func hydrateDeletionWorkspace() async {
+        guard deletionWorkspaceActive else { return }
+        do {
+            let hydrated = try await client.runs().flatMap(\.hydratedJobs)
+            guard deletionWorkspaceActive else { return }
+            mergeDeletionJobs(hydrated)
+        } catch {
+            guard deletionWorkspaceActive else { return }
+            deletionMessage = error.localizedDescription
+        }
+    }
+
+    func endDeletionWorkspace() {
+        deletionWorkspaceActive = false
+        deletionJobs.removeAll()
+        deletionMessage = nil
     }
 
     func visibleJobs(resultLimit: ResultLimit, showFailed: Bool) -> [ImageGridJob] {
@@ -935,6 +1060,13 @@ final class ImageGridStore: ObservableObject {
             if let job = try? decoder.decode(ImageGridJob.self, from: event.data) {
                 merge([job])
             }
+        case "runs-deleted":
+            if let deletion = try? decoder.decode(
+                ImageGridRunsDeletedEvent.self,
+                from: event.data
+            ) {
+                removeRuns(withIDs: Set(deletion.runIds))
+            }
         default:
             break
         }
@@ -953,6 +1085,7 @@ final class ImageGridStore: ObservableObject {
     }
 
     private func merge(_ incoming: [ImageGridJob]) {
+        mergeDeletionJobs(incoming)
         var mergedJobs = jobs
         for job in incoming {
             let existing = mergedJobs[job.id]
@@ -984,6 +1117,44 @@ final class ImageGridStore: ObservableObject {
         guard mergedJobs != jobs else { return }
 
         jobs = mergedJobs
+        updateActiveRunReconciliation()
+    }
+
+    private func mergeDeletionJobs(_ incoming: [ImageGridJob]) {
+        guard deletionWorkspaceActive else { return }
+        var mergedJobs = deletionJobs
+        for job in incoming {
+            if let existing = mergedJobs[job.id], existing.eventTime > job.eventTime {
+                continue
+            }
+            mergedJobs[job.id] = job
+        }
+        if mergedJobs != deletionJobs {
+            deletionJobs = mergedJobs
+        }
+    }
+
+    private func removeRuns(withIDs runIDs: Set<String>) {
+        guard !runIDs.isEmpty else { return }
+        let removedJobIDs = Set(
+            (Array(jobs.values) + Array(deletionJobs.values))
+                .filter { job in
+                    job.runId.map(runIDs.contains) == true
+                }
+                .map(\.id)
+        )
+        clearedJobIDs.formUnion(removedJobIDs)
+        jobs = jobs.filter { _, job in
+            job.runId.map { !runIDs.contains($0) } ?? true
+        }
+        deletionJobs = deletionJobs.filter { _, job in
+            job.runId.map { !runIDs.contains($0) } ?? true
+        }
+        failureNoticeTracker.removeJobs(withIDs: removedJobIDs)
+        synchronizeFailureNoticeCount()
+        if clearedJobIDs.count > 512 {
+            clearedJobIDs = Set(clearedJobIDs.suffix(512))
+        }
         updateActiveRunReconciliation()
     }
 

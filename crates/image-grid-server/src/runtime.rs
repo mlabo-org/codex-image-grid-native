@@ -180,6 +180,28 @@ pub(crate) struct GeneratedFile {
     pub url: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeleteRunFailure {
+    pub run_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeleteRunsResult {
+    pub ok: bool,
+    pub deleted_run_ids: Vec<String>,
+    pub deleted_job_count: usize,
+    pub failures: Vec<DeleteRunFailure>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DeleteRunsError {
+    ActiveRuns(Vec<String>),
+    Io(io::Error),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RunApiError {
     pub error: String,
@@ -559,6 +581,124 @@ impl GenerationRuntime {
     #[cfg(test)]
     pub(crate) async fn insert_test_job(&self, job: ImageGridJob) {
         self.inner.jobs.write().await.insert(job.id.clone(), job);
+    }
+
+    pub(crate) async fn delete_runs(
+        &self,
+        run_ids: &[String],
+    ) -> Result<DeleteRunsResult, DeleteRunsError> {
+        let _admission_guard = self.inner.admission_gate.write().await;
+        let requested = run_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut active_run_ids = self
+            .inner
+            .jobs
+            .read()
+            .await
+            .values()
+            .filter(|job| requested.contains(&job.run_id) && job.is_active())
+            .map(|job| job.run_id.clone())
+            .collect::<Vec<_>>();
+        active_run_ids.sort();
+        active_run_ids.dedup();
+        if !active_run_ids.is_empty() {
+            return Err(DeleteRunsError::ActiveRuns(active_run_ids));
+        }
+
+        fs::create_dir_all(&self.inner.config.generated_dir)
+            .await
+            .map_err(DeleteRunsError::Io)?;
+        let generated_root = fs::canonicalize(&self.inner.config.generated_dir)
+            .await
+            .map_err(DeleteRunsError::Io)?;
+
+        let mut deleted_run_ids = Vec::new();
+        let mut failures = Vec::new();
+        for run_id in run_ids {
+            let run_directory = generated_root.join(run_id);
+            let metadata = match fs::symlink_metadata(&run_directory).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    deleted_run_ids.push(run_id.clone());
+                    continue;
+                }
+                Err(error) => {
+                    failures.push(DeleteRunFailure {
+                        run_id: run_id.clone(),
+                        error: format!("Could not inspect the run directory: {error}"),
+                    });
+                    continue;
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                failures.push(DeleteRunFailure {
+                    run_id: run_id.clone(),
+                    error: "The run path is not an owned directory.".to_owned(),
+                });
+                continue;
+            }
+            let canonical_run = match fs::canonicalize(&run_directory).await {
+                Ok(path) => path,
+                Err(error) => {
+                    failures.push(DeleteRunFailure {
+                        run_id: run_id.clone(),
+                        error: format!("Could not resolve the run directory: {error}"),
+                    });
+                    continue;
+                }
+            };
+            if canonical_run.parent() != Some(generated_root.as_path()) {
+                failures.push(DeleteRunFailure {
+                    run_id: run_id.clone(),
+                    error: "The run directory is outside the generated image root.".to_owned(),
+                });
+                continue;
+            }
+            match fs::remove_dir_all(&canonical_run).await {
+                Ok(()) => deleted_run_ids.push(run_id.clone()),
+                Err(error) => failures.push(DeleteRunFailure {
+                    run_id: run_id.clone(),
+                    error: format!("Could not delete the run directory: {error}"),
+                }),
+            }
+        }
+
+        let deleted = deleted_run_ids.iter().cloned().collect::<HashSet<_>>();
+        let removed_job_ids = {
+            let mut jobs = self.inner.jobs.write().await;
+            let removed = jobs
+                .values()
+                .filter(|job| deleted.contains(&job.run_id))
+                .map(|job| job.id.clone())
+                .collect::<HashSet<_>>();
+            jobs.retain(|_, job| !deleted.contains(&job.run_id));
+            removed
+        };
+        self.inner
+            .runs
+            .write()
+            .await
+            .retain(|run_id, _| !deleted.contains(run_id));
+        self.inner
+            .attempts
+            .write()
+            .await
+            .retain(|job_id, _| !removed_job_ids.contains(job_id));
+
+        if !deleted_run_ids.is_empty() {
+            self.emit(
+                "runs-deleted",
+                json!({
+                    "runIds": deleted_run_ids
+                }),
+            );
+        }
+
+        Ok(DeleteRunsResult {
+            ok: failures.is_empty(),
+            deleted_run_ids,
+            deleted_job_count: removed_job_ids.len(),
+            failures,
+        })
     }
 
     pub(crate) fn scheduler_snapshot(&self) -> SchedulerSnapshot {

@@ -4,10 +4,12 @@ import Testing
 private func retentionJob(
     id: String,
     status: String,
-    time: Int64
+    time: Int64,
+    runID: String? = nil
 ) -> ImageGridJob {
     ImageGridJob(
         id: id,
+        runId: runID,
         status: status,
         updatedAt: ImageGridTimestamp(milliseconds: time)
     )
@@ -98,5 +100,36 @@ private func terminalSeries(
         #expect(bounded.contains { $0.id == "active" })
         #expect(bounded.filter { $0.status == "error" }.count == 6)
         #expect(bounded.filter { $0.status == "done" }.count == 6)
+    }
+
+    @Test func deletionSelectionUsesWholeTerminalRunsAndSelectsEveryFailedRun() {
+        let jobs = [
+            retentionJob(id: "failed-one", status: "error", time: 5, runID: "run-failed"),
+            retentionJob(id: "failed-two", status: "error", time: 4, runID: "run-failed"),
+            retentionJob(id: "done", status: "done", time: 3, runID: "run-done"),
+            retentionJob(id: "active", status: "running", time: 2, runID: "run-active"),
+            retentionJob(id: "active-error", status: "error", time: 1, runID: "run-active"),
+        ]
+
+        #expect(
+            ImageGridRunSelection.selectableRunIDs(jobs: jobs)
+                == ["run-failed", "run-done"]
+        )
+        #expect(ImageGridRunSelection.failedRunIDs(jobs: jobs) == ["run-failed"])
+    }
+
+    @Test func deletionSelectionCountsEveryResultInTheSelectedRunDirectory() {
+        let jobs = [
+            retentionJob(id: "one", status: "done", time: 3, runID: "run-shared"),
+            retentionJob(id: "two", status: "done", time: 2, runID: "run-shared"),
+            retentionJob(id: "other", status: "done", time: 1, runID: "run-other"),
+        ]
+
+        #expect(
+            ImageGridRunSelection.affectedJobCount(
+                runIDs: ["run-shared"],
+                jobs: jobs
+            ) == 2
+        )
     }
 }

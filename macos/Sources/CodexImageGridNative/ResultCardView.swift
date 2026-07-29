@@ -56,6 +56,9 @@ struct ResultCardView: View {
 
     let job: ImageGridJob
     let imageURL: URL?
+    let isSelected: Bool
+    let isSelectable: Bool
+    let onSelectionToggle: () -> Void
     let onCopy: () -> Void
     let onReveal: () -> Void
     let onManifest: () -> Void
@@ -92,10 +95,12 @@ struct ResultCardView: View {
         .overlay {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(
-                    job.status == "error"
-                        ? Color.red.opacity(0.55)
-                        : Color(nsColor: .separatorColor),
-                    lineWidth: job.status == "error" ? 1.5 : 1
+                    isSelected
+                        ? Color.accentColor
+                        : (job.status == "error"
+                            ? Color.red.opacity(0.55)
+                            : Color(nsColor: .separatorColor)),
+                    lineWidth: isSelected ? 3 : (job.status == "error" ? 1.5 : 1)
                 )
         }
         .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -105,7 +110,7 @@ struct ResultCardView: View {
     }
 
     private var image: some View {
-        ZStack {
+        ZStack(alignment: .topLeading) {
             Color(nsColor: .underPageBackgroundColor)
             if let imageURL {
                 AsyncImage(url: imageURL) { phase in
@@ -140,6 +145,39 @@ struct ResultCardView: View {
                 generationFailurePlaceholder
             } else {
                 imageUnavailablePlaceholder
+            }
+
+            if isSelectable {
+                Button(action: onSelectionToggle) {
+                    Label(
+                        isSelected ? strings.selectedForDeletion : strings.markForDeletion,
+                        systemImage: isSelected ? "checkmark.circle.fill" : "circle"
+                    )
+                    .appFont(.caption, weight: .semibold)
+                    .foregroundStyle(isSelected ? Color.white : Color.primary)
+                    .padding(.horizontal, 10)
+                    .frame(height: 30)
+                    .background(
+                        isSelected
+                            ? Color.accentColor
+                            : Color(nsColor: .windowBackgroundColor).opacity(0.92),
+                        in: Capsule()
+                    )
+                    .overlay {
+                        Capsule()
+                            .stroke(
+                                isSelected
+                                    ? Color.accentColor
+                                    : Color(nsColor: .separatorColor),
+                                lineWidth: 1
+                            )
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(10)
+                .accessibilityLabel(
+                    isSelected ? strings.removeFromDeletion : strings.addToDeletion
+                )
             }
         }
         .aspectRatio(aspectRatio, contentMode: .fit)
@@ -381,6 +419,12 @@ private struct ResultCardStrings {
     var generationFailed: String { localized("画像生成に失敗しました", "Image generation failed") }
     var imageUnavailable: String { localized("画像を読み込めません", "Image unavailable") }
     var image: String { localized("画像", "Image") }
+    var markForDeletion: String { localized("削除対象にする", "Mark for deletion") }
+    var selectedForDeletion: String { localized("削除対象", "Selected for deletion") }
+    var addToDeletion: String { localized("このrunを削除対象に追加", "Add this run to deletion") }
+    var removeFromDeletion: String {
+        localized("このrunを削除対象から外す", "Remove this run from deletion")
+    }
 
     func settings(_ job: ImageGridJob) -> String {
         let mood = job.mood ?? localized("未指定", "Not specified")

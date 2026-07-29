@@ -20,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use image_grid_core::{APP_IDENTITY, MAX_RUN_JOBS};
 use runtime::{
-    GeneratedJobFileError, GenerationRuntime, content_type, render_artifact_page,
+    DeleteRunsError, GeneratedJobFileError, GenerationRuntime, content_type, render_artifact_page,
     render_image_page, valid_run_id,
 };
 use serde::Serialize;
@@ -289,6 +289,7 @@ fn router_with_state(state: RuntimeState) -> Router {
             axum::routing::post(open_generated_file),
         )
         .route("/api/runs", get(run_list))
+        .route("/api/delete-runs", axum::routing::post(delete_runs))
         .route("/api/runs/{run_id}", get(run_status))
         .route("/api/generated", get(generated_list))
         .route("/generated/{run_id}/{filename}", get(generated_file))
@@ -433,6 +434,70 @@ async fn open_generated_file(State(state): State<RuntimeState>, request: AxumReq
         })),
     )
         .into_response()
+}
+
+async fn delete_runs(State(state): State<RuntimeState>, request: AxumRequest) -> Response {
+    const MAX_DELETE_RUNS: usize = 256;
+
+    let body = match http_json::read_json_body(request).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    let Some(values) = body.get("runIds").and_then(Value::as_array) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "runIds must be an array" })),
+        )
+            .into_response();
+    };
+    if values.is_empty() || values.len() > MAX_DELETE_RUNS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("runIds must contain 1 to {MAX_DELETE_RUNS} entries")
+            })),
+        )
+            .into_response();
+    }
+
+    let mut run_ids = Vec::with_capacity(values.len());
+    let mut seen = std::collections::HashSet::new();
+    for value in values {
+        let Some(run_id) = value.as_str().map(str::trim) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "every runId must be a string" })),
+            )
+                .into_response();
+        };
+        if run_id.len() > 128 || !valid_run_id(run_id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid runId" })),
+            )
+                .into_response();
+        }
+        if seen.insert(run_id.to_owned()) {
+            run_ids.push(run_id.to_owned());
+        }
+    }
+
+    match state.generation.delete_runs(&run_ids).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(DeleteRunsError::ActiveRuns(active_run_ids)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "active runs cannot be deleted",
+                "activeRunIds": active_run_ids
+            })),
+        )
+            .into_response(),
+        Err(DeleteRunsError::Io(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 fn compatible_request_string(value: Option<&Value>, fallback: &str) -> String {
@@ -1860,6 +1925,107 @@ done
                 vec![real_output.as_os_str().to_owned()]
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn delete_runs_http_removes_the_complete_owned_directory_and_runtime_jobs() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let opener = Arc::new(RecordingHostOpener::default());
+        let (app, generation, config) = finder_test_app(&temporary, opener).await;
+        let run_directory = config.generated_dir.join("feedface");
+        fs::create_dir_all(&run_directory).expect("run directory");
+        fs::write(run_directory.join("variant-01.png"), b"fixture image")
+            .expect("first generated image");
+        fs::write(run_directory.join("variant-02.png"), b"fixture image")
+            .expect("second generated image");
+        fs::write(run_directory.join("reference.png"), b"fixture reference")
+            .expect("reference image");
+        fs::write(run_directory.join("manifest.json"), b"{}").expect("manifest");
+        fs::write(run_directory.join("handoff.md"), b"handoff").expect("handoff");
+
+        let mut first = finder_test_job("delete-one", &run_directory.join("variant-01.png"));
+        first.total = 2;
+        let mut second = finder_test_job("delete-two", &run_directory.join("variant-02.png"));
+        second.variant = 2;
+        second.total = 2;
+        generation.insert_test_job(first).await;
+        generation.insert_test_job(second).await;
+
+        let (status, body) = finder_request(
+            &app,
+            "/api/delete-runs",
+            Body::from(json!({ "runIds": ["feedface"] }).to_string()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "ok": true,
+                "deletedRunIds": ["feedface"],
+                "deletedJobCount": 2,
+                "failures": []
+            })
+        );
+        assert!(!run_directory.exists());
+        assert!(generation.snapshot().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_runs_http_rejects_active_unsafe_and_unowned_targets() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let opener = Arc::new(RecordingHostOpener::default());
+        let (app, generation, config) = finder_test_app(&temporary, opener).await;
+        let active_directory = config.generated_dir.join("feedface");
+        fs::create_dir_all(&active_directory).expect("active run directory");
+        let active_output = active_directory.join("variant-01.png");
+        fs::write(&active_output, b"fixture image").expect("active output");
+        let mut active = finder_test_job("active-delete", &active_output);
+        active.status = "running".to_owned();
+        active.status_text = "Generating".to_owned();
+        generation.insert_test_job(active).await;
+
+        let (status, body) = finder_request(
+            &app,
+            "/api/delete-runs",
+            Body::from(json!({ "runIds": ["feedface"] }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["activeRunIds"], json!(["feedface"]));
+        assert!(active_directory.exists());
+
+        let (status, _) = finder_request(
+            &app,
+            "/api/delete-runs",
+            Body::from(json!({ "runIds": ["../outside"] }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside directory");
+        fs::write(outside.join("preserved.txt"), b"preserve").expect("outside file");
+        fs::create_dir_all(&config.generated_dir).expect("generated directory");
+        let linked_run = config.generated_dir.join("deadbeef");
+        symlink(&outside, &linked_run).expect("linked run fixture");
+
+        let (status, body) = finder_request(
+            &app,
+            "/api/delete-runs",
+            Body::from(json!({ "runIds": ["deadbeef"] }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["deletedRunIds"], json!([]));
+        assert_eq!(body["failures"][0]["runId"], "deadbeef");
+        assert!(outside.join("preserved.txt").exists());
+        assert!(linked_run.symlink_metadata().is_ok());
     }
 
     #[tokio::test]
