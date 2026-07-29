@@ -885,18 +885,18 @@ struct ImageGridView: View {
             .frame(maxWidth: .infinity)
             .background {
                 GeometryReader { geometry in
-                    Color.clear.preference(
-                        key: ResultGridColumnCountPreferenceKey.self,
-                        value: grid.columnCount(
-                            for: geometry.size.width,
-                            itemCount: visible.count
-                        )
-                    )
-                }
-            }
-            .onPreferenceChange(ResultGridColumnCountPreferenceKey.self) { columnCount in
-                if columnCount != resultGridColumnCount {
-                    resultGridColumnCount = columnCount
+                    Color.clear
+                        .onChange(
+                            of: grid.columnCount(
+                                for: geometry.size.width,
+                                itemCount: visible.count
+                            ),
+                            initial: true
+                        ) { _, columnCount in
+                            if columnCount != resultGridColumnCount {
+                                resultGridColumnCount = columnCount
+                            }
+                        }
                 }
             }
         }
