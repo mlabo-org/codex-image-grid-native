@@ -697,6 +697,10 @@ impl AppServerBridge {
         self.inner.lock().await.client.clone().ok_or(diagnostics)
     }
 
+    pub(crate) async fn current_client(&self) -> Option<Arc<AppServerClient>> {
+        self.inner.lock().await.client.clone()
+    }
+
     async fn set_failure(&self, diagnostics: AppServerDiagnostics) {
         let mut inner = self.inner.lock().await;
         inner.diagnostics = diagnostics;
