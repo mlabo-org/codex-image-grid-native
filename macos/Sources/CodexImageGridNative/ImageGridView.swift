@@ -87,6 +87,7 @@ private enum ReferenceInteractionState: Equatable {
 
 struct ImageGridView: View {
     @EnvironmentObject private var runtimeLifecycle: NativeRuntimeLifecycle
+    @Environment(\.openWindow) private var openWindow
     @AppStorage(AppShellPreferenceKeys.language) private var selectedLanguage =
         AppShellLanguage.system
     @AppStorage(AppShellPreferenceKeys.theme) private var selectedTheme = AppShellTheme.system
@@ -94,7 +95,7 @@ struct ImageGridView: View {
     @AppStorage("imageGrid.showFailed") private var showFailed = false
     @AppStorage("imageGrid.promptHistory") private var promptHistoryData = "[]"
 
-    @StateObject private var store = ImageGridStore()
+    @ObservedObject var store: ImageGridStore
     @StateObject private var draftPersistence = ImageGridDraftPersistence()
     @State private var referencePremise = ""
     @State private var prompt = ImageGridContract.defaultPrompt
@@ -110,11 +111,6 @@ struct ImageGridView: View {
     @State private var formError: String?
     @State private var draftReady = false
     @State private var resultGridColumnCount = 1
-    @State private var deletionGridColumnCount = 1
-    @State private var isRunDeletionMode = false
-    @State private var selectedRunIDs: Set<String> = []
-    @State private var failedRunIDsSeenForSelection: Set<String> = []
-    @State private var showsRunDeletionConfirmation = false
 
     private var strings: ImageGridStrings {
         ImageGridStrings(language: selectedLanguage)
@@ -122,17 +118,9 @@ struct ImageGridView: View {
 
     var body: some View {
         AppShellRoot {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    header
-                    generationPanel
-                    resultsPanel
-                }
-                .padding(.horizontal, 32)
-                .padding(.vertical, 28)
-                .frame(maxWidth: .infinity)
-            }
+            mainWorkspace
             .background(Color(nsColor: .windowBackgroundColor))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .frame(minHeight: 560)
         }
         .onAppear {
@@ -177,16 +165,21 @@ struct ImageGridView: View {
                 store.acknowledgeFailureNotice()
             }
         }
-        .onChange(of: store.deletionJobs, initial: true) { _, _ in
-            synchronizeRunDeletionSelection()
-        }
         .onPasteCommand(of: [.fileURL, .png, .jpeg, .webP]) { providers in
             pasteReference(providers: providers)
         }
-        .sheet(isPresented: $isRunDeletionMode, onDismiss: {
-            finishRunDeletionMode()
-        }) {
-            runDeletionWorkspace
+    }
+
+    private var mainWorkspace: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                header
+                generationPanel
+                resultsPanel
+            }
+            .padding(.horizontal, 32)
+            .padding(.vertical, 28)
+            .frame(maxWidth: .infinity)
         }
     }
 
@@ -1016,7 +1009,7 @@ struct ImageGridView: View {
                 }
                 .disabled(store.generatedDirectory == nil)
                 Button {
-                    beginRunDeletionMode()
+                    openWindow(id: ImageGridWindowID.runDeletion)
                 } label: {
                     Label(strings.beginDeletionMode, systemImage: "trash")
                 }
@@ -1034,7 +1027,7 @@ struct ImageGridView: View {
                     }
                     .disabled(store.generatedDirectory == nil)
                     Button {
-                        beginRunDeletionMode()
+                        openWindow(id: ImageGridWindowID.runDeletion)
                     } label: {
                         Label(strings.beginDeletionMode, systemImage: "trash")
                     }
@@ -1043,244 +1036,6 @@ struct ImageGridView: View {
                 }
             }
         }
-    }
-
-    private var runDeletionWorkspace: some View {
-        let visible = ImageGridJobSelection.visible(
-            jobs: store.deletionJobs.values,
-            completedLimit: nil,
-            showFailed: true
-        )
-            .filter { !$0.isActive }
-        let grid = ResponsiveResultGrid(minimumColumnWidth: 440, spacing: 16)
-        return VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .top, spacing: 16) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Label(strings.deletionModeTitle, systemImage: "trash.fill")
-                        .appFont(.title2, weight: .bold)
-                        .foregroundStyle(.red)
-                    Text(strings.deletionModeExplanation)
-                        .appFont(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 20)
-                Button(strings.finishDeletionMode) {
-                    finishRunDeletionMode()
-                }
-                .keyboardShortcut(.cancelAction)
-                .disabled(store.isDeletingRuns)
-            }
-
-            runDeletionControls
-
-            if let message = store.deletionMessage {
-                Label(message, systemImage: "exclamationmark.triangle.fill")
-                    .appFont(.caption, weight: .semibold)
-                    .foregroundStyle(.red)
-                    .textSelection(.enabled)
-                    .accessibilityElement(children: .combine)
-            }
-
-            Divider()
-
-            ScrollView {
-                if visible.isEmpty {
-                    ContentUnavailableView(
-                        strings.noDeletableRuns,
-                        systemImage: "photo.on.rectangle.angled"
-                    )
-                    .frame(maxWidth: .infinity, minHeight: 320)
-                } else {
-                    LazyVGrid(
-                        columns: grid.gridItems(
-                            count: min(deletionGridColumnCount, visible.count)
-                        ),
-                        alignment: .leading,
-                        spacing: grid.spacing
-                    ) {
-                        ForEach(visible) { job in
-                            ResultCardView(
-                                job: job,
-                                imageURL: store.client.resolvedURL(job.imageUrl),
-                                isSelected: job.runId.map(selectedRunIDs.contains) == true,
-                                isSelectable: job.runId.map(selectableRunIDs.contains) == true,
-                                onSelectionToggle: {
-                                    toggleRunDeletionSelection(for: job)
-                                },
-                                onCopy: { store.copyPrompt(job.prompt) },
-                                onReveal: { store.reveal(job) },
-                                onManifest: { store.openArtifact(job.manifestViewUrl) },
-                                onHandoff: { store.openArtifact(job.handoffViewUrl) }
-                            )
-                            .frame(maxWidth: .infinity, alignment: .top)
-                        }
-                    }
-                    .frame(maxWidth: .infinity)
-                    .background {
-                        GeometryReader { geometry in
-                            Color.clear
-                                .onChange(
-                                    of: grid.columnCount(
-                                        for: geometry.size.width,
-                                        itemCount: visible.count
-                                    ),
-                                    initial: true
-                                ) { _, columnCount in
-                                    if columnCount != deletionGridColumnCount {
-                                        deletionGridColumnCount = columnCount
-                                    }
-                                }
-                        }
-                    }
-                }
-            }
-        }
-        .padding(22)
-        .frame(minWidth: 900, idealWidth: 1180, minHeight: 650, idealHeight: 820)
-        .interactiveDismissDisabled(store.isDeletingRuns)
-        .alert(
-            strings.deleteConfirmationTitle,
-            isPresented: $showsRunDeletionConfirmation
-        ) {
-            Button(strings.cancel, role: .cancel) {}
-            Button(strings.deleteSelectedRuns, role: .destructive) {
-                deleteSelectedRuns()
-            }
-        } message: {
-            Text(strings.deleteConfirmationMessage(
-                runCount: selectedRunIDs.count,
-                resultCount: selectedResultCount,
-                generatedDirectory: store.generatedDirectory?.path
-            ))
-        }
-    }
-
-    private var runDeletionControls: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 10) {
-                runDeletionSelectionSummary
-                Spacer(minLength: 12)
-                runDeletionButtons
-            }
-
-            VStack(alignment: .leading, spacing: 10) {
-                runDeletionSelectionSummary
-                runDeletionButtons
-            }
-        }
-        .padding(12)
-        .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.red.opacity(0.45), lineWidth: 1.5)
-        }
-    }
-
-    private var runDeletionSelectionSummary: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Label(strings.deletionSelectionTitle, systemImage: "externaldrive.badge.minus")
-                .appFont(.caption, weight: .bold)
-                .foregroundStyle(.red)
-            Text(strings.deletionSelectionSummary(
-                runCount: selectedRunIDs.count,
-                resultCount: selectedResultCount
-            ))
-                .appFont(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .accessibilityElement(children: .combine)
-    }
-
-    private var runDeletionButtons: some View {
-        HStack(spacing: 8) {
-            Button(strings.selectFailedRuns) {
-                selectedRunIDs.formUnion(failedRunIDs)
-            }
-            .disabled(failedRunIDs.isEmpty || store.isDeletingRuns)
-
-            Button(strings.clearSelection) {
-                selectedRunIDs.removeAll()
-            }
-            .disabled(selectedRunIDs.isEmpty || store.isDeletingRuns)
-
-            Button {
-                showsRunDeletionConfirmation = true
-            } label: {
-                if store.isDeletingRuns {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Label(strings.deleteSelectedRuns, systemImage: "trash.fill")
-                }
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.red)
-            .disabled(selectedRunIDs.isEmpty || store.isDeletingRuns)
-        }
-    }
-
-    private var selectableRunIDs: Set<String> {
-        ImageGridRunSelection.selectableRunIDs(jobs: store.deletionJobs.values)
-    }
-
-    private var failedRunIDs: Set<String> {
-        ImageGridRunSelection.failedRunIDs(jobs: store.deletionJobs.values)
-    }
-
-    private var selectedResultCount: Int {
-        ImageGridRunSelection.affectedJobCount(
-            runIDs: selectedRunIDs,
-            jobs: store.deletionJobs.values
-        )
-    }
-
-    private func synchronizeRunDeletionSelection() {
-        guard isRunDeletionMode else { return }
-        let presentRunIDs = Set(store.deletionJobs.values.compactMap(\.runId))
-        failedRunIDsSeenForSelection.formIntersection(presentRunIDs)
-        selectedRunIDs.formIntersection(selectableRunIDs)
-        let newlyFailedRunIDs = failedRunIDs.subtracting(failedRunIDsSeenForSelection)
-        selectedRunIDs.formUnion(newlyFailedRunIDs)
-        failedRunIDsSeenForSelection.formUnion(failedRunIDs)
-    }
-
-    private func toggleRunDeletionSelection(for job: ImageGridJob) {
-        guard isRunDeletionMode,
-              let runID = job.runId,
-              selectableRunIDs.contains(runID)
-        else { return }
-        if selectedRunIDs.contains(runID) {
-            selectedRunIDs.remove(runID)
-        } else {
-            selectedRunIDs.insert(runID)
-        }
-    }
-
-    private func deleteSelectedRuns() {
-        let requestedRunIDs = selectedRunIDs
-        Task {
-            guard let response = await store.deleteRuns(requestedRunIDs) else { return }
-            selectedRunIDs.subtract(Set(response.deletedRunIds))
-        }
-    }
-
-    private func beginRunDeletionMode() {
-        store.beginDeletionWorkspace()
-        isRunDeletionMode = true
-        selectedRunIDs = failedRunIDs
-        failedRunIDsSeenForSelection = failedRunIDs
-        store.deletionMessage = nil
-        Task {
-            await store.hydrateDeletionWorkspace()
-        }
-    }
-
-    private func finishRunDeletionMode() {
-        guard !store.isDeletingRuns else { return }
-        isRunDeletionMode = false
-        selectedRunIDs.removeAll()
-        failedRunIDsSeenForSelection.removeAll()
-        store.endDeletionWorkspace()
     }
 
     private var resultLimitControl: some View {
@@ -1425,15 +1180,16 @@ struct ImageGridStrings {
         localized("失敗した結果を表示", "Show failed results")
     }
     var openInFinder: String { localized("Finderで開く", "Open in Finder") }
-    var beginDeletionMode: String { localized("削除モード", "Deletion mode") }
+    var beginDeletionMode: String { localized("削除ウィンドウ", "Deletion window") }
     var beginDeletionModeHelp: String {
         localized(
             "生成データを確認して、runディレクトリ単位で削除します",
             "Review generated data and delete complete run directories"
         )
     }
-    var deletionModeActive: String { localized("削除モード中", "Deletion mode active") }
-    var finishDeletionMode: String { localized("削除モードを終了", "Exit deletion mode") }
+    var closeDeletionWindow: String {
+        localized("削除ウィンドウを閉じる", "Close deletion window")
+    }
     var deletionModeTitle: String { localized("生成データの一括削除", "Delete generated data") }
     var deletionModeExplanation: String {
         localized(
