@@ -2,12 +2,10 @@ import SwiftUI
 
 struct ResponsiveResultGrid: Layout {
     let minimumColumnWidth: CGFloat
-    let maximumColumns: Int
     let spacing: CGFloat
 
-    init(minimumColumnWidth: CGFloat, maximumColumns: Int, spacing: CGFloat) {
+    init(minimumColumnWidth: CGFloat, spacing: CGFloat) {
         self.minimumColumnWidth = minimumColumnWidth
-        self.maximumColumns = maximumColumns
         self.spacing = spacing
     }
 
@@ -20,7 +18,7 @@ struct ResponsiveResultGrid: Layout {
             return CGSize(width: proposal.width ?? 0, height: 0)
         }
         let width = proposal.width ?? minimumColumnWidth
-        let columns = columnCount(for: width)
+        let columns = columnCount(for: width, itemCount: subviews.count)
         let columnWidth = max(0, (width - CGFloat(columns - 1) * spacing) / CGFloat(columns))
         let heights = rowHeights(subviews: subviews, columns: columns, columnWidth: columnWidth)
         return CGSize(
@@ -36,7 +34,7 @@ struct ResponsiveResultGrid: Layout {
         cache: inout ()
     ) {
         guard !subviews.isEmpty else { return }
-        let columns = columnCount(for: bounds.width)
+        let columns = columnCount(for: bounds.width, itemCount: subviews.count)
         let columnWidth = max(
             0,
             (bounds.width - CGFloat(columns - 1) * spacing) / CGFloat(columns)
@@ -60,10 +58,10 @@ struct ResponsiveResultGrid: Layout {
         }
     }
 
-    private func columnCount(for width: CGFloat) -> Int {
+    func columnCount(for width: CGFloat, itemCount: Int) -> Int {
         max(
             1,
-            min(maximumColumns, Int((width + spacing) / (minimumColumnWidth + spacing)))
+            min(itemCount, Int((width + spacing) / (minimumColumnWidth + spacing)))
         )
     }
 

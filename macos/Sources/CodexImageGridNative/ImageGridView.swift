@@ -124,7 +124,6 @@ struct ImageGridView: View {
                 }
                 .padding(.horizontal, 32)
                 .padding(.vertical, 28)
-                .frame(maxWidth: 1480)
                 .frame(maxWidth: .infinity)
             }
             .background(Color(nsColor: .windowBackgroundColor))
@@ -862,7 +861,7 @@ struct ImageGridView: View {
                     .padding(24)
                 }
         } else {
-            ResponsiveResultGrid(minimumColumnWidth: 320, maximumColumns: 3, spacing: 16) {
+            ResponsiveResultGrid(minimumColumnWidth: 512, spacing: 16) {
                 ForEach(visible) { job in
                     ResultCardView(
                         job: job,

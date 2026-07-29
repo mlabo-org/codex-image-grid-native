@@ -97,6 +97,15 @@ import Foundation
     #expect(shownFailures.map(\.id) == ["active", "failed", "done-new"])
 }
 
+@Test func responsiveGridUsesAvailableWidthWithoutAFixedColumnCap() {
+    let grid = ResponsiveResultGrid(minimumColumnWidth: 512, spacing: 16)
+
+    #expect(grid.columnCount(for: 480, itemCount: 20) == 1)
+    #expect(grid.columnCount(for: 1_600, itemCount: 20) == 3)
+    #expect(grid.columnCount(for: 3_840, itemCount: 20) == 7)
+    #expect(grid.columnCount(for: 3_840, itemCount: 2) == 2)
+}
+
 @Test func referenceContractMatchesNativeServerLimitAndFormats() {
     #expect(ImageGridReference.maximumBytes == 100 * 1_024 * 1_024)
     #expect(ImageGridReference.supportedExtensions == ["png", "jpg", "jpeg", "webp"])

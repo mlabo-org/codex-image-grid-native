@@ -281,7 +281,7 @@ struct ImageGridAPIError: LocalizedError, Equatable, Sendable {
 
 enum ImageGridRuntimeIdentityValidation {
     static let expectedIdentity = "codex-image-grid"
-    static let expectedPackageVersion = "0.2.3"
+    static let expectedPackageVersion = "0.2.4"
 
     static func validate(_ response: ImageGridHealthResponse) throws -> ImageGridRuntimeIdentity {
         guard response.ok else {
