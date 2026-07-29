@@ -402,6 +402,11 @@ impl AppServerClient {
         let mut command = Command::new(command_path);
         command
             .arg("app-server")
+            // This child must use Codex's built-in image generation capability only.
+            // Loading the public Image Grid plugin here lets the child call this
+            // runtime's MCP tool recursively instead of producing an image item.
+            .arg("--disable")
+            .arg("plugins")
             .current_dir(workspace_dir)
             .env("NO_COLOR", "1")
             .stdin(Stdio::piped())
@@ -1111,6 +1116,8 @@ mod tests {
             file,
             "#!/bin/sh\n\
              test \"$1\" = \"app-server\" || exit 2\n\
+             test \"$2\" = \"--disable\" || exit 3\n\
+             test \"$3\" = \"plugins\" || exit 4\n\
              marker=\"{}\"\n\
              trap 'printf TERM > \"$marker\"; exit 0' TERM\n\
              printf READY > \"$marker\"\n\
