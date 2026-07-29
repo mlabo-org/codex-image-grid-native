@@ -3,8 +3,8 @@ use crate::{RuntimeConfig, RuntimeIdentity, SchedulerSnapshot};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use image_grid_core::{
-    APP_IDENTITY, MAX_PROMPTS, MAX_RUN_JOBS, MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS,
-    stage_reference_image,
+    APP_IDENTITY, MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES, MAX_RUN_JOBS, MAX_VARIANTS_PER_PROMPT,
+    MAX_WAIT_MS, stage_reference_image,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -214,8 +214,15 @@ struct NormalizedRunRequest {
     engine: String,
     aspect_ratio: String,
     reference_premise: String,
+    inline_reference_image: Option<InlineReferenceImage>,
     reference_image_path: Option<PathBuf>,
     wait_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct InlineReferenceImage {
+    bytes: Vec<u8>,
+    extension: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -512,7 +519,18 @@ impl GenerationRuntime {
             RunApiError::message(format!("could not create run directory: {error}"))
         })?;
 
-        let reference = if let Some(source_path) = request.reference_image_path.clone() {
+        let reference = if let Some(inline) = request.inline_reference_image.clone() {
+            let filename = format!("reference.{}", inline.extension);
+            let staged_path = run_directory.join(&filename);
+            atomic_write(&staged_path, &inline.bytes).await?;
+            let staged_path = fs::canonicalize(&staged_path).await.map_err(|error| {
+                RunApiError::message(format!("reference staging failed: {error}"))
+            })?;
+            Some(ReferenceRecord {
+                path: display_path(&staged_path),
+                url: format!("/generated/{run_id}/{filename}"),
+            })
+        } else if let Some(source_path) = request.reference_image_path.clone() {
             let staging_directory = run_directory.clone();
             let staged = tokio::task::spawn_blocking(move || {
                 stage_reference_image(source_path, staging_directory)
@@ -2467,19 +2485,14 @@ fn normalize_request(
         .unwrap_or_default()
         .trim()
         .to_owned();
-    if body
-        .get("referenceImage")
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err(RunApiError::message(
-            "referenceImage upload compatibility is not implemented yet; use referenceImagePath",
-        ));
-    }
-    let reference_image_path = body
-        .get("referenceImagePath")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
+    let inline_reference_image = normalize_inline_reference_image(body.get("referenceImage"))?;
+    let reference_image_path = inline_reference_image.is_none().then(|| {
+        body.get("referenceImagePath")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    let reference_image_path = reference_image_path.flatten();
     let wait_ms = normalize_wait_ms(body.get("waitMs"), query_wait_ms);
 
     Ok(NormalizedRunRequest {
@@ -2489,9 +2502,76 @@ fn normalize_request(
         engine,
         aspect_ratio,
         reference_premise,
+        inline_reference_image,
         reference_image_path,
         wait_ms,
     })
+}
+
+fn normalize_inline_reference_image(
+    reference_image: Option<&Value>,
+) -> Result<Option<InlineReferenceImage>, RunApiError> {
+    let Some(reference_image) = reference_image else {
+        return Ok(None);
+    };
+    let Some(data_url_value) = reference_image.get("dataUrl") else {
+        return Ok(None);
+    };
+    if !json_value_is_truthy(data_url_value) {
+        return Ok(None);
+    }
+    let data_url = data_url_value
+        .as_str()
+        .ok_or_else(invalid_reference_image)?;
+    let (mime_type, encoded, extension) =
+        if let Some(encoded) = data_url.strip_prefix("data:image/png;base64,") {
+            ("image/png", encoded, "png")
+        } else if let Some(encoded) = data_url.strip_prefix("data:image/jpeg;base64,") {
+            ("image/jpeg", encoded, "jpg")
+        } else if let Some(encoded) = data_url.strip_prefix("data:image/webp;base64,") {
+            ("image/webp", encoded, "webp")
+        } else {
+            return Err(invalid_reference_image());
+        };
+    if encoded.is_empty()
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        return Err(invalid_reference_image());
+    }
+
+    let declared_mime_type = reference_image
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "image/png" | "image/jpeg" | "image/webp"));
+    if declared_mime_type.is_some_and(|declared| declared != mime_type) {
+        return Err(invalid_reference_image());
+    }
+
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid_reference_image())?;
+    if bytes.len() as u64 > MAX_REFERENCE_IMAGE_BYTES {
+        return Err(RunApiError::message(
+            "reference image is too large; keep it under 100 MB",
+        ));
+    }
+    Ok(Some(InlineReferenceImage { bytes, extension }))
+}
+
+fn json_value_is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+fn invalid_reference_image() -> RunApiError {
+    RunApiError::message("reference image must be PNG, JPEG, or WebP")
 }
 
 fn normalize_prompts(values: &[Value]) -> Result<Vec<String>, RunApiError> {
