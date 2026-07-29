@@ -53,7 +53,7 @@ enum NativeRuntimeResolutionError: LocalizedError, Equatable {
 
 enum NativeRuntimeResolver {
     static let expectedIdentity = "codex-image-grid"
-    static let expectedPackageVersion = "0.2.2"
+    static let expectedPackageVersion = "0.2.3"
     static let dataDirectoryName = "codex-image-grid"
     static let bindAddress = "127.0.0.1:4322"
     static let executableName = "image-grid-server"

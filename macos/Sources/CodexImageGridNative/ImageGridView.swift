@@ -86,7 +86,6 @@ private enum ReferenceInteractionState: Equatable {
 }
 
 struct ImageGridView: View {
-    @Environment(\.appShellLanguage) private var language
     @EnvironmentObject private var runtimeLifecycle: NativeRuntimeLifecycle
     @AppStorage(AppShellPreferenceKeys.language) private var selectedLanguage =
         AppShellLanguage.system
@@ -112,23 +111,25 @@ struct ImageGridView: View {
     @State private var draftReady = false
 
     private var strings: ImageGridStrings {
-        ImageGridStrings(language: language)
+        ImageGridStrings(language: selectedLanguage)
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                header
-                generationPanel
-                resultsPanel
+        AppShellRoot {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    header
+                    generationPanel
+                    resultsPanel
+                }
+                .padding(.horizontal, 32)
+                .padding(.vertical, 28)
+                .frame(maxWidth: 1480)
+                .frame(maxWidth: .infinity)
             }
-            .padding(.horizontal, 32)
-            .padding(.vertical, 28)
-            .frame(maxWidth: 1480)
-            .frame(maxWidth: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .frame(minHeight: 560)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .frame(minHeight: 560)
         .onAppear {
             store.applyRetentionMode(resultLimit: resultLimit)
         }

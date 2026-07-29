@@ -1,6 +1,6 @@
 {
   "name": "codex-image-grid",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Public Codex image-generation plugin package for generic image requests, Prompt Batch, thumbnails, and project, article, or video visuals. It calls codex_image_grid/generate_image_grid and automatically opens the native SwiftUI app. CodexVideo, Agentic StructCiv, and RelayPress use this same route; the frozen Electron implementation is out of scope.",
   "author": {
     "name": "Local",
