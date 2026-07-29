@@ -1,5 +1,5 @@
 use crate::RuntimeConfig;
-use crate::app_server::{AppServerBridge, AppServerDiagnostics};
+use crate::app_server::{AppServerBridge, AppServerDiagnostics, RUNTIME_CLOSED_MESSAGE};
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -43,6 +43,10 @@ impl ReferenceAnalysisRuntime {
     }
 
     pub(crate) async fn analyze(&self, body: Value) -> Result<String, AnalysisError> {
+        if self.app_server.is_closed() {
+            return Err(AnalysisError::runtime_closed());
+        }
+        let _operation = self.app_server.bind_operation();
         let source = ReferenceSource::from_body(body)?;
         let analysis_directory = self
             .config
@@ -66,7 +70,12 @@ impl ReferenceAnalysisRuntime {
                     AnalysisError::new(format!("reference image staging failed: {error}"))
                 })??;
 
-            self.run_app_server_analysis(&staged_path).await
+            let mut shutdown = self.app_server.shutdown_receiver();
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => Err(AnalysisError::runtime_closed()),
+                result = self.run_app_server_analysis(&staged_path) => result,
+            }
         }
         .await;
 
@@ -220,6 +229,19 @@ async fn collect_analysis_notifications(
                     .unwrap_or("reference analysis failed");
                 return Err(AnalysisError::new(message));
             }
+            Some("server-status")
+                if matches!(
+                    params.get("status").and_then(Value::as_str),
+                    Some("error" | "stopped")
+                ) =>
+            {
+                return Err(AnalysisError::new(
+                    params
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Codex App Server stopped"),
+                ));
+            }
             _ => {}
         }
     }
@@ -355,12 +377,11 @@ fn is_supported_mime_type(value: &str) -> bool {
 }
 
 fn app_server_unavailable(diagnostics: AppServerDiagnostics) -> AnalysisError {
-    AnalysisError::new(
-        diagnostics
-            .error
-            .map(|error| error.message)
-            .unwrap_or_else(|| "Codex App Server is unavailable".to_owned()),
-    )
+    match diagnostics.error {
+        Some(error) if error.code == "RuntimeClosed" => AnalysisError::runtime_closed(),
+        Some(error) => AnalysisError::new(error.message),
+        None => AnalysisError::new("Codex App Server is unavailable"),
+    }
 }
 
 fn display_path(path: &Path) -> String {
@@ -370,23 +391,46 @@ fn display_path(path: &Path) -> String {
 #[derive(Debug)]
 pub(crate) struct AnalysisError {
     message: String,
+    code: Option<&'static str>,
+    status: StatusCode,
 }
 
 impl AnalysisError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            code: None,
+            status: StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn runtime_closed() -> Self {
+        Self {
+            message: RUNTIME_CLOSED_MESSAGE.to_owned(),
+            code: Some("RuntimeClosed"),
+            status: StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
 
 impl IntoResponse for AnalysisError {
     fn into_response(self) -> Response {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": self.message })),
-        )
-            .into_response()
+        let mut body = json!({ "error": self.message });
+        if let Some(code) = self.code {
+            body["code"] = Value::String(code.to_owned());
+        }
+        (self.status, Json(body)).into_response()
+    }
+}
+
+async fn wait_for_shutdown(receiver: &mut tokio::sync::watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
+        }
     }
 }
 

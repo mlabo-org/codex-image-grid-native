@@ -6,17 +6,24 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, broadcast, oneshot, watch};
 use tokio::time::timeout;
 
 pub const APP_SERVER_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const RUNTIME_CLOSED_MESSAGE: &str = "Codex Image Grid runtime closed";
+
+#[derive(Debug, Clone)]
+pub(crate) struct AppServerEvent {
+    pub(crate) name: String,
+    pub(crate) data: Value,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -280,18 +287,117 @@ impl fmt::Display for AppServerClientError {
 type PendingResponse = oneshot::Sender<Result<Value, AppServerClientError>>;
 type PendingMap = Arc<StdMutex<HashMap<String, PendingResponse>>>;
 
+struct AppServerLifecycle {
+    public_events: broadcast::Sender<AppServerEvent>,
+    state: StdMutex<AppServerLifecycleState>,
+}
+
+#[derive(Default)]
+struct AppServerLifecycleState {
+    active_operations: u64,
+    pending_terminal: Option<(String, String)>,
+    terminal_recorded: bool,
+}
+
+impl AppServerLifecycle {
+    fn bind(self: &Arc<Self>) -> AppServerOperation {
+        self.state
+            .lock()
+            .expect("App Server lifecycle state poisoned")
+            .active_operations += 1;
+        AppServerOperation {
+            lifecycle: self.clone(),
+        }
+    }
+
+    fn defer_terminal(&self, status: &str, message: &str) {
+        let emit_now = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("App Server lifecycle state poisoned");
+            if state.terminal_recorded {
+                return;
+            }
+            state.terminal_recorded = true;
+            if state.active_operations == 0 {
+                true
+            } else {
+                state.pending_terminal = Some((status.to_owned(), message.to_owned()));
+                false
+            }
+        };
+        if emit_now {
+            self.emit_terminal(status, message);
+        }
+    }
+
+    fn reset_terminal(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("App Server lifecycle state poisoned");
+        state.terminal_recorded = false;
+        state.pending_terminal = None;
+    }
+
+    fn operation_finished(&self) {
+        let terminal = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("App Server lifecycle state poisoned");
+            debug_assert!(state.active_operations > 0);
+            state.active_operations = state.active_operations.saturating_sub(1);
+            if state.active_operations == 0 {
+                state.pending_terminal.take()
+            } else {
+                None
+            }
+        };
+        if let Some((status, message)) = terminal {
+            self.emit_terminal(&status, &message);
+        }
+    }
+
+    fn emit_terminal(&self, status: &str, message: &str) {
+        let _ = self.public_events.send(AppServerEvent {
+            name: "server-status".to_owned(),
+            data: json!({
+                "status": status,
+                "message": message
+            }),
+        });
+    }
+}
+
+pub(crate) struct AppServerOperation {
+    lifecycle: Arc<AppServerLifecycle>,
+}
+
+impl Drop for AppServerOperation {
+    fn drop(&mut self) {
+        self.lifecycle.operation_finished();
+    }
+}
+
 pub(crate) struct AppServerClient {
     stdin: Mutex<ChildStdin>,
     child: Mutex<Child>,
     pending: PendingMap,
     next_id: AtomicU64,
     notifications: broadcast::Sender<Value>,
+    closed: Arc<AtomicBool>,
+    lifecycle: Arc<AppServerLifecycle>,
+    shutdown_gate: Mutex<()>,
 }
 
 impl AppServerClient {
     async fn spawn(
         command_path: &Path,
         workspace_dir: &Path,
+        public_events: broadcast::Sender<AppServerEvent>,
+        lifecycle: Arc<AppServerLifecycle>,
     ) -> Result<Arc<Self>, AppServerClientError> {
         let mut command = Command::new(command_path);
         command
@@ -330,8 +436,16 @@ impl AppServerClient {
 
         let pending = Arc::new(StdMutex::new(HashMap::new()));
         let (notifications, _) = broadcast::channel(256);
-        spawn_stdout_reader(stdout, pending.clone(), notifications.clone());
-        spawn_stderr_reader(stderr, notifications.clone());
+        let closed = Arc::new(AtomicBool::new(false));
+        spawn_stdout_reader(
+            stdout,
+            pending.clone(),
+            notifications.clone(),
+            public_events.clone(),
+            lifecycle.clone(),
+            closed.clone(),
+        );
+        spawn_stderr_reader(stderr, notifications.clone(), public_events);
 
         Ok(Arc::new(Self {
             stdin: Mutex::new(stdin),
@@ -339,6 +453,9 @@ impl AppServerClient {
             pending,
             next_id: AtomicU64::new(1),
             notifications,
+            closed,
+            lifecycle,
+            shutdown_gate: Mutex::new(()),
         }))
     }
 
@@ -348,6 +465,9 @@ impl AppServerClient {
         params: Value,
         request_timeout: Duration,
     ) -> Result<Value, AppServerClientError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(runtime_closed_error());
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id_key = id.to_string();
         let (sender, receiver) = oneshot::channel();
@@ -355,6 +475,13 @@ impl AppServerClient {
             .lock()
             .expect("App Server pending map poisoned")
             .insert(id_key.clone(), sender);
+        if self.closed.load(Ordering::Acquire) {
+            self.pending
+                .lock()
+                .expect("App Server pending map poisoned")
+                .remove(&id_key);
+            return Err(runtime_closed_error());
+        }
 
         let message = json!({
             "id": id,
@@ -393,6 +520,9 @@ impl AppServerClient {
         method: &str,
         params: Option<Value>,
     ) -> Result<(), AppServerClientError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(runtime_closed_error());
+        }
         let mut message = json!({ "method": method });
         if let Some(params) = params {
             message["params"] = params;
@@ -405,6 +535,9 @@ impl AppServerClient {
     }
 
     async fn write_message(&self, message: &Value) -> Result<(), AppServerClientError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(runtime_closed_error());
+        }
         let mut bytes = serde_json::to_vec(message).map_err(|error| {
             AppServerClientError::new(
                 "AppServerSerializeFailed",
@@ -414,21 +547,26 @@ impl AppServerClient {
         bytes.push(b'\n');
 
         let mut stdin = self.stdin.lock().await;
-        stdin.write_all(&bytes).await.map_err(|error| {
-            AppServerClientError::new(
+        if let Err(error) = stdin.write_all(&bytes).await {
+            let error = AppServerClientError::new(
                 "AppServerWriteFailed",
                 format!("could not write App Server request: {error}"),
-            )
-        })?;
-        stdin.flush().await.map_err(|error| {
-            AppServerClientError::new(
+            );
+            self.lifecycle.defer_terminal("error", &error.message);
+            return Err(error);
+        }
+        if let Err(error) = stdin.flush().await {
+            let error = AppServerClientError::new(
                 "AppServerWriteFailed",
                 format!("could not flush App Server request: {error}"),
-            )
-        })
+            );
+            self.lifecycle.defer_terminal("error", &error.message);
+            return Err(error);
+        }
+        Ok(())
     }
 
-    async fn is_running(&self) -> bool {
+    pub(crate) async fn is_running(&self) -> bool {
         self.child
             .lock()
             .await
@@ -438,16 +576,63 @@ impl AppServerClient {
     }
 
     async fn shutdown(&self) {
+        let _shutdown_guard = self.shutdown_gate.lock().await;
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pending_responses = {
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("App Server pending map poisoned");
+            pending
+                .drain()
+                .map(|(_, sender)| sender)
+                .collect::<Vec<_>>()
+        };
+        for sender in pending_responses {
+            let _ = sender.send(Err(runtime_closed_error()));
+        }
         let mut child = self.child.lock().await;
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        terminate_owned_child(&mut child).await;
     }
+}
+
+#[cfg(unix)]
+async fn terminate_owned_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    if let Some(pid) = child.id() {
+        let _ = Command::new("/bin/kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    let _ = child.wait().await;
+}
+
+#[cfg(not(unix))]
+async fn terminate_owned_child(child: &mut Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+fn runtime_closed_error() -> AppServerClientError {
+    AppServerClientError::new("RuntimeClosed", RUNTIME_CLOSED_MESSAGE)
 }
 
 fn spawn_stdout_reader(
     stdout: tokio::process::ChildStdout,
     pending: PendingMap,
     notifications: broadcast::Sender<Value>,
+    public_events: broadcast::Sender<AppServerEvent>,
+    lifecycle: Arc<AppServerLifecycle>,
+    closed: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -455,6 +640,7 @@ fn spawn_stdout_reader(
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                        emit_server_log(&public_events, "stdout", line.clone());
                         let _ = notifications.send(json!({
                             "method": "server-log",
                             "params": {
@@ -464,6 +650,22 @@ fn spawn_stdout_reader(
                         }));
                         continue;
                     };
+                    if message.get("method").and_then(Value::as_str) == Some("server-log") {
+                        let params = message.get("params").unwrap_or(&Value::Null);
+                        emit_server_log(
+                            &public_events,
+                            params
+                                .get("stream")
+                                .and_then(Value::as_str)
+                                .unwrap_or("stdout"),
+                            params
+                                .get("text")
+                                .or_else(|| params.get("message"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        );
+                    }
 
                     if let Some(id_key) = message.get("id").map(rpc_id_key) {
                         let sender = pending
@@ -495,11 +697,13 @@ fn spawn_stdout_reader(
                 }
                 Ok(None) => break,
                 Err(error) => {
+                    let text = format!("App Server stdout failed: {error}");
+                    emit_server_log(&public_events, "stdout", text.clone());
                     let _ = notifications.send(json!({
                         "method": "server-log",
                         "params": {
                             "stream": "stdout",
-                            "message": format!("App Server stdout failed: {error}")
+                            "message": text
                         }
                     }));
                     break;
@@ -520,16 +724,29 @@ fn spawn_stdout_reader(
                 "App Server stdout closed",
             )));
         }
+        if !closed.load(Ordering::Acquire) {
+            let message = "Codex App Server stopped";
+            let _ = notifications.send(json!({
+                "method": "server-status",
+                "params": {
+                    "status": "stopped",
+                    "message": message
+                }
+            }));
+            lifecycle.defer_terminal("stopped", message);
+        }
     });
 }
 
 fn spawn_stderr_reader(
     stderr: tokio::process::ChildStderr,
     notifications: broadcast::Sender<Value>,
+    public_events: broadcast::Sender<AppServerEvent>,
 ) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
+            emit_server_log(&public_events, "stderr", line.clone());
             let _ = notifications.send(json!({
                 "method": "server-log",
                 "params": {
@@ -538,6 +755,21 @@ fn spawn_stderr_reader(
                 }
             }));
         }
+    });
+}
+
+fn emit_server_log(public_events: &broadcast::Sender<AppServerEvent>, stream: &str, text: String) {
+    let stream = match stream {
+        "stderr" => "stderr",
+        "artifact" => "artifact",
+        _ => "stdout",
+    };
+    let _ = public_events.send(AppServerEvent {
+        name: "server-log".to_owned(),
+        data: json!({
+            "stream": stream,
+            "text": text
+        }),
     });
 }
 
@@ -559,10 +791,21 @@ pub(crate) struct AppServerBridge {
     launch: AppServerLaunchConfig,
     inner: Arc<Mutex<BridgeInner>>,
     preflight_gate: Arc<Mutex<()>>,
+    shutdown_gate: Arc<Mutex<()>>,
+    closed: Arc<AtomicBool>,
+    shutdown_signal: watch::Sender<bool>,
+    public_events: broadcast::Sender<AppServerEvent>,
+    lifecycle: Arc<AppServerLifecycle>,
 }
 
 impl AppServerBridge {
     pub(crate) fn new(workspace_dir: PathBuf, launch: AppServerLaunchConfig) -> Self {
+        let (shutdown_signal, _) = watch::channel(false);
+        let (public_events, _) = broadcast::channel(256);
+        let lifecycle = Arc::new(AppServerLifecycle {
+            public_events: public_events.clone(),
+            state: StdMutex::new(AppServerLifecycleState::default()),
+        });
         Self {
             workspace_dir,
             launch,
@@ -571,7 +814,28 @@ impl AppServerBridge {
                 client: None,
             })),
             preflight_gate: Arc::new(Mutex::new(())),
+            shutdown_gate: Arc::new(Mutex::new(())),
+            closed: Arc::new(AtomicBool::new(false)),
+            shutdown_signal,
+            public_events,
+            lifecycle,
         }
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<AppServerEvent> {
+        self.public_events.subscribe()
+    }
+
+    pub(crate) fn shutdown_receiver(&self) -> watch::Receiver<bool> {
+        self.shutdown_signal.subscribe()
+    }
+
+    pub(crate) fn bind_operation(&self) -> AppServerOperation {
+        self.lifecycle.bind()
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     pub(crate) async fn diagnostics(&self) -> AppServerDiagnostics {
@@ -579,7 +843,13 @@ impl AppServerBridge {
     }
 
     pub(crate) async fn ensure_ready(&self) -> AppServerDiagnostics {
+        if self.is_closed() {
+            return stopped_diagnostics(self.diagnostics().await);
+        }
         let _guard = self.preflight_gate.lock().await;
+        if self.is_closed() {
+            return stopped_diagnostics(self.diagnostics().await);
+        }
         let current_client = { self.inner.lock().await.client.clone() };
         if let Some(client) = current_client
             && client.is_running().await
@@ -603,7 +873,7 @@ impl AppServerBridge {
                     platform_os: None,
                     checked_at: Some(now_string()),
                 };
-                self.set_failure(diagnostics.clone()).await;
+                self.set_failure(diagnostics.clone(), false).await;
                 return diagnostics;
             }
         };
@@ -621,7 +891,15 @@ impl AppServerBridge {
         };
         self.inner.lock().await.diagnostics = diagnostics.clone();
 
-        let client = match AppServerClient::spawn(&selected.command, &self.workspace_dir).await {
+        self.lifecycle.reset_terminal();
+        let client = match AppServerClient::spawn(
+            &selected.command,
+            &self.workspace_dir,
+            self.public_events.clone(),
+            self.lifecycle.clone(),
+        )
+        .await
+        {
             Ok(client) => client,
             Err(error) => {
                 diagnostics.status = "error".to_owned();
@@ -630,7 +908,7 @@ impl AppServerBridge {
                     message: error.message,
                 });
                 diagnostics.checked_at = Some(now_string());
-                self.set_failure(diagnostics.clone()).await;
+                self.set_failure(diagnostics.clone(), true).await;
                 return diagnostics;
             }
         };
@@ -658,7 +936,7 @@ impl AppServerBridge {
                     message: error.message,
                 });
                 diagnostics.checked_at = Some(now_string());
-                self.set_failure(diagnostics.clone()).await;
+                self.set_failure(diagnostics.clone(), true).await;
                 return diagnostics;
             }
         };
@@ -671,7 +949,7 @@ impl AppServerBridge {
                 message: error.message,
             });
             diagnostics.checked_at = Some(now_string());
-            self.set_failure(diagnostics.clone()).await;
+            self.set_failure(diagnostics.clone(), true).await;
             return diagnostics;
         }
 
@@ -686,6 +964,8 @@ impl AppServerBridge {
         let mut inner = self.inner.lock().await;
         inner.diagnostics = diagnostics.clone();
         inner.client = Some(client);
+        drop(inner);
+        self.emit_ready(&diagnostics);
         diagnostics
     }
 
@@ -701,11 +981,62 @@ impl AppServerBridge {
         self.inner.lock().await.client.clone()
     }
 
-    async fn set_failure(&self, diagnostics: AppServerDiagnostics) {
+    async fn set_failure(&self, diagnostics: AppServerDiagnostics, emit_event: bool) {
+        let message = diagnostics
+            .error
+            .as_ref()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| "Codex App Server failed".to_owned());
         let mut inner = self.inner.lock().await;
         inner.diagnostics = diagnostics;
         inner.client = None;
+        drop(inner);
+        if emit_event {
+            self.lifecycle.defer_terminal("error", &message);
+        }
     }
+
+    pub(crate) async fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
+        let _guard = self.shutdown_gate.lock().await;
+        if *self.shutdown_signal.borrow() {
+            return;
+        }
+        let _preflight = self.preflight_gate.lock().await;
+        let client = {
+            let mut inner = self.inner.lock().await;
+            let client = inner.client.take();
+            inner.diagnostics = stopped_diagnostics(inner.diagnostics.clone());
+            client
+        };
+        if let Some(client) = client {
+            client.shutdown().await;
+        }
+        let _ = self.shutdown_signal.send(true);
+    }
+
+    fn emit_ready(&self, diagnostics: &AppServerDiagnostics) {
+        let _ = self.public_events.send(AppServerEvent {
+            name: "server-status".to_owned(),
+            data: json!({
+                "status": "ready",
+                "platform": diagnostics.platform_os.as_deref().unwrap_or_default(),
+                "selectedCommand": diagnostics.selected_command.as_deref().unwrap_or_default(),
+                "selectedSource": diagnostics.selected_source.as_deref().unwrap_or_default()
+            }),
+        });
+    }
+}
+
+fn stopped_diagnostics(mut diagnostics: AppServerDiagnostics) -> AppServerDiagnostics {
+    diagnostics.status = "stopped".to_owned();
+    diagnostics.ready = false;
+    diagnostics.error = Some(AppServerDiagnosticError {
+        code: "RuntimeClosed".to_owned(),
+        message: RUNTIME_CLOSED_MESSAGE.to_owned(),
+    });
+    diagnostics.checked_at = Some(now_string());
+    diagnostics
 }
 
 fn display_path(path: &Path) -> String {
@@ -722,6 +1053,126 @@ fn now_string() -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Barrier;
+
+    fn fixture_lifecycle() -> (Arc<AppServerLifecycle>, broadcast::Receiver<AppServerEvent>) {
+        let (public_events, receiver) = broadcast::channel(16);
+        (
+            Arc::new(AppServerLifecycle {
+                public_events,
+                state: StdMutex::new(AppServerLifecycleState::default()),
+            }),
+            receiver,
+        )
+    }
+
+    #[test]
+    fn shutdown_contract_terminal_defer_and_last_operation_emit_exactly_once() {
+        let (lifecycle, mut events) = fixture_lifecycle();
+        let operation = lifecycle.bind();
+        let barrier = Arc::new(Barrier::new(3));
+        let defer_lifecycle = lifecycle.clone();
+        let defer_barrier = barrier.clone();
+        let defer = std::thread::spawn(move || {
+            defer_barrier.wait();
+            defer_lifecycle.defer_terminal("stopped", "fixture stopped");
+        });
+        let finish_barrier = barrier.clone();
+        let finish = std::thread::spawn(move || {
+            finish_barrier.wait();
+            drop(operation);
+        });
+        barrier.wait();
+        defer.join().expect("terminal defer thread");
+        finish.join().expect("operation finish thread");
+
+        let event = events.try_recv().expect("one terminal event");
+        assert_eq!(event.name, "server-status");
+        assert_eq!(
+            event.data,
+            json!({"status": "stopped", "message": "fixture stopped"})
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_contract_owned_child_observes_sigterm_and_pending_rpc_closes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let marker = temporary.path().join("term-observed");
+        let fake = temporary.path().join("fake-codex");
+        let mut file = fs::File::create(&fake).expect("fake executable");
+        writeln!(
+            file,
+            "#!/bin/sh\n\
+             test \"$1\" = \"app-server\" || exit 2\n\
+             marker=\"{}\"\n\
+             trap 'printf TERM > \"$marker\"; exit 0' TERM\n\
+             printf READY > \"$marker\"\n\
+             while :; do :; done",
+            display_path(&marker)
+        )
+        .expect("fake source");
+        file.flush().expect("fake source flushed");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = file.metadata().expect("fake metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&fake, permissions).expect("fake executable permissions");
+        }
+        let (public_events, _) = broadcast::channel(16);
+        let (lifecycle, _) = fixture_lifecycle();
+        let client = AppServerClient::spawn(&fake, &workspace, public_events, lifecycle)
+            .await
+            .expect("owned child");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if fs::read_to_string(&marker).ok().as_deref() == Some("READY") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("TERM trap installed");
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .request("fixture/pending", json!({}), Duration::from_secs(10))
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !client.pending.lock().expect("pending map").is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending RPC registered");
+
+        let left = client.clone();
+        let right = client.clone();
+        tokio::join!(left.shutdown(), right.shutdown());
+        let error = pending
+            .await
+            .expect("pending task")
+            .expect_err("pending RPC rejected");
+        assert_eq!(error.code, "RuntimeClosed");
+        assert_eq!(error.message, RUNTIME_CLOSED_MESSAGE);
+        assert_eq!(
+            fs::read_to_string(marker).expect("TERM marker"),
+            "TERM",
+            "owned child must observe SIGTERM rather than SIGKILL"
+        );
+        assert!(!client.is_running().await);
+    }
 
     #[tokio::test]
     async fn preflight_registers_the_request_before_a_synchronous_response() {

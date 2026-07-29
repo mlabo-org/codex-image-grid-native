@@ -9,7 +9,7 @@ pub use app_server::{
 };
 
 use analysis::ReferenceAnalysisRuntime;
-use app_server::{AppServerBridge, AppServerLaunchConfig};
+use app_server::{AppServerBridge, AppServerEvent, AppServerLaunchConfig};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
@@ -33,8 +33,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -232,13 +231,43 @@ impl RuntimeState {
     }
 }
 
-pub fn router(config: RuntimeConfig) -> Router {
-    router_with_launch_config(config, AppServerLaunchConfig::from_environment())
+#[derive(Clone)]
+pub struct RuntimeShutdown {
+    generation: GenerationRuntime,
 }
 
+impl RuntimeShutdown {
+    pub async fn shutdown(&self) {
+        self.generation.shutdown().await;
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.generation.is_closed()
+    }
+}
+
+pub fn router(config: RuntimeConfig) -> Router {
+    router_with_shutdown(config).0
+}
+
+pub fn router_with_shutdown(config: RuntimeConfig) -> (Router, RuntimeShutdown) {
+    router_with_launch_config_and_shutdown(config, AppServerLaunchConfig::from_environment())
+}
+
+#[cfg(test)]
 fn router_with_launch_config(config: RuntimeConfig, launch: AppServerLaunchConfig) -> Router {
+    router_with_launch_config_and_shutdown(config, launch).0
+}
+
+fn router_with_launch_config_and_shutdown(
+    config: RuntimeConfig,
+    launch: AppServerLaunchConfig,
+) -> (Router, RuntimeShutdown) {
     let state = RuntimeState::new(config, launch);
-    router_with_state(state)
+    let shutdown = RuntimeShutdown {
+        generation: state.generation.clone(),
+    };
+    (router_with_state(state), shutdown)
 }
 
 fn router_with_state(state: RuntimeState) -> Router {
@@ -444,15 +473,62 @@ fn json_string(value: &Value) -> String {
 async fn events(
     State(state): State<RuntimeState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let mut runtime_events = state.generation.subscribe();
+    let mut app_server_events = state.app_server.subscribe();
+    let mut shutdown = state.generation.shutdown_receiver();
     let snapshot = serde_json::to_string(&state.generation.snapshot().await)
         .unwrap_or_else(|_| "[]".to_owned());
-    let initial = tokio_stream::once(Ok(Event::default().event("snapshot").data(snapshot)));
-    let updates = BroadcastStream::new(state.generation.subscribe()).filter_map(|result| {
-        let event = result.ok()?;
-        let data = serde_json::to_string(&event.data).ok()?;
-        Some(Ok(Event::default().event(event.name).data(data)))
+    let (sender, receiver) = tokio::sync::mpsc::channel(128);
+    tokio::spawn(async move {
+        if sender
+            .send(Ok(Event::default().event("snapshot").data(snapshot)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                result = runtime_events.recv() => {
+                    let Ok(event) = result else {
+                        continue;
+                    };
+                    let Ok(data) = serde_json::to_string(&event.data) else {
+                        continue;
+                    };
+                    if sender
+                        .send(Ok(Event::default().event(event.name).data(data)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                result = app_server_events.recv() => {
+                    let Ok(AppServerEvent { name, data }) = result else {
+                        continue;
+                    };
+                    let Ok(data) = serde_json::to_string(&data) else {
+                        continue;
+                    };
+                    if sender
+                        .send(Ok(Event::default().event(name).data(data)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
     });
-    Sse::new(initial.chain(updates))
+    Sse::new(ReceiverStream::new(receiver))
 }
 
 async fn run_single(
@@ -499,7 +575,15 @@ async fn create_run_response(
             Json(response),
         )
             .into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, Json(error.body())).into_response(),
+        Err(error) => (
+            if error.code.as_deref() == Some("RuntimeClosed") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            Json(error.body()),
+        )
+            .into_response(),
     }
 }
 
@@ -782,6 +866,199 @@ done
         assert_eq!(health["appServerImageReady"], true);
         assert_eq!(health["codexAppServer"]["status"], "ready");
         assert_eq!(health["identity"]["codexAppServer"]["status"], "ready");
+    }
+
+    #[tokio::test]
+    async fn shutdown_contract_sse_orders_snapshot_and_normalized_public_events_then_closes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let server_root = temporary.path().join("server");
+        let data_dir = temporary.path().join("data");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&server_root).expect("server root");
+        fs::create_dir_all(&data_dir).expect("data root");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let fake = temporary.path().join("fake-codex");
+        let mut file = fs::File::create(&fake).expect("fake executable");
+        file.write_all(
+            br#"#!/bin/sh
+test "$1" = "app-server" || exit 2
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' 'fixture stdout log'
+      printf '%s\n' 'fixture stderr log' >&2
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"fixture-thread"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"fixture-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"fixture-thread","turnId":"fixture-turn","item":{"type":"imageGeneration","id":"fixture-image","status":"completed","result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"completed","error":null}}}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("fake source");
+        file.flush().expect("fake source flushed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = file.metadata().expect("fake metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&fake, permissions).expect("fake executable permissions");
+        }
+
+        let config =
+            RuntimeConfig::new(server_root, data_dir, Some(workspace), "server".to_owned());
+        let (app, shutdown) = router_with_launch_config_and_shutdown(
+            config,
+            AppServerLaunchConfig::single("fixture", fake.clone()),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .body(Body::empty())
+                    .expect("SSE request"),
+            )
+            .await
+            .expect("SSE response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio_stream::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("snapshot deadline")
+        .expect("snapshot chunk")
+        .expect("snapshot data");
+        let first = String::from_utf8(first.to_vec()).expect("snapshot UTF-8");
+        assert!(first.starts_with("event: snapshot\ndata: []"));
+        assert!(!first.contains("server-status"));
+
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/preflight/app-server-image")
+                    .body(Body::empty())
+                    .expect("preflight request"),
+            )
+            .await
+            .expect("preflight response");
+        assert_eq!(preflight.status(), StatusCode::OK);
+
+        let run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/run-batch")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "prompts": ["SSE fixture"],
+                            "count": 1,
+                            "waitMs": 2000
+                        })
+                        .to_string(),
+                    ))
+                    .expect("run request"),
+            )
+            .await
+            .expect("run response");
+        assert_eq!(run.status(), StatusCode::OK);
+
+        let mut public_events = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !(public_events.contains("event: server-log")
+                && public_events.contains("\"stream\":\"stdout\"")
+                && public_events.contains("\"text\":\"fixture stdout log\"")
+                && public_events.contains("\"stream\":\"stderr\"")
+                && public_events.contains("\"text\":\"fixture stderr log\"")
+                && public_events.contains("event: server-status")
+                && public_events.contains("\"status\":\"ready\"")
+                && public_events.contains("\"platform\":\"macos\"")
+                && public_events.contains("\"selectedSource\":\"fixture\"")
+                && public_events.contains("\"status\":\"stopped\"")
+                && public_events.contains("\"message\":\"Codex App Server stopped\"")
+                && public_events.contains("event: run")
+                && public_events.contains("event: job"))
+            {
+                let chunk = tokio_stream::StreamExt::next(&mut stream)
+                    .await
+                    .expect("public event chunk")
+                    .expect("public event data");
+                public_events
+                    .push_str(&String::from_utf8(chunk.to_vec()).expect("public event UTF-8"));
+            }
+        })
+        .await
+        .expect("public event deadline");
+        assert!(public_events.contains(&display_path(&fake)));
+
+        let left = shutdown.clone();
+        let right = shutdown.clone();
+        tokio::join!(left.shutdown(), right.shutdown());
+        assert!(shutdown.is_closed());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while tokio_stream::StreamExt::next(&mut stream).await.is_some() {}
+        })
+        .await
+        .expect("SSE must close before Axum graceful drain");
+
+        let rejected_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/run")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"prompt": "closed"}).to_string()))
+                    .expect("closed run request"),
+            )
+            .await
+            .expect("closed run response");
+        assert_eq!(rejected_run.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let rejected_analysis = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/analyze-reference")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "referenceImage": {
+                                "dataUrl": format!(
+                                    "data:image/png;base64,{}",
+                                    BASE64_STANDARD.encode(b"closed")
+                                )
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("closed analysis request"),
+            )
+            .await
+            .expect("closed analysis response");
+        assert_eq!(rejected_analysis.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = rejected_analysis
+            .into_body()
+            .collect()
+            .await
+            .expect("closed analysis body")
+            .to_bytes();
+        let body: Value = serde_json::from_slice(&body).expect("closed analysis JSON");
+        assert_eq!(body["code"], "RuntimeClosed");
     }
 
     #[tokio::test]
