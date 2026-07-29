@@ -20,15 +20,18 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use image_grid_core::{APP_IDENTITY, MAX_RUN_JOBS};
 use runtime::{
-    GenerationRuntime, content_type, render_artifact_page, render_image_page, valid_run_id,
+    GeneratedJobFileError, GenerationRuntime, content_type, render_artifact_page,
+    render_image_page, valid_run_id,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -42,6 +45,24 @@ pub struct RuntimeConfig {
     pub workspace_dir: PathBuf,
     pub launch_target: String,
     pub package_root_kind: String,
+}
+
+trait HostOpener: Send + Sync {
+    fn open(&self, arguments: &[OsString]) -> io::Result<()>;
+}
+
+struct SystemHostOpener;
+
+impl HostOpener for SystemHostOpener {
+    fn open(&self, arguments: &[OsString]) -> io::Result<()> {
+        Command::new("open")
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
+    }
 }
 
 impl RuntimeConfig {
@@ -184,10 +205,19 @@ struct RuntimeState {
     app_server: AppServerBridge,
     analysis: ReferenceAnalysisRuntime,
     generation: GenerationRuntime,
+    host_opener: Arc<dyn HostOpener>,
 }
 
 impl RuntimeState {
     fn new(config: RuntimeConfig, launch: AppServerLaunchConfig) -> Self {
+        Self::new_with_opener(config, launch, Arc::new(SystemHostOpener))
+    }
+
+    fn new_with_opener(
+        config: RuntimeConfig,
+        launch: AppServerLaunchConfig,
+        host_opener: Arc<dyn HostOpener>,
+    ) -> Self {
         let app_server = AppServerBridge::new(config.workspace_dir.clone(), launch);
         let config = Arc::new(config);
         let analysis = ReferenceAnalysisRuntime::new(config.clone(), app_server.clone());
@@ -197,6 +227,7 @@ impl RuntimeState {
             app_server,
             analysis,
             generation,
+            host_opener,
         }
     }
 }
@@ -207,6 +238,10 @@ pub fn router(config: RuntimeConfig) -> Router {
 
 fn router_with_launch_config(config: RuntimeConfig, launch: AppServerLaunchConfig) -> Router {
     let state = RuntimeState::new(config, launch);
+    router_with_state(state)
+}
+
+fn router_with_state(state: RuntimeState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/events", get(events))
@@ -215,6 +250,14 @@ fn router_with_launch_config(config: RuntimeConfig, launch: AppServerLaunchConfi
         .route(
             "/api/analyze-reference",
             axum::routing::post(analyze_reference),
+        )
+        .route(
+            "/api/open-generated-dir",
+            axum::routing::post(open_generated_dir),
+        )
+        .route(
+            "/api/open-generated-file",
+            axum::routing::post(open_generated_file),
         )
         .route("/api/runs", get(run_list))
         .route("/api/runs/{run_id}", get(run_status))
@@ -264,6 +307,137 @@ async fn analyze_reference(State(state): State<RuntimeState>, request: AxumReque
     match state.analysis.analyze(body).await {
         Ok(premise) => (StatusCode::OK, Json(json!({ "premise": premise }))).into_response(),
         Err(error) => error.into_response(),
+    }
+}
+
+async fn open_generated_dir(State(state): State<RuntimeState>) -> Response {
+    if let Err(error) = tokio::fs::create_dir_all(&state.config.generated_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    let path = display_path(&state.config.generated_dir);
+    if let Err(error) = state
+        .host_opener
+        .open(&[state.config.generated_dir.as_os_str().to_owned()])
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(json!({ "ok": true, "path": path }))).into_response()
+}
+
+async fn open_generated_file(State(state): State<RuntimeState>, request: AxumRequest) -> Response {
+    let body = match http_json::read_json_body(request).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    let job_id = compatible_request_string(body.get("jobId"), "")
+        .trim()
+        .to_owned();
+    let action = compatible_request_string(body.get("action"), "reveal");
+    if job_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "jobId is required" })),
+        )
+            .into_response();
+    }
+    if !matches!(action.as_str(), "reveal" | "open") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid action" })),
+        )
+            .into_response();
+    }
+
+    let path = match state.generation.generated_file_for_job(&job_id).await {
+        Ok(path) => path,
+        Err(GeneratedJobFileError::JobNotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "job not found" })),
+            )
+                .into_response();
+        }
+        Err(GeneratedJobFileError::GeneratedFileNotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "generated file not found" })),
+            )
+                .into_response();
+        }
+        Err(GeneratedJobFileError::Forbidden) => {
+            return (StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))).into_response();
+        }
+        Err(GeneratedJobFileError::Io(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let mut arguments = Vec::with_capacity(2);
+    if action == "reveal" {
+        arguments.push(OsString::from("-R"));
+    }
+    arguments.push(path.as_os_str().to_owned());
+    if let Err(error) = state.host_opener.open(&arguments) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "action": action,
+            "path": display_path(&path)
+        })),
+    )
+        .into_response()
+}
+
+fn compatible_request_string(value: Option<&Value>, fallback: &str) -> String {
+    value
+        .filter(|value| json_truthy(value))
+        .map(json_string)
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn json_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+fn json_string(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| match value {
+                Value::Null => String::new(),
+                value => json_string(value),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => "[object Object]".to_owned(),
     }
 }
 
@@ -495,6 +669,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use http_body_util::BodyExt;
     use std::io::Write;
+    use std::sync::Mutex as StdMutex;
     use tower::ServiceExt;
 
     #[test]
@@ -1169,5 +1344,380 @@ done
                 .next()
                 .is_none()
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingHostOpener {
+        calls: StdMutex<Vec<Vec<OsString>>>,
+        fail: bool,
+    }
+
+    impl HostOpener for RecordingHostOpener {
+        fn open(&self, arguments: &[OsString]) -> io::Result<()> {
+            self.calls
+                .lock()
+                .expect("host opener calls")
+                .push(arguments.to_vec());
+            if self.fail {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "fixture open command unavailable",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn finder_test_job(job_id: &str, output_path: &Path) -> runtime::ImageGridJob {
+        runtime::ImageGridJob {
+            id: job_id.to_owned(),
+            run_id: "feedface".to_owned(),
+            engine: "app-server-image".to_owned(),
+            model: "gpt-image-1".to_owned(),
+            prompt: "finder fixture".to_owned(),
+            reference_premise: String::new(),
+            mood: "warm-mascot".to_owned(),
+            prompt_index: 1,
+            prompt_total: 1,
+            variant: 1,
+            total: 1,
+            filename: "variant-01.png".to_owned(),
+            output_path: display_path(output_path),
+            aspect_ratio: "16:9".to_owned(),
+            reference_image_path: None,
+            reference_image_url: None,
+            manifest_path: "/tmp/manifest.json".to_owned(),
+            manifest_url: "/generated/feedface/manifest.json".to_owned(),
+            manifest_view_url: "/artifacts/feedface/manifest".to_owned(),
+            handoff_path: "/tmp/handoff.md".to_owned(),
+            handoff_url: "/generated/feedface/handoff.md".to_owned(),
+            handoff_view_url: "/artifacts/feedface/handoff".to_owned(),
+            output_format: "png".to_owned(),
+            status: "done".to_owned(),
+            status_text: "Generated".to_owned(),
+            image_url: Some("/generated/feedface/variant-01.png".to_owned()),
+            log: String::new(),
+            thread_id: None,
+            turn_id: None,
+            error_code: None,
+            error_message: None,
+            upstream_status: Some("completed".to_owned()),
+            diagnostic_log: String::new(),
+            retry_count: 0,
+            timing: runtime::JobTiming {
+                phase: "done".to_owned(),
+                phase_changed_at: 1,
+                enqueued_at: 1,
+                dequeued_at: Some(1),
+                first_started_at: Some(1),
+                first_running_at: Some(1),
+                completed_at: Some(1),
+                queue_ms: Some(0),
+                execution_ms: Some(0),
+                total_ms: Some(0),
+                cooldown_ms: 0,
+                attempt_count: 1,
+                current_attempt_started_at: None,
+                last_attempt_completed_at: Some(1),
+                last_attempt_ms: Some(0),
+            },
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    async fn finder_test_app(
+        temporary: &tempfile::TempDir,
+        opener: Arc<RecordingHostOpener>,
+    ) -> (Router, GenerationRuntime, RuntimeConfig) {
+        let config = RuntimeConfig::new(
+            temporary.path().join("server"),
+            temporary.path().join("data"),
+            Some(temporary.path().join("workspace")),
+            "server".to_owned(),
+        );
+        fs::create_dir_all(&config.server_root).expect("server root");
+        fs::create_dir_all(&config.workspace_dir).expect("workspace");
+        let state = RuntimeState::new_with_opener(
+            config.clone(),
+            AppServerLaunchConfig::single("unused", temporary.path().join("unused-codex")),
+            opener,
+        );
+        let generation = state.generation.clone();
+        (router_with_state(state), generation, config)
+    }
+
+    async fn finder_request(app: &Router, uri: &str, body: impl Into<Body>) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body.into())
+                    .expect("finder request"),
+            )
+            .await
+            .expect("finder response");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("finder response body")
+            .to_bytes();
+        let body = serde_json::from_slice(&bytes).expect("finder response JSON");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn finder_http_routes_use_owned_paths_and_exact_open_arguments() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let opener = Arc::new(RecordingHostOpener::default());
+        let (app, generation, config) = finder_test_app(&temporary, opener.clone()).await;
+
+        let (status, body) = finder_request(&app, "/api/open-generated-dir", Body::from("{")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "ok": true,
+                "path": display_path(&config.generated_dir)
+            })
+        );
+        assert!(config.generated_dir.is_dir());
+
+        let run_directory = config.generated_dir.join("feedface");
+        fs::create_dir_all(&run_directory).expect("run directory");
+        let output_path = run_directory.join("variant-01.png");
+        fs::write(&output_path, b"fixture image").expect("generated file");
+        generation
+            .insert_test_job(finder_test_job("42", &output_path))
+            .await;
+        let real_output = fs::canonicalize(&output_path).expect("canonical generated file");
+        let caller_path = display_path(&temporary.path().join("caller-controlled.png"));
+
+        let (status, body) = finder_request(
+            &app,
+            "/api/open-generated-file",
+            Body::from(
+                json!({
+                    "jobId": 42,
+                    "outputPath": caller_path
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "ok": true,
+                "action": "reveal",
+                "path": display_path(&real_output)
+            })
+        );
+
+        let (status, body) = finder_request(
+            &app,
+            "/api/open-generated-file",
+            Body::from(json!({ "jobId": " 42 ", "action": "open" }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["action"], "open");
+        assert_eq!(body["path"], display_path(&real_output));
+
+        let calls = opener.calls.lock().expect("host opener calls");
+        assert_eq!(
+            calls.as_slice(),
+            &[
+                vec![config.generated_dir.as_os_str().to_owned()],
+                vec![OsString::from("-R"), real_output.as_os_str().to_owned()],
+                vec![real_output.as_os_str().to_owned()]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn finder_http_routes_reject_unowned_unsafe_and_invalid_requests() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let opener = Arc::new(RecordingHostOpener::default());
+        let (app, generation, config) = finder_test_app(&temporary, opener.clone()).await;
+        fs::create_dir_all(config.generated_dir.join("feedface")).expect("generated root");
+
+        let outside_path = temporary.path().join("outside.png");
+        fs::write(&outside_path, b"outside").expect("outside file");
+        let traversal = config
+            .generated_dir
+            .join("feedface")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("outside.png");
+        generation
+            .insert_test_job(finder_test_job("traversal", &traversal))
+            .await;
+
+        let missing_path = config.generated_dir.join("feedface").join("missing.png");
+        generation
+            .insert_test_job(finder_test_job("missing", &missing_path))
+            .await;
+
+        let directory_path = config.generated_dir.join("feedface").join("directory.png");
+        fs::create_dir_all(&directory_path).expect("directory output");
+        generation
+            .insert_test_job(finder_test_job("directory", &directory_path))
+            .await;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside_link = config
+                .generated_dir
+                .join("feedface")
+                .join("outside-link.png");
+            symlink(&outside_path, &outside_link).expect("outside symlink");
+            generation
+                .insert_test_job(finder_test_job("outside-link", &outside_link))
+                .await;
+
+            let inside_target = config
+                .generated_dir
+                .join("feedface")
+                .join("inside-target.png");
+            fs::write(&inside_target, b"inside").expect("inside target");
+            let inside_link = config
+                .generated_dir
+                .join("feedface")
+                .join("inside-link.png");
+            symlink(&inside_target, &inside_link).expect("inside symlink");
+            generation
+                .insert_test_job(finder_test_job("inside-link", &inside_link))
+                .await;
+        }
+
+        for (payload, expected_status, expected_error) in [
+            (
+                json!({ "jobId": "not-owned" }),
+                StatusCode::NOT_FOUND,
+                "job not found",
+            ),
+            (
+                json!({ "jobId": "traversal" }),
+                StatusCode::FORBIDDEN,
+                "forbidden",
+            ),
+            (
+                json!({ "jobId": "missing" }),
+                StatusCode::NOT_FOUND,
+                "generated file not found",
+            ),
+            (
+                json!({ "jobId": "directory" }),
+                StatusCode::NOT_FOUND,
+                "generated file not found",
+            ),
+            (json!({}), StatusCode::BAD_REQUEST, "jobId is required"),
+            (
+                json!({ "jobId": "missing", "action": "preview" }),
+                StatusCode::BAD_REQUEST,
+                "invalid action",
+            ),
+        ] {
+            let (status, body) = finder_request(
+                &app,
+                "/api/open-generated-file",
+                Body::from(payload.to_string()),
+            )
+            .await;
+            assert_eq!(status, expected_status);
+            assert_eq!(body, json!({ "error": expected_error }));
+        }
+
+        #[cfg(unix)]
+        for (job_id, expected_status, expected_error) in [
+            ("outside-link", StatusCode::FORBIDDEN, "forbidden"),
+            (
+                "inside-link",
+                StatusCode::NOT_FOUND,
+                "generated file not found",
+            ),
+        ] {
+            let (status, body) = finder_request(
+                &app,
+                "/api/open-generated-file",
+                Body::from(json!({ "jobId": job_id }).to_string()),
+            )
+            .await;
+            assert_eq!(status, expected_status);
+            assert_eq!(body, json!({ "error": expected_error }));
+        }
+
+        let (status, body) =
+            finder_request(&app, "/api/open-generated-file", Body::from("{")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "InvalidJsonBody");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/open-generated-file")
+                    .header(
+                        header::CONTENT_LENGTH,
+                        http_json::DEFAULT_JSON_BODY_BYTES + 1,
+                    )
+                    .body(Body::empty())
+                    .expect("oversized finder request"),
+            )
+            .await
+            .expect("oversized finder response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("oversized response body")
+                .to_bytes(),
+        )
+        .expect("oversized response JSON");
+        assert_eq!(body["code"], "RequestBodyTooLarge");
+        assert!(opener.calls.lock().expect("host opener calls").is_empty());
+    }
+
+    #[tokio::test]
+    async fn finder_http_routes_report_host_spawn_errors_without_real_open() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let opener = Arc::new(RecordingHostOpener {
+            calls: StdMutex::new(Vec::new()),
+            fail: true,
+        });
+        let (app, generation, config) = finder_test_app(&temporary, opener).await;
+
+        let (status, body) = finder_request(&app, "/api/open-generated-dir", Body::empty()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "fixture open command unavailable");
+
+        let run_directory = config.generated_dir.join("feedface");
+        fs::create_dir_all(&run_directory).expect("run directory");
+        let output_path = run_directory.join("variant-01.png");
+        fs::write(&output_path, b"fixture image").expect("generated file");
+        generation
+            .insert_test_job(finder_test_job("owned", &output_path))
+            .await;
+        let (status, body) = finder_request(
+            &app,
+            "/api/open-generated-file",
+            Body::from(json!({ "jobId": "owned" }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "fixture open command unavailable");
     }
 }
