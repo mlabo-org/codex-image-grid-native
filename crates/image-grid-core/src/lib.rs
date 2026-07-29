@@ -140,7 +140,7 @@ pub enum ReferenceImageError {
     PathNotAbsolute,
     UnsupportedExtension,
     Unavailable { path: PathBuf, reason: String },
-    NotRegularFile,
+    NotRegularFile { path: PathBuf },
     TooLarge { actual: u64, maximum: u64 },
     StageFailed { path: PathBuf, reason: String },
 }
@@ -167,16 +167,17 @@ impl fmt::Display for ReferenceImageError {
                     path.display()
                 )
             }
-            Self::NotRegularFile => {
+            Self::NotRegularFile { path } => {
                 write!(
                     formatter,
-                    "referenceImagePath must point to a regular file"
+                    "referenceImagePath must point to a regular file: {}",
+                    path.display()
                 )
             }
             Self::TooLarge { maximum, .. } => {
                 write!(
                     formatter,
-                    "referenceImagePath is too large; keep it at or below {maximum} bytes"
+                    "reference image is too large; keep it at or below {maximum} bytes"
                 )
             }
             Self::StageFailed { path, reason } => {
@@ -206,7 +207,9 @@ pub fn validate_reference_image(
         reason: error.to_string(),
     })?;
     if !metadata.is_file() {
-        return Err(ReferenceImageError::NotRegularFile);
+        return Err(ReferenceImageError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
     }
     if metadata.len() > MAX_REFERENCE_IMAGE_BYTES {
         return Err(ReferenceImageError::TooLarge {
@@ -215,11 +218,10 @@ pub fn validate_reference_image(
         });
     }
 
-    let source_path =
-        fs::canonicalize(path).map_err(|error| ReferenceImageError::Unavailable {
-            path: path.to_path_buf(),
-            reason: error.to_string(),
-        })?;
+    let source_path = fs::canonicalize(path).map_err(|error| ReferenceImageError::Unavailable {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
+    })?;
 
     Ok(ValidatedReferenceImage {
         source_path,
@@ -252,17 +254,15 @@ pub fn stage_reference_image(
             reason: error.to_string(),
         })?;
 
-    let copied = io::copy(
-        &mut source.take(MAX_REFERENCE_IMAGE_BYTES + 1),
-        &mut staged,
-    )
-    .map_err(|error| {
-        let _ = fs::remove_file(&staged_path);
-        ReferenceImageError::StageFailed {
-            path: staged_path.clone(),
-            reason: error.to_string(),
-        }
-    })?;
+    let copied = io::copy(&mut source.take(MAX_REFERENCE_IMAGE_BYTES + 1), &mut staged).map_err(
+        |error| {
+            let _ = fs::remove_file(&staged_path);
+            ReferenceImageError::StageFailed {
+                path: staged_path.clone(),
+                reason: error.to_string(),
+            }
+        },
+    )?;
     if copied > MAX_REFERENCE_IMAGE_BYTES {
         drop(staged);
         let _ = fs::remove_file(&staged_path);
@@ -335,11 +335,13 @@ mod tests {
         let source_path = external_directory.join("user-selected-name.jpeg");
         fs::write(&source_path, b"original reference bytes").expect("reference fixture");
 
-        let staged =
-            stage_reference_image(&source_path, &run_directory).expect("reference staged");
+        let staged = stage_reference_image(&source_path, &run_directory).expect("reference staged");
 
         assert_eq!(
-            staged.staged_path.file_name().and_then(|name| name.to_str()),
+            staged
+                .staged_path
+                .file_name()
+                .and_then(|name| name.to_str()),
             Some("reference.jpg")
         );
         assert_eq!(staged.media_type, "image/jpeg");
@@ -362,11 +364,9 @@ mod tests {
         let run_directory = temporary.path().join("generated").join("run-1234");
         fs::create_dir_all(&run_directory).expect("run directory");
         fs::write(&source_path, b"new bytes").expect("reference fixture");
-        fs::write(run_directory.join("reference.png"), b"old bytes")
-            .expect("old staged reference");
+        fs::write(run_directory.join("reference.png"), b"old bytes").expect("old staged reference");
 
-        let staged =
-            stage_reference_image(&source_path, &run_directory).expect("reference staged");
+        let staged = stage_reference_image(&source_path, &run_directory).expect("reference staged");
 
         assert_eq!(
             fs::read(staged.staged_path).expect("replaced bytes"),
@@ -390,9 +390,20 @@ mod tests {
             validate_reference_image(temporary.path().join("missing.png")),
             Err(ReferenceImageError::Unavailable { .. })
         ));
+        let directory_error =
+            validate_reference_image(&directory_path).expect_err("directory must be rejected");
         assert_eq!(
-            validate_reference_image(&directory_path),
-            Err(ReferenceImageError::NotRegularFile)
+            directory_error,
+            ReferenceImageError::NotRegularFile {
+                path: directory_path.clone()
+            }
+        );
+        assert_eq!(
+            directory_error.to_string(),
+            format!(
+                "referenceImagePath must point to a regular file: {}",
+                directory_path.display()
+            )
         );
         assert_eq!(
             validate_reference_image(&unsupported_path),
@@ -422,12 +433,20 @@ mod tests {
                 .size_bytes,
             MAX_REFERENCE_IMAGE_BYTES
         );
+        let size_error =
+            validate_reference_image(&rejected_path).expect_err("oversized image must be rejected");
         assert_eq!(
-            validate_reference_image(&rejected_path),
-            Err(ReferenceImageError::TooLarge {
+            size_error,
+            ReferenceImageError::TooLarge {
                 actual: MAX_REFERENCE_IMAGE_BYTES + 1,
                 maximum: MAX_REFERENCE_IMAGE_BYTES,
-            })
+            }
+        );
+        assert_eq!(
+            size_error.to_string(),
+            format!(
+                "reference image is too large; keep it at or below {MAX_REFERENCE_IMAGE_BYTES} bytes"
+            )
         );
     }
 }

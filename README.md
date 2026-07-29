@@ -49,18 +49,18 @@ The provider-free first runnable slice now includes:
   stable App Server image notifications, and atomic image/artifact writes;
 - stdio MCP JSONL handling for `initialize`, `ping`, `tools/list`, and
   `tools/call`, including the frozen `generate_image_grid` schema and
-  validation errors;
+  validation errors, bounded native-server launch/join, health and App Server
+  preflight checks, and compatible success summaries/structured content;
 - a responsive SwiftUI compatibility shell with the frozen language, theme,
   prompt, generation-option, reference-image, and result-filter controls.
 
-The provider-free fixture now completes a real run through the owned App Server
-transport and validates the generated image, run response, manifest, handoff,
+The provider-free fixture now completes real HTTP and MCP runs through the
+owned App Server transport and validates generated images, local reference
+copy staging, compatible MCP handoff fields, run responses, manifests,
 history, and artifact routes. Live-provider confirmation, `codex-svg`, retry
-branches, reference analysis, successful MCP execution, and Native UI runtime
-binding remain in progress. A valid MCP generation call therefore still
-reports that execution is not connected instead of falling back to the
-Electron runtime. `.mcp.json` remains intentionally empty until the live
-primary path and MCP launch route are smoke-validated.
+branches, reference analysis, and Native UI runtime binding remain in
+progress. `.mcp.json` remains intentionally empty until the live primary path
+and native UI launch route are smoke-validated.
 
 ## First checks
 
