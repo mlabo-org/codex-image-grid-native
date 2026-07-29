@@ -1,6 +1,15 @@
+mod app_server;
+
+pub use app_server::{
+    AppServerCandidateDiagnostic, AppServerDiagnosticError, AppServerDiagnostics,
+    AppServerPreflightResponse,
+};
+
+use app_server::{AppServerBridge, AppServerLaunchConfig};
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::routing::get;
 use image_grid_core::{APP_IDENTITY, MAX_RUN_JOBS};
 use serde::Serialize;
@@ -52,34 +61,6 @@ impl RuntimeConfig {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct AppServerDiagnostics {
-    pub status: &'static str,
-    pub ready: bool,
-    pub selected_command: Option<String>,
-    pub selected_source: Option<String>,
-    pub candidates: Vec<String>,
-    pub error: Option<String>,
-    pub platform_os: Option<String>,
-    pub checked_at: Option<String>,
-}
-
-impl Default for AppServerDiagnostics {
-    fn default() -> Self {
-        Self {
-            status: "not-started",
-            ready: false,
-            selected_command: None,
-            selected_source: None,
-            candidates: Vec::new(),
-            error: None,
-            platform_os: None,
-            checked_at: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct SchedulerSnapshot {
     pub configured_max: usize,
     pub adaptive: bool,
@@ -118,7 +99,11 @@ pub struct RuntimeIdentity {
 }
 
 impl RuntimeIdentity {
-    pub fn from_config(config: &RuntimeConfig) -> Self {
+    pub fn from_config(
+        config: &RuntimeConfig,
+        codex_app_server: AppServerDiagnostics,
+        app_server_image_scheduler: SchedulerSnapshot,
+    ) -> Self {
         Self {
             app: APP_IDENTITY,
             server_root: display_path(&config.server_root),
@@ -130,8 +115,8 @@ impl RuntimeIdentity {
             package_name: APP_IDENTITY,
             package_version: env!("CARGO_PKG_VERSION"),
             package_root_kind: config.package_root_kind.clone(),
-            codex_app_server: AppServerDiagnostics::default(),
-            app_server_image_scheduler: SchedulerSnapshot::default(),
+            codex_app_server,
+            app_server_image_scheduler,
         }
     }
 }
@@ -151,27 +136,84 @@ pub struct HealthResponse {
 
 impl HealthResponse {
     pub fn from_config(config: &RuntimeConfig) -> Self {
-        let identity = RuntimeIdentity::from_config(config);
+        Self::from_parts(
+            config,
+            AppServerDiagnostics::default(),
+            SchedulerSnapshot::default(),
+        )
+    }
+
+    pub fn from_parts(
+        config: &RuntimeConfig,
+        diagnostics: AppServerDiagnostics,
+        scheduler: SchedulerSnapshot,
+    ) -> Self {
+        let identity = RuntimeIdentity::from_config(config, diagnostics.clone(), scheduler);
         Self {
             ok: true,
             jobs: 0,
-            app_server_image: false,
-            app_server_image_ready: false,
-            app_server_image_diagnostics: AppServerDiagnostics::default(),
+            app_server_image: diagnostics.ready,
+            app_server_image_ready: diagnostics.ready,
+            app_server_image_diagnostics: diagnostics,
             identity_fields: identity.clone(),
             identity,
         }
     }
 }
 
-pub fn router(config: RuntimeConfig) -> Router {
-    Router::new()
-        .route("/api/health", get(health))
-        .with_state(Arc::new(config))
+#[derive(Clone)]
+struct RuntimeState {
+    config: Arc<RuntimeConfig>,
+    app_server: AppServerBridge,
 }
 
-async fn health(State(config): State<Arc<RuntimeConfig>>) -> Json<HealthResponse> {
-    Json(HealthResponse::from_config(&config))
+impl RuntimeState {
+    fn new(config: RuntimeConfig, launch: AppServerLaunchConfig) -> Self {
+        let app_server = AppServerBridge::new(config.workspace_dir.clone(), launch);
+        Self {
+            config: Arc::new(config),
+            app_server,
+        }
+    }
+}
+
+pub fn router(config: RuntimeConfig) -> Router {
+    router_with_launch_config(config, AppServerLaunchConfig::from_environment())
+}
+
+fn router_with_launch_config(config: RuntimeConfig, launch: AppServerLaunchConfig) -> Router {
+    let state = RuntimeState::new(config, launch);
+    Router::new()
+        .route("/api/health", get(health))
+        .route(
+            "/api/preflight/app-server-image",
+            get(preflight).post(preflight),
+        )
+        .with_state(state)
+}
+
+async fn health(State(state): State<RuntimeState>) -> Json<HealthResponse> {
+    let diagnostics = state.app_server.diagnostics().await;
+    Json(HealthResponse::from_parts(
+        &state.config,
+        diagnostics,
+        SchedulerSnapshot::default(),
+    ))
+}
+
+async fn preflight(
+    State(state): State<RuntimeState>,
+) -> (StatusCode, Json<AppServerPreflightResponse>) {
+    let diagnostics = state.app_server.ensure_ready().await;
+    let status = if diagnostics.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(AppServerPreflightResponse::from_diagnostics(diagnostics)),
+    )
 }
 
 fn display_path(path: &Path) -> String {
@@ -194,6 +236,11 @@ fn classify_package_root(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use std::io::Write;
+    use tower::ServiceExt;
 
     #[test]
     fn fresh_health_preserves_the_baseline_shape_with_native_identity() {
@@ -218,5 +265,92 @@ mod tests {
             SchedulerSnapshot::default()
         );
         assert_eq!(health.identity_fields, health.identity);
+    }
+
+    #[tokio::test]
+    async fn provider_free_preflight_updates_health_without_hiding_the_server() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let server_root = temporary.path().join("server");
+        let data_dir = temporary.path().join("data");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&server_root).expect("server root");
+        fs::create_dir_all(&data_dir).expect("data root");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let fake = temporary.path().join("fake-codex");
+        let mut file = fs::File::create(&fake).expect("fake executable");
+        file.write_all(
+            br#"#!/bin/sh
+test "$1" = "app-server" || exit 2
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("fake source");
+        file.flush().expect("fake source flushed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = file.metadata().expect("fake metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&fake, permissions).expect("fake executable permissions");
+        }
+
+        let config =
+            RuntimeConfig::new(server_root, data_dir, Some(workspace), "server".to_owned());
+        let app = router_with_launch_config(config, AppServerLaunchConfig::single("fixture", fake));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/preflight/app-server-image")
+                    .body(Body::empty())
+                    .expect("preflight request"),
+            )
+            .await
+            .expect("preflight response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("preflight body")
+            .to_bytes();
+        let preflight: serde_json::Value = serde_json::from_slice(&body).expect("preflight JSON");
+        assert_eq!(preflight["ok"], true);
+        assert_eq!(preflight["appServerImageReady"], true);
+        assert_eq!(preflight["diagnostics"]["status"], "ready");
+        assert_eq!(preflight["diagnostics"]["selectedSource"], "fixture");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("health body")
+            .to_bytes();
+        let health: serde_json::Value = serde_json::from_slice(&body).expect("health JSON");
+        assert_eq!(health["ok"], true);
+        assert_eq!(health["appServerImage"], true);
+        assert_eq!(health["appServerImageReady"], true);
+        assert_eq!(health["codexAppServer"]["status"], "ready");
+        assert_eq!(health["identity"]["codexAppServer"]["status"], "ready");
     }
 }

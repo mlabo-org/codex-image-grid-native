@@ -7,4 +7,11 @@ edition = "2024"
 axum.workspace = true
 image-grid-core = { path = "../image-grid-core" }
 serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }

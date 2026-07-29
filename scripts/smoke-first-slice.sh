@@ -26,8 +26,24 @@ cargo build \
 server_stdout="$temporary_root/server.stdout"
 server_stderr="$temporary_root/server.stderr"
 data_root="$temporary_root/data"
+fake_codex="$temporary_root/fake-codex"
 
-"$repo_root/target/debug/image-grid-server" \
+printf '%s\n' \
+  '#!/bin/sh' \
+  'test "$1" = "app-server" || exit 2' \
+  'while IFS= read -r line; do' \
+  '  case "$line" in' \
+  '    *'"'"'"method":"initialize"'"'"'*)' \
+  '      printf '"'"'%s\n'"'"' '"'"'{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'"'"'' \
+  '      ;;' \
+  '    *'"'"'"method":"initialized"'"'"'*)' \
+  '      ;;' \
+  '  esac' \
+  'done' \
+  >"$fake_codex"
+chmod 755 "$fake_codex"
+
+IMAGE_GRID_CODEX_BIN="$fake_codex" "$repo_root/target/debug/image-grid-server" \
   --bind 127.0.0.1:0 \
   --data-root "$data_root" \
   --server-root "$repo_root" \
@@ -88,6 +104,37 @@ jq --exit-status \
     and .identity.codexAppServer == .codexAppServer
     and .identity.appServerImageScheduler == .appServerImageScheduler
   ' "$health_json" >/dev/null
+
+preflight_json="$temporary_root/preflight.json"
+curl --fail --silent --show-error \
+  --request POST \
+  "$server_url/api/preflight/app-server-image" \
+  >"$preflight_json"
+jq --exit-status \
+  --arg fakeCodex "$fake_codex" \
+  '
+    .ok == true
+    and .appServerImage == true
+    and .appServerImageReady == true
+    and .diagnostics.status == "ready"
+    and .diagnostics.ready == true
+    and .diagnostics.selectedCommand == $fakeCodex
+    and .diagnostics.selectedSource == "IMAGE_GRID_CODEX_BIN"
+    and .diagnostics.platformOs == "macos"
+    and .diagnostics.error == null
+  ' "$preflight_json" >/dev/null
+
+ready_health_json="$temporary_root/health-ready.json"
+curl --fail --silent --show-error "$server_url/api/health" >"$ready_health_json"
+jq --exit-status \
+  '
+    .ok == true
+    and .appServerImage == true
+    and .appServerImageReady == true
+    and .appServerImageDiagnostics.status == "ready"
+    and .codexAppServer.status == "ready"
+    and .identity.codexAppServer.status == "ready"
+  ' "$ready_health_json" >/dev/null
 
 mcp_output="$temporary_root/mcp.jsonl"
 printf '%s\n' \
