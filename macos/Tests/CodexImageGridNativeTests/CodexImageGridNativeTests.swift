@@ -97,6 +97,25 @@ import Foundation
     #expect(shownFailures.map(\.id) == ["active", "failed", "done-new"])
 }
 
+@Test func hiddenFailureNoticeCopyIsExplicitAndLocalized() {
+    let japanese = ImageGridStrings(language: .japanese)
+    let english = ImageGridStrings(language: .english)
+
+    #expect(japanese.generationFailed == "画像生成に失敗しました")
+    #expect(japanese.hiddenFailureMessage(count: 2) == "2件の失敗結果は表示設定により非表示です。")
+    #expect(japanese.showFailedResults == "失敗した結果を表示")
+    #expect(english.generationFailed == "Image generation failed")
+    #expect(
+        english.hiddenFailureMessage(count: 1)
+            == "1 failed result is hidden by your display setting."
+    )
+    #expect(
+        english.hiddenFailureMessage(count: 2)
+            == "2 failed results are hidden by your display setting."
+    )
+    #expect(english.showFailedResults == "Show failed results")
+}
+
 @Test func responsiveGridUsesAvailableWidthWithoutAFixedColumnCap() {
     let grid = ResponsiveResultGrid(minimumColumnWidth: 512, spacing: 16)
 
