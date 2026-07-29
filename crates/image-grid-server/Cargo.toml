@@ -1,0 +1,10 @@
+[package]
+name = "image-grid-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum.workspace = true
+image-grid-core = { path = "../image-grid-core" }
+serde.workspace = true
+tokio.workspace = true

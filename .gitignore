@@ -1,0 +1,16 @@
+/target/
+/dist/
+/build/
+/.run/
+/generated/
+/artifacts/
+.DS_Store
+
+# Swift Package Manager build output.
+macos/.build/
+macos/.swiftpm/
+
+# Local runtime state and developer-only configuration.
+.env
+*.local.json
+
