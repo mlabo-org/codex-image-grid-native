@@ -69,14 +69,10 @@ enum ResultLimit: String, CaseIterable, Identifiable {
     case all
 
     var id: String { rawValue }
-}
 
-private enum RuntimeConnectionState {
-    case disconnected
-    case idle
-    case starting
-    case ready
-    case error
+    var completedLimit: Int? {
+        self == .all ? nil : Int(rawValue)
+    }
 }
 
 struct ImageGridView: View {
@@ -86,7 +82,9 @@ struct ImageGridView: View {
     @AppStorage(AppShellPreferenceKeys.theme) private var selectedTheme = AppShellTheme.system
     @AppStorage("imageGrid.resultLimit") private var resultLimit = ResultLimit.twentyFour
     @AppStorage("imageGrid.showFailed") private var showFailed = false
+    @AppStorage("imageGrid.promptHistory") private var promptHistoryData = "[]"
 
+    @StateObject private var store = ImageGridStore()
     @State private var referencePremise = ""
     @State private var prompt = ImageGridContract.defaultPrompt
     @State private var promptMode = PromptMode.single
@@ -95,9 +93,8 @@ struct ImageGridView: View {
     @State private var engine = ImageEngine.appServerImage
     @State private var count = 1
     @State private var aspectRatio = AspectRatio.widescreen
-    @State private var referenceImagePath: String?
+    @State private var referenceImage: ImageGridReference?
     @State private var formError: String?
-    @State private var runtimeState = RuntimeConnectionState.disconnected
 
     private var strings: ImageGridStrings {
         ImageGridStrings(language: language)
@@ -117,8 +114,19 @@ struct ImageGridView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .frame(minHeight: 560)
-        .task {
-            await refreshRuntimeState()
+        .onAppear {
+            store.start()
+        }
+        .onDisappear {
+            store.stop()
+            referenceImage?.removeOwnedTemporaryFile()
+        }
+        .onChange(of: resultLimit) { _, value in
+            if value == .all {
+                Task {
+                    await store.hydrateRuns()
+                }
+            }
         }
     }
 
@@ -154,7 +162,7 @@ struct ImageGridView: View {
                     .frame(minWidth: 180, idealWidth: 220)
                 themeSegment
                     .frame(minWidth: 180, idealWidth: 220)
-                RuntimePill(state: runtimeState, strings: strings)
+                RuntimePill(state: store.runtimeState, strings: strings)
             }
 
             VStack(alignment: .leading, spacing: 12) {
@@ -162,7 +170,7 @@ struct ImageGridView: View {
                     .frame(maxWidth: .infinity)
                 themeSegment
                     .frame(maxWidth: .infinity)
-                RuntimePill(state: runtimeState, strings: strings)
+                RuntimePill(state: store.runtimeState, strings: strings)
             }
         }
     }
@@ -310,9 +318,17 @@ struct ImageGridView: View {
     private var promptActions: some View {
         HStack(spacing: 8) {
             Menu(strings.promptHistory) {
-                Text(strings.noPromptHistory)
+                if promptHistory.isEmpty {
+                    Text(strings.noPromptHistory)
+                } else {
+                    ForEach(promptHistory, id: \.self) { entry in
+                        Button(entry) {
+                            applyPromptHistory(entry)
+                        }
+                    }
+                }
             }
-            .disabled(true)
+            .disabled(promptHistory.isEmpty)
 
             Button(strings.clearInput) {
                 if promptMode == .single {
@@ -322,8 +338,10 @@ struct ImageGridView: View {
                 }
             }
 
-            Button(strings.clearHistory) {}
-                .disabled(true)
+            Button(strings.clearHistory) {
+                promptHistoryData = "[]"
+            }
+            .disabled(promptHistory.isEmpty)
         }
     }
 
@@ -382,14 +400,12 @@ struct ImageGridView: View {
                 .appFont(.caption)
                 .foregroundStyle(.secondary)
 
-            ReferenceDropZone(path: referenceImagePath, strings: strings)
+            ReferenceDropZone(url: referenceImage?.url, strings: strings)
                 .dropDestination(for: URL.self) { urls, _ in
-                    guard let url = urls.first, isSupportedImage(url) else {
+                    guard let url = urls.first else {
                         return false
                     }
-                    referenceImagePath = url.path
-                    formError = nil
-                    return true
+                    return selectReference(url)
                 }
 
             ViewThatFits(in: .horizontal) {
@@ -405,31 +421,28 @@ struct ImageGridView: View {
                 }
             }
 
-            if let formError {
-                Text(formError)
+            if let message = formError ?? store.referenceAnalysisMessage ?? store.generationMessage {
+                Text(message)
                     .appFont(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             Button {
-                formError = strings.generationUnavailable
+                submitGeneration()
             } label: {
                 Label(strings.generate, systemImage: "play.fill")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(
-                promptMode == .batch
-                    && !ImageGridContract.batchIsValid(prompts: batchPrompts, count: count)
-            )
+            .disabled(!generationIsValid || store.isSubmitting)
             .padding(.top, 8)
         }
     }
 
     private var referenceSelectionStatus: some View {
-        Text(referenceImagePath.map { URL(fileURLWithPath: $0).lastPathComponent }
+        Text(referenceImage.map { $0.url.lastPathComponent }
             ?? strings.noReferenceSelected)
             .appFont(.caption)
             .foregroundStyle(.secondary)
@@ -440,22 +453,146 @@ struct ImageGridView: View {
     private var referenceActions: some View {
         HStack(spacing: 8) {
             Button(strings.analyze) {
-                formError = strings.analysisUnavailable
+                analyzeReference()
             }
-            .disabled(referenceImagePath == nil)
+            .disabled(referenceImage == nil || store.isAnalyzing)
 
             Button(strings.choose) {
-                referenceImagePath = NativeFilePicker.chooseImagePath()
-                formError = nil
+                if let url = NativeFilePicker.chooseImageURL() {
+                    _ = selectReference(url)
+                }
             }
             .buttonStyle(.borderedProminent)
 
+            Button(strings.paste) {
+                pasteReference()
+            }
+
             Button(strings.clear) {
-                referenceImagePath = nil
-                referencePremise = ""
-                formError = nil
+                clearReference()
             }
         }
+    }
+
+    private var generationIsValid: Bool {
+        if promptMode == .single {
+            return !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return ImageGridContract.batchIsValid(prompts: batchPrompts, count: count)
+    }
+
+    private func submitGeneration() {
+        let prompts = promptMode == .single
+            ? [prompt.trimmingCharacters(in: .whitespacesAndNewlines)].filter { !$0.isEmpty }
+            : batchPrompts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        guard !prompts.isEmpty else {
+            formError = strings.promptRequired
+            return
+        }
+        guard promptMode != .batch
+            || ImageGridContract.batchIsValid(prompts: batchPrompts, count: count)
+        else {
+            formError = strings.batchLimitError
+            return
+        }
+        formError = nil
+        store.generationMessage = nil
+        let request = ImageGridGenerationRequest(
+            prompt: prompts[0],
+            prompts: promptMode == .batch ? prompts : nil,
+            referencePremise: referencePremise,
+            mood: mood.rawValue,
+            engine: engine.rawValue,
+            count: count,
+            aspectRatio: aspectRatio.rawValue,
+            referenceImagePath: referenceImage?.url.path
+        )
+        Task {
+            if await store.generate(request: request, batch: promptMode == .batch) {
+                savePromptHistory(prompts)
+            }
+        }
+    }
+
+    private var promptHistory: [String] {
+        guard let data = promptHistoryData.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String].self, from: data)
+        else {
+            return []
+        }
+        return decoded.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private func applyPromptHistory(_ entry: String) {
+        if promptMode == .single {
+            prompt = entry
+        } else if batchPrompts.count < ImageGridContract.maxPrompts {
+            batchPrompts.append(entry)
+        }
+    }
+
+    private func savePromptHistory(_ prompts: [String]) {
+        var next: [String] = []
+        for value in prompts + promptHistory {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, !next.contains(trimmed) {
+                next.append(trimmed)
+            }
+        }
+        next = Array(next.prefix(ImageGridContract.maxPrompts))
+        if let data = try? JSONEncoder().encode(next),
+           let encoded = String(data: data, encoding: .utf8)
+        {
+            promptHistoryData = encoded
+        }
+    }
+
+    private func analyzeReference() {
+        guard let referenceImage else { return }
+        formError = nil
+        Task {
+            if let premise = await store.analyze(reference: referenceImage) {
+                referencePremise = premise
+            }
+        }
+    }
+
+    private func pasteReference() {
+        do {
+            guard let pasted = try NativeReferencePasteboard.reference() else {
+                formError = strings.noPastedImage
+                return
+            }
+            replaceReference(with: pasted)
+        } catch {
+            formError = error.localizedDescription
+        }
+    }
+
+    private func selectReference(_ url: URL) -> Bool {
+        do {
+            replaceReference(with: try ImageGridReference.validate(url: url))
+            return true
+        } catch {
+            formError = error.localizedDescription
+            return false
+        }
+    }
+
+    private func replaceReference(with next: ImageGridReference) {
+        referenceImage?.removeOwnedTemporaryFile()
+        referenceImage = next
+        store.referenceAnalysisMessage = nil
+        formError = nil
+    }
+
+    private func clearReference() {
+        referenceImage?.removeOwnedTemporaryFile()
+        referenceImage = nil
+        referencePremise = ""
+        store.referenceAnalysisMessage = nil
+        formError = nil
     }
 
     private var resultsPanel: some View {
@@ -474,30 +611,58 @@ struct ImageGridView: View {
                     }
                 }
 
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.55))
-                    .frame(minHeight: 180)
-                    .overlay {
-                        VStack(spacing: 8) {
-                            Image(systemName: "photo.on.rectangle.angled")
-                                .foregroundStyle(.secondary)
-                                .accessibilityHidden(true)
-                            Text(strings.readyMessage(engine: engine))
-                                .appFont(.body)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                        }
-                        .padding(24)
-                    }
+                resultGrid
             }
         }
     }
 
+    @ViewBuilder
+    private var resultGrid: some View {
+        let visible = store.visibleJobs(resultLimit: resultLimit, showFailed: showFailed)
+        if visible.isEmpty {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+                .frame(minHeight: 180)
+                .overlay {
+                    VStack(spacing: 8) {
+                        Image(systemName: "photo.on.rectangle.angled")
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                        Text(strings.readyMessage(engine: engine))
+                            .appFont(.body)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(24)
+                }
+        } else {
+            ResponsiveResultGrid(minimumColumnWidth: 320, maximumColumns: 3, spacing: 16) {
+                ForEach(visible) { job in
+                    ResultCardView(
+                        job: job,
+                        imageURL: store.client.resolvedURL(job.imageUrl),
+                        onCopy: { store.copyPrompt(job.prompt) },
+                        onReveal: { store.reveal(job) },
+                        onManifest: { store.openArtifact(job.manifestViewUrl) },
+                        onHandoff: { store.openArtifact(job.handoffViewUrl) }
+                    )
+                    .frame(maxWidth: .infinity, alignment: .top)
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
+    }
+
     private var resultsHeading: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let counts = store.counts
+        return VStack(alignment: .leading, spacing: 4) {
             Text(strings.runs)
                 .appFont(.title3, weight: .semibold)
-            Text(strings.runSummary(done: 0, running: 0, failed: 0))
+            Text(strings.runSummary(
+                done: counts.done,
+                running: counts.running,
+                failed: counts.failed
+            ))
                 .appFont(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -509,10 +674,14 @@ struct ImageGridView: View {
                 resultLimitControl
                 Toggle(strings.showFailed, isOn: $showFailed)
                     .toggleStyle(.checkbox)
-                Button(strings.openInFinder) {}
-                    .disabled(true)
-                Button(strings.clearScreen) {}
-                    .disabled(true)
+                Button(strings.openInFinder) {
+                    store.openGeneratedDirectory()
+                }
+                .disabled(store.generatedDirectory == nil)
+                Button(strings.clearScreen) {
+                    store.clearTerminalJobs()
+                }
+                .disabled(!store.hasTerminalJobs)
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -520,10 +689,14 @@ struct ImageGridView: View {
                 Toggle(strings.showFailed, isOn: $showFailed)
                     .toggleStyle(.checkbox)
                 HStack(spacing: 8) {
-                    Button(strings.openInFinder) {}
-                        .disabled(true)
-                    Button(strings.clearScreen) {}
-                        .disabled(true)
+                    Button(strings.openInFinder) {
+                        store.openGeneratedDirectory()
+                    }
+                    .disabled(store.generatedDirectory == nil)
+                    Button(strings.clearScreen) {
+                        store.clearTerminalJobs()
+                    }
+                    .disabled(!store.hasTerminalJobs)
                 }
             }
         }
@@ -544,43 +717,9 @@ struct ImageGridView: View {
         }
     }
 
-    private func isSupportedImage(_ url: URL) -> Bool {
-        ["png", "jpg", "jpeg", "webp"].contains(url.pathExtension.lowercased())
-    }
-
-    private func refreshRuntimeState() async {
-        runtimeState = .starting
-        guard let url = URL(string: "http://127.0.0.1:4322/api/health") else {
-            runtimeState = .error
-            return
-        }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 2
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                runtimeState = .error
-                return
-            }
-            let health = try JSONDecoder().decode(NativeHealth.self, from: data)
-            guard health.ok, health.app == "codex-image-grid-native" else {
-                runtimeState = .error
-                return
-            }
-            runtimeState = health.appServerImageReady ? .ready : .idle
-        } catch {
-            runtimeState = .disconnected
-        }
-    }
 }
 
-private struct NativeHealth: Decodable {
-    let ok: Bool
-    let app: String
-    let appServerImageReady: Bool
-}
-
-private struct ImageGridStrings {
+struct ImageGridStrings {
     private let resolvedLanguage: AppShellLanguage
 
     init(language: AppShellLanguage) {
@@ -627,8 +766,18 @@ private struct ImageGridStrings {
     }
     var analyze: String { localized("解析", "Analyze") }
     var choose: String { localized("選択", "Choose") }
+    var paste: String { localized("貼り付け", "Paste") }
     var clear: String { localized("クリア", "Clear") }
     var generate: String { localized("生成", "Generate") }
+    var promptRequired: String {
+        localized("Promptを入力してください。", "Enter a prompt.")
+    }
+    var noPastedImage: String {
+        localized(
+            "クリップボードにPNG、JPEG、WebP画像または画像ファイルがありません。",
+            "The clipboard does not contain a PNG, JPEG, WebP image, or image file."
+        )
+    }
     var analysisUnavailable: String {
         localized(
             "参照画像の解析経路はまだ接続されていません。",
@@ -851,7 +1000,7 @@ private struct PlaceholderTextEditor: View {
 }
 
 private struct ReferenceDropZone: View {
-    let path: String?
+    let url: URL?
     let strings: ImageGridStrings
 
     var body: some View {
@@ -864,7 +1013,7 @@ private struct ReferenceDropZone: View {
                     style: StrokeStyle(lineWidth: 1, dash: [5, 4])
                 )
 
-            if let path, let image = NSImage(contentsOfFile: path) {
+            if let url, let image = NSImage(contentsOf: url) {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFit()

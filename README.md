@@ -53,16 +53,17 @@ The provider-free first runnable slice now includes:
   `tools/call`, including the frozen `generate_image_grid` schema and
   validation errors, bounded native-server launch/join, health and App Server
   preflight checks, and compatible success summaries/structured content;
-- a responsive SwiftUI compatibility shell with the frozen language, theme,
-  prompt, generation-option, reference-image, and result-filter controls.
+- a responsive SwiftUI runtime client with the frozen language, theme, prompt,
+  generation-option, reference-image, and result-filter controls, plus
+  health/preflight/run calls, SSE progress, native file actions, and adaptive
+  result cards.
 
 The provider-free fixture now completes real HTTP and MCP runs through the
 owned App Server transport and validates generated images, local reference
 copy staging, compatible MCP handoff fields, run responses, manifests,
-history, and artifact routes. Live-provider confirmation, retry branches,
-reference analysis, and Native UI runtime binding remain in progress.
-`.mcp.json` remains intentionally empty until the live primary path and native
-UI launch route are smoke-validated.
+history, and artifact routes. Live-provider confirmation, retry branches, and
+reference analysis remain in progress. `.mcp.json` remains intentionally empty
+until the live primary path and native UI launch route are smoke-validated.
 
 ## First checks
 

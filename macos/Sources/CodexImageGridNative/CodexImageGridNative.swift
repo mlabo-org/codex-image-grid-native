@@ -36,11 +36,11 @@ struct CodexImageGridApp: App {
 
 @MainActor
 enum NativeFilePicker {
-    static func chooseImagePath() -> String? {
+    static func chooseImageURL() -> URL? {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.png, .jpeg, .webP]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        return panel.runModal() == .OK ? panel.url?.path : nil
+        return panel.runModal() == .OK ? panel.url : nil
     }
 }
