@@ -32,6 +32,19 @@ struct ResponsiveResultGrid {
     }
 }
 
+enum ResultCardImageLoadFailurePresentation: Equatable {
+    case progress
+    case generationFailure
+    case imageUnavailable
+
+    static func resolve(for job: ImageGridJob) -> Self {
+        if job.isActive {
+            return .progress
+        }
+        return job.status == "error" ? .generationFailure : .imageUnavailable
+    }
+}
+
 struct ResultCardView: View {
     @Environment(\.appShellLanguage) private var language
 
@@ -92,15 +105,22 @@ struct ResultCardView: View {
                 AsyncImage(url: imageURL) { phase in
                     switch phase {
                     case .empty:
-                        ProgressView()
+                        if job.isActive {
+                            activeImagePlaceholder
+                        } else {
+                            ProgressView()
+                        }
                     case let .success(image):
                         image
                             .resizable()
                             .scaledToFill()
                     case .failure:
-                        if job.status == "error" {
+                        switch ResultCardImageLoadFailurePresentation.resolve(for: job) {
+                        case .progress:
+                            activeImagePlaceholder
+                        case .generationFailure:
                             generationFailurePlaceholder
-                        } else {
+                        case .imageUnavailable:
                             imageUnavailablePlaceholder
                         }
                     @unknown default:
@@ -108,12 +128,7 @@ struct ResultCardView: View {
                     }
                 }
             } else if job.isActive {
-                VStack(spacing: 8) {
-                    ProgressView()
-                    Text(job.statusText ?? job.status)
-                        .appFont(.caption)
-                }
-                .foregroundStyle(.secondary)
+                activeImagePlaceholder
             } else if job.status == "error" {
                 generationFailurePlaceholder
             } else {
@@ -122,6 +137,19 @@ struct ResultCardView: View {
         }
         .aspectRatio(aspectRatio, contentMode: .fit)
         .clipped()
+        .accessibilityElement(children: .combine)
+    }
+
+    private var activeImagePlaceholder: some View {
+        VStack(spacing: 8) {
+            ProgressView()
+            Text(activeStatusText)
+                .appFont(.caption, weight: .semibold)
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .foregroundStyle(.secondary)
+        .multilineTextAlignment(.center)
         .accessibilityElement(children: .combine)
     }
 
@@ -167,7 +195,7 @@ struct ResultCardView: View {
                 Text(title)
                     .appFont(.headline)
                     .lineLimit(2)
-                Label(job.statusText ?? job.status, systemImage: statusSymbol)
+                Label(displayStatusText, systemImage: statusSymbol)
                     .appFont(.caption, weight: .semibold)
                     .foregroundStyle(statusColor)
             }
@@ -272,6 +300,16 @@ struct ResultCardView: View {
         return "\(promptPart)Variant \(job.variant ?? 1)/\(job.total ?? 1) · \(job.model ?? job.engine ?? "job")"
     }
 
+    private var activeStatusText: String {
+        imageURL == nil
+            ? (job.statusText ?? strings.generatingImage)
+            : strings.finalizingImage
+    }
+
+    private var displayStatusText: String {
+        job.isActive ? activeStatusText : (job.statusText ?? job.status)
+    }
+
     private var aspectRatio: CGFloat {
         guard let value = job.aspectRatio?.split(separator: ":"),
               value.count == 2,
@@ -322,6 +360,8 @@ private struct ResultCardStrings {
         localized("この生成のPromptは残っていません。", "The prompt for this generation is unavailable.")
     }
     var generationLog: String { localized("生成ログ", "Generation log") }
+    var generatingImage: String { localized("画像を生成しています...", "Generating image...") }
+    var finalizingImage: String { localized("画像生成を完了しています...", "Finalizing image...") }
     var generationFailed: String { localized("画像生成に失敗しました", "Image generation failed") }
     var imageUnavailable: String { localized("画像を読み込めません", "Image unavailable") }
     var image: String { localized("画像", "Image") }
