@@ -735,7 +735,7 @@ fn classify_package_root(path: &Path) -> &'static str {
     let normalized = path.to_string_lossy().replace('\\', "/");
     if normalized.contains("/.codex/plugins/cache/") {
         "cache"
-    } else if normalized.contains(".app/Contents/Resources/") {
+    } else if normalized.ends_with(".app") || normalized.contains(".app/Contents/Resources/") {
         "packaged"
     } else if normalized.ends_with("/plugins/codex-image-grid-native") {
         "source"
@@ -757,7 +757,7 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
-    fn fresh_health_preserves_the_baseline_shape_with_native_identity() {
+    fn fresh_health_uses_public_identity_with_native_paths() {
         let config = RuntimeConfig::new(
             PathBuf::from("/Users/example/plugins/codex-image-grid-native"),
             PathBuf::from("/tmp/codex-image-grid-native"),
@@ -771,14 +771,26 @@ mod tests {
         assert_eq!(health.jobs, 0);
         assert!(!health.app_server_image);
         assert_eq!(health.app_server_image_diagnostics.status, "not-started");
-        assert_eq!(health.identity.app, APP_IDENTITY);
-        assert_eq!(health.identity.package_name, APP_IDENTITY);
+        assert_eq!(health.identity.app, "codex-image-grid");
+        assert_eq!(health.identity.package_name, "codex-image-grid");
+        assert_eq!(health.identity.package_version, "0.2.0");
+        assert_eq!(health.identity.data_dir, "/tmp/codex-image-grid-native");
         assert_eq!(health.identity.package_root_kind, "source");
         assert_eq!(
             health.identity.app_server_image_scheduler,
             SchedulerSnapshot::default()
         );
         assert_eq!(health.identity_fields, health.identity);
+    }
+
+    #[test]
+    fn app_bundle_root_is_classified_as_packaged() {
+        assert_eq!(
+            classify_package_root(Path::new(
+                "/Users/example/Applications/Codex Image Grid Native.app"
+            )),
+            "packaged"
+        );
     }
 
     #[tokio::test]

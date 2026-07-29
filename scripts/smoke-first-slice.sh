@@ -113,15 +113,15 @@ jq --exit-status \
     and .appServerImageReady == false
     and .appServerImageDiagnostics.status == "not-started"
     and .appServerImageDiagnostics.ready == false
-    and .app == "codex-image-grid-native"
+    and .app == "codex-image-grid"
     and .serverRoot == $serverRoot
     and .dataDir == $dataDir
     and .generatedDir == ($dataDir + "/generated")
     and .runDir == ($dataDir + "/.run")
     and .workspaceDir == $dataDir
     and .launchTarget == "server"
-    and .packageName == "codex-image-grid-native"
-    and .packageVersion == "0.1.0"
+    and .packageName == "codex-image-grid"
+    and .packageVersion == "0.2.0"
     and .packageRootKind == "source"
     and .codexAppServer.status == "not-started"
     and .codexAppServer.ready == false
@@ -296,7 +296,7 @@ jq --slurp --exit-status \
     length == 4
     and .[0].id == 1
     and .[0].result.protocolVersion == "2025-06-18"
-    and .[0].result.serverInfo.name == "codex-image-grid-native"
+    and .[0].result.serverInfo.name == "codex-image-grid"
     and .[0].result.capabilities.tools.listChanged == false
     and .[1].id == 2
     and (.[1].result.tools | length) == 1
@@ -320,9 +320,9 @@ jq --slurp --exit-status \
     and .[3].result.structuredContent.status == "done"
     and .[3].result.structuredContent.completed == true
     and .[3].result.structuredContent.serverStarted == false
-    and .[3].result.structuredContent.health.app == "codex-image-grid-native"
+    and .[3].result.structuredContent.health.app == "codex-image-grid"
     and .[3].result.structuredContent.health.appServerImageReady == true
-    and .[3].result.structuredContent.server.app == "codex-image-grid-native"
+    and .[3].result.structuredContent.server.app == "codex-image-grid"
     and .[3].result.structuredContent.statusUrl
       == ($serverUrl + "/api/runs/" + .[3].result.structuredContent.runId)
     and (.[3].result.structuredContent.outputPaths | length) == 1

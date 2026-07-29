@@ -4,6 +4,7 @@ use image_grid_core::{
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -15,13 +16,16 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const TOOL_NAME: &str = "generate_image_grid";
 
 const TOOL_DESCRIPTION: &str = "Generate project-ready image variants from Prompt Batch input. \
-Auto-launches the local Image Grid app or web server when possible, then returns handoff.md, \
-absolute output paths, display-safe image URLs, and Codex Markdown.";
+Activates the installed native Codex Image Grid app, then returns handoff.md, absolute output \
+paths, display-safe image URLs, and Codex Markdown.";
 const SERVER_INSTRUCTIONS: &str = "Use generate_image_grid when the user needs project-specific \
 thumbnails, visual variants, or Prompt Batch image generation. Return and reuse handoff.md, \
 absolute output paths, imageUrls, and codexMarkdown.";
 const DEFAULT_IMAGE_GRID_URL: &str = "http://127.0.0.1:4322";
-const EXPECTED_APP_IDENTITY: &str = "codex-image-grid-native";
+const EXPECTED_APP_IDENTITY: &str = "codex-image-grid";
+const NATIVE_APP_EXECUTABLE_NAME: &str = "CodexImageGridNative";
+const NATIVE_MCP_EXECUTABLE_NAME: &str = "image-grid-mcp";
+const NATIVE_SERVER_EXECUTABLE_NAME: &str = "image-grid-server";
 const MAX_JSON_RESPONSE_BYTES: u64 = 5 * 1024 * 1024;
 
 pub fn serve<R: BufRead, W: Write>(reader: R, mut writer: W) -> io::Result<()> {
@@ -87,7 +91,7 @@ fn initialize_result(params: Option<&Value>) -> Value {
             }
         },
         "serverInfo": {
-            "name": "codex-image-grid-native",
+            "name": "codex-image-grid",
             "title": "Codex Image Grid Native",
             "version": env!("CARGO_PKG_VERSION")
         },
@@ -139,13 +143,16 @@ struct BridgeConfig {
     endpoint: HttpEndpoint,
     image_grid_url: String,
     app_dir: Option<PathBuf>,
+    runtime_state_dir: Option<PathBuf>,
     strict_app_dir: bool,
+    native_app_activation: Option<LaunchPlan>,
     launch_plan: Option<LaunchPlan>,
     launch_timeout: Duration,
     health_timeout: Duration,
     preflight_timeout: Duration,
     run_timeout: Duration,
     launch_probe: Duration,
+    activation_timeout: Duration,
 }
 
 impl BridgeConfig {
@@ -165,6 +172,12 @@ impl BridgeConfig {
             );
         }
 
+        let native_app_path = first_nonempty_env(&["IMAGE_GRID_NATIVE_APP_PATH"])
+            .map(|path| resolve_native_app(&PathBuf::from(path)))
+            .transpose()?;
+        let runtime_state_dir = first_nonempty_env(&["IMAGE_GRID_RUNTIME_STATE_DIR"])
+            .map(|path| prepare_runtime_state_directory(&PathBuf::from(path)))
+            .transpose()?;
         let start_command = first_nonempty_env(&[
             "IMAGE_GRID_START_COMMAND",
             "IMAGE_GRID_NATIVE_START_COMMAND",
@@ -194,18 +207,46 @@ impl BridgeConfig {
         } else {
             None
         };
-        if strict_app_dir && launch_plan.is_none() {
-            return Err(
-                "IMAGE_GRID_STRICT_APP_DIR=1 requires IMAGE_GRID_START_COMMAND or IMAGE_GRID_NATIVE_SERVER_BIN for the installed native server route"
-                    .to_owned(),
-            );
+        let native_app_activation = native_app_path
+            .as_ref()
+            .map(|path| native_app_launch_plan(path));
+        if strict_app_dir {
+            let native_app_path = native_app_path.as_ref().ok_or_else(|| {
+                "IMAGE_GRID_STRICT_APP_DIR=1 requires IMAGE_GRID_NATIVE_APP_PATH for the installed SwiftUI route"
+                    .to_owned()
+            })?;
+            let app_dir = app_dir.as_ref().expect("strict app dir checked");
+            if app_dir != native_app_path {
+                return Err(format!(
+                    "IMAGE_GRID_STRICT_APP_DIR=1 requires IMAGE_GRID_APP_DIR to match IMAGE_GRID_NATIVE_APP_PATH exactly: {}",
+                    native_app_path.display()
+                ));
+            }
+            let runtime_state_dir = runtime_state_dir.as_ref().ok_or_else(|| {
+                "IMAGE_GRID_STRICT_APP_DIR=1 requires IMAGE_GRID_RUNTIME_STATE_DIR for the writable startup lock"
+                    .to_owned()
+            })?;
+            if path_is_within(runtime_state_dir, app_dir) {
+                return Err(
+                    "IMAGE_GRID_RUNTIME_STATE_DIR must be writable state outside the native app bundle"
+                        .to_owned(),
+                );
+            }
+            if launch_plan.is_some() {
+                return Err(
+                    "IMAGE_GRID_STRICT_APP_DIR=1 forbids direct server launch configuration; use IMAGE_GRID_NATIVE_APP_PATH"
+                        .to_owned(),
+                );
+            }
         }
 
         Ok(Self {
             endpoint,
             image_grid_url: image_grid_url.trim_end_matches('/').to_owned(),
             app_dir,
+            runtime_state_dir,
             strict_app_dir,
+            native_app_activation,
             launch_plan,
             launch_timeout: bounded_env_duration(
                 "IMAGE_GRID_LAUNCH_TIMEOUT_MS",
@@ -232,6 +273,12 @@ impl BridgeConfig {
                 180_000,
             ),
             launch_probe: bounded_env_duration("IMAGE_GRID_LAUNCH_PROBE_MS", 250, 25, 2_000),
+            activation_timeout: bounded_env_duration(
+                "IMAGE_GRID_APP_ACTIVATION_TIMEOUT_MS",
+                5_000,
+                250,
+                15_000,
+            ),
         })
     }
 }
@@ -561,6 +608,9 @@ fn encode_base64(bytes: &[u8]) -> String {
 
 fn start_or_join_native_server(config: &BridgeConfig) -> Result<ServerStartup, String> {
     let deadline = Instant::now() + config.launch_timeout;
+    if let Some(activation) = &config.native_app_activation {
+        activate_native_app(activation, config.activation_timeout)?;
+    }
     match check_health(config, deadline)? {
         Some(health) => {
             return Ok(ServerStartup {
@@ -572,10 +622,12 @@ fn start_or_join_native_server(config: &BridgeConfig) -> Result<ServerStartup, S
         None => {}
     }
 
-    let launch_plan = config.launch_plan.as_ref().ok_or_else(|| {
-        "Image Grid Native is not running, and no native auto-launch target is configured. Set IMAGE_GRID_APP_DIR with IMAGE_GRID_START_COMMAND, or set IMAGE_GRID_NATIVE_SERVER_BIN."
-            .to_owned()
-    })?;
+    if config.native_app_activation.is_none() && config.launch_plan.is_none() {
+        return Err(
+            "Image Grid Native is not running, and no native app activation target is configured. Set IMAGE_GRID_NATIVE_APP_PATH."
+                .to_owned(),
+        );
+    }
     let lock_path = startup_lock_path(config);
     let stale_after = config
         .launch_timeout
@@ -609,6 +661,30 @@ fn start_or_join_native_server(config: &BridgeConfig) -> Result<ServerStartup, S
         });
     }
 
+    if let Some(activation) = &config.native_app_activation {
+        loop {
+            if let Some(health) = check_health(config, deadline)? {
+                return Ok(ServerStartup {
+                    started: true,
+                    launch_plan: Some(activation.label.clone()),
+                    health,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Image Grid Native app did not make its runtime healthy at {} within {} ms",
+                    config.image_grid_url,
+                    config.launch_timeout.as_millis()
+                ));
+            }
+            thread::sleep(Duration::from_millis(100).min(remaining_duration(deadline)));
+        }
+    }
+
+    let launch_plan = config
+        .launch_plan
+        .as_ref()
+        .expect("non-app launch plan checked");
     let mut child = launch_native_server(launch_plan)?;
     let probe_deadline = deadline.min(Instant::now() + config.launch_probe);
     while Instant::now() < probe_deadline {
@@ -652,6 +728,36 @@ fn start_or_join_native_server(config: &BridgeConfig) -> Result<ServerStartup, S
             ));
         }
         thread::sleep(Duration::from_millis(100).min(remaining_duration(deadline)));
+    }
+}
+
+fn activate_native_app(plan: &LaunchPlan, timeout: Duration) -> Result<(), String> {
+    let mut child = launch_native_server(plan)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("could not inspect native app activation: {error}"))?
+        {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Image Grid Native app activation failed with {status}: {}",
+                    plan.label
+                ))
+            };
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Image Grid Native app activation did not exit within {} ms: {}",
+                timeout.as_millis(),
+                plan.label
+            ));
+        }
+        thread::sleep(Duration::from_millis(25).min(remaining_duration(deadline)));
     }
 }
 
@@ -880,30 +986,47 @@ fn validate_strict_runtime_identity(
             .filter(|value| !value.is_empty())
     };
 
-    if let Some(package_name) = reported("packageName")
-        && package_name != EXPECTED_APP_IDENTITY
-    {
+    let package_name = reported("packageName").ok_or_else(|| {
+        "IMAGE_GRID_STRICT_APP_DIR=1 rejected server without packageName.".to_owned()
+    })?;
+    if package_name != EXPECTED_APP_IDENTITY {
         return Err(format!(
             "IMAGE_GRID_STRICT_APP_DIR=1 rejected server packageName={package_name}; expected {EXPECTED_APP_IDENTITY}."
         ));
     }
 
     let expected_version = env!("CARGO_PKG_VERSION");
-    if let Some(package_version) = reported("packageVersion")
-        && package_version != expected_version
-    {
+    let package_version = reported("packageVersion").ok_or_else(|| {
+        "IMAGE_GRID_STRICT_APP_DIR=1 rejected server without packageVersion.".to_owned()
+    })?;
+    if package_version != expected_version {
         return Err(format!(
             "IMAGE_GRID_STRICT_APP_DIR=1 rejected server packageVersion={package_version}; expected {expected_version}. Restart the stale runtime."
         ));
     }
 
     let expected_root_kind = package_root_kind_for(expected_root);
-    if expected_root_kind != "unknown"
-        && let Some(package_root_kind) = reported("packageRootKind")
-        && package_root_kind != expected_root_kind
-    {
+    if expected_root_kind != "packaged" {
+        return Err(format!(
+            "IMAGE_GRID_STRICT_APP_DIR=1 requires IMAGE_GRID_APP_DIR to be a packaged .app root; got {}.",
+            expected_root.display()
+        ));
+    }
+    let package_root_kind = reported("packageRootKind").ok_or_else(|| {
+        "IMAGE_GRID_STRICT_APP_DIR=1 rejected server without packageRootKind.".to_owned()
+    })?;
+    if package_root_kind != expected_root_kind {
         return Err(format!(
             "IMAGE_GRID_STRICT_APP_DIR=1 rejected server packageRootKind={package_root_kind}; expected {expected_root_kind}."
+        ));
+    }
+
+    let launch_target = reported("launchTarget").ok_or_else(|| {
+        "IMAGE_GRID_STRICT_APP_DIR=1 rejected server without launchTarget.".to_owned()
+    })?;
+    if launch_target != "swiftui" {
+        return Err(format!(
+            "IMAGE_GRID_STRICT_APP_DIR=1 rejected server launchTarget={launch_target}; expected swiftui."
         ));
     }
 
@@ -914,7 +1037,7 @@ fn package_root_kind_for(path: &Path) -> &'static str {
     let normalized = path.to_string_lossy().replace('\\', "/");
     if normalized.contains("/.codex/plugins/cache/") {
         "cache"
-    } else if normalized.contains(".app/Contents/Resources/") {
+    } else if normalized.ends_with(".app") || normalized.contains(".app/Contents/Resources/") {
         "packaged"
     } else if normalized.ends_with("/plugins/codex-image-grid-native") {
         "source"
@@ -1312,6 +1435,9 @@ fn running_process_identity(pid: u32) -> Result<Option<String>, ()> {
 }
 
 fn startup_lock_path(config: &BridgeConfig) -> PathBuf {
+    if let Some(runtime_state_dir) = &config.runtime_state_dir {
+        return runtime_state_dir.join(format!("mcp-start-{}.lock", config.endpoint.port));
+    }
     if let Some(app_dir) = &config.app_dir {
         return app_dir
             .join(".run")
@@ -1607,6 +1733,105 @@ fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn resolve_native_app(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("IMAGE_GRID_NATIVE_APP_PATH must be an absolute .app path".to_owned());
+    }
+    let path = canonical_directory(path, "IMAGE_GRID_NATIVE_APP_PATH")?;
+    if path.extension().and_then(|extension| extension.to_str()) != Some("app") {
+        return Err("IMAGE_GRID_NATIVE_APP_PATH must point to a .app bundle".to_owned());
+    }
+
+    let required_executables = [
+        path.join("Contents")
+            .join("MacOS")
+            .join(NATIVE_APP_EXECUTABLE_NAME),
+        path.join("Contents")
+            .join("Resources")
+            .join(NATIVE_MCP_EXECUTABLE_NAME),
+        path.join("Contents")
+            .join("Resources")
+            .join(NATIVE_SERVER_EXECUTABLE_NAME),
+    ];
+    for executable in required_executables {
+        let metadata = fs::metadata(&executable).map_err(|error| {
+            format!(
+                "IMAGE_GRID_NATIVE_APP_PATH is missing bundled executable {} ({error})",
+                executable.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "IMAGE_GRID_NATIVE_APP_PATH bundled executable is not a file: {}",
+                executable.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return Err(format!(
+                    "IMAGE_GRID_NATIVE_APP_PATH bundled executable is not executable: {}",
+                    executable.display()
+                ));
+            }
+        }
+    }
+    Ok(path)
+}
+
+fn native_app_launch_plan(path: &Path) -> LaunchPlan {
+    LaunchPlan {
+        label: "IMAGE_GRID_NATIVE_APP_PATH".to_owned(),
+        program: PathBuf::from("/usr/bin/open"),
+        arguments: vec![path.to_string_lossy().into_owned()],
+        cwd: None,
+        environment: Vec::new(),
+    }
+}
+
+fn prepare_runtime_state_directory(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("IMAGE_GRID_RUNTIME_STATE_DIR must be an absolute path".to_owned());
+    }
+    fs::create_dir_all(path).map_err(|error| {
+        format!(
+            "IMAGE_GRID_RUNTIME_STATE_DIR could not be created at {} ({error})",
+            path.display()
+        )
+    })?;
+    let path = canonical_directory(path, "IMAGE_GRID_RUNTIME_STATE_DIR")?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let probe = path.join(format!(
+        ".image-grid-mcp-write-probe-{}-{nonce}",
+        std::process::id()
+    ));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| {
+            format!(
+                "IMAGE_GRID_RUNTIME_STATE_DIR is not writable at {} ({error})",
+                path.display()
+            )
+        })?;
+    fs::remove_file(&probe).map_err(|error| {
+        format!(
+            "IMAGE_GRID_RUNTIME_STATE_DIR write probe could not be removed at {} ({error})",
+            probe.display()
+        )
+    })?;
+    Ok(path)
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
 fn resolve_executable(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err("IMAGE_GRID_NATIVE_SERVER_BIN must be an absolute executable path".to_owned());
@@ -1896,6 +2121,8 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1969,7 +2196,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_free_transcript_covers_initialize_list_and_call() {
+    fn provider_free_transcript_preserves_public_identity_and_tool_contract() {
         let input = concat!(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":",
             "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
@@ -1996,8 +2223,9 @@ mod tests {
         );
         assert_eq!(
             responses[0]["result"]["serverInfo"]["name"],
-            "codex-image-grid-native"
+            "codex-image-grid"
         );
+        assert_eq!(responses[0]["result"]["serverInfo"]["version"], "0.2.0");
         assert_eq!(responses[1]["id"], 2);
         assert_eq!(
             responses[1]["result"]["tools"].as_array().map(Vec::len),
@@ -2069,19 +2297,18 @@ mod tests {
     #[test]
     fn installed_route_strict_app_dir_rejects_stale_or_foreign_health_metadata() {
         let directory = TestDirectory::new("strict-health");
-        let expected_root = directory
-            .path
-            .join("plugins")
-            .join("codex-image-grid-native");
-        fs::create_dir_all(&expected_root).expect("strict source root");
-        let expected_root = fs::canonicalize(expected_root).expect("canonical strict source root");
+        let expected_root = directory.path.join("Codex Image Grid Native.app");
+        fs::create_dir_all(&expected_root).expect("strict packaged root");
+        let expected_root =
+            fs::canonicalize(expected_root).expect("canonical strict packaged root");
         let mut health = json!({
             "ok": true,
             "app": EXPECTED_APP_IDENTITY,
             "serverRoot": expected_root,
             "packageName": EXPECTED_APP_IDENTITY,
             "packageVersion": "0.0.0-stale",
-            "packageRootKind": "source"
+            "packageRootKind": "packaged",
+            "launchTarget": "swiftui"
         });
 
         validate_health_payload(&health, Some(&expected_root), false)
@@ -2099,12 +2326,12 @@ mod tests {
         assert_eq!(
             validate_health_payload(&health, Some(&expected_root), true),
             Err(
-                "IMAGE_GRID_STRICT_APP_DIR=1 rejected server packageRootKind=cache; expected source."
+                "IMAGE_GRID_STRICT_APP_DIR=1 rejected server packageRootKind=cache; expected packaged."
                     .to_owned()
             )
         );
 
-        health["packageRootKind"] = Value::String("source".to_owned());
+        health["packageRootKind"] = Value::String("packaged".to_owned());
         health["packageName"] = Value::String("foreign-image-grid".to_owned());
         assert_eq!(
             validate_health_payload(&health, Some(&expected_root), true),
@@ -2122,6 +2349,41 @@ mod tests {
                 .expect_err("strict root mismatch")
                 .starts_with("IMAGE_GRID_STRICT_APP_DIR=1 rejected Image Grid server:")
         );
+
+        health["serverRoot"] = Value::String(expected_root.to_string_lossy().into_owned());
+        health["launchTarget"] = Value::String("mcp".to_owned());
+        assert_eq!(
+            validate_health_payload(&health, Some(&expected_root), true),
+            Err(
+                "IMAGE_GRID_STRICT_APP_DIR=1 rejected server launchTarget=mcp; expected swiftui."
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn packaged_app_route_uses_exact_open_target_and_requires_all_binaries() {
+        let directory = TestDirectory::new("packaged-app");
+        let app = directory.path.join("Codex Image Grid Native.app");
+        for relative_path in [
+            format!("Contents/MacOS/{NATIVE_APP_EXECUTABLE_NAME}"),
+            format!("Contents/Resources/{NATIVE_MCP_EXECUTABLE_NAME}"),
+            format!("Contents/Resources/{NATIVE_SERVER_EXECUTABLE_NAME}"),
+        ] {
+            make_test_executable(&app.join(relative_path));
+        }
+
+        let app = resolve_native_app(&app).expect("complete native app");
+        let plan = native_app_launch_plan(&app);
+
+        assert_eq!(plan.label, "IMAGE_GRID_NATIVE_APP_PATH");
+        assert_eq!(plan.program, PathBuf::from("/usr/bin/open"));
+        assert_eq!(
+            plan.arguments,
+            vec![app.to_string_lossy().into_owned()],
+            "the launcher must receive the exact app path without name lookup"
+        );
+        assert!(plan.cwd.is_none());
     }
 
     #[test]
@@ -2170,6 +2432,24 @@ mod tests {
                 .is_none()
         );
         assert!(lock_path.exists(), "live other-owner lock must remain");
+    }
+
+    #[test]
+    fn installed_route_uses_writable_runtime_state_outside_the_app_bundle() {
+        let directory = TestDirectory::new("runtime-state-lock");
+        let app_root = directory.path.join("Codex Image Grid Native.app");
+        let state_root = directory.path.join("Application Support").join(".run");
+        fs::create_dir_all(&app_root).expect("app root");
+        fs::create_dir_all(&state_root).expect("state root");
+        let app_root = fs::canonicalize(app_root).expect("canonical app root");
+        let state_root = fs::canonicalize(state_root).expect("canonical state root");
+        let mut config = test_config("http://127.0.0.1:4322", Some(app_root.clone()), None);
+        config.runtime_state_dir = Some(state_root.clone());
+
+        let lock = startup_lock_path(&config);
+
+        assert_eq!(lock, state_root.join("mcp-start-4322.lock"));
+        assert!(!path_is_within(&lock, &app_root));
     }
 
     #[test]
@@ -2256,7 +2536,15 @@ skipped PATH=(none): PATH is unavailable."
         let reference_path = root.join("reference.png");
         fs::write(&reference_path, b"provider-free-reference").expect("reference fixture");
         let fake = FakeServer::running(root.clone(), 3);
-        let config = test_config(&fake.url, Some(root.clone()), None);
+        let activation_marker = root.join("warm-app-activation");
+        let mut config = test_config(&fake.url, Some(root.clone()), None);
+        config.native_app_activation = Some(LaunchPlan {
+            label: "IMAGE_GRID_NATIVE_APP_PATH".to_owned(),
+            program: PathBuf::from("/usr/bin/touch"),
+            arguments: vec![activation_marker.to_string_lossy().into_owned()],
+            cwd: None,
+            environment: Vec::new(),
+        });
         let input = json!({
             "prompts": ["project visual"],
             "count": 1,
@@ -2272,6 +2560,10 @@ skipped PATH=(none): PATH is unavailable."
             .expect("native generation response");
         let requests = fake.finish();
 
+        assert!(
+            activation_marker.is_file(),
+            "a valid warm-server call must still activate the native app"
+        );
         assert_eq!(
             requests
                 .iter()
@@ -2327,6 +2619,54 @@ skipped PATH=(none): PATH is unavailable."
         assert!(summary.contains("runId: abc12345"));
         assert!(summary.contains("serverStarted: false"));
         assert!(summary.contains("diagnostics:\n- none"));
+    }
+
+    #[test]
+    fn cold_app_activation_keeps_polling_after_the_launcher_exits_successfully() {
+        let directory = TestDirectory::new("cold-app-activation");
+        let root = fs::canonicalize(&directory.path).expect("canonical root");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let address = listener.local_addr().expect("reserved address");
+        drop(listener);
+        let server_root = root.clone();
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            let listener = TcpListener::bind(address).expect("delayed native bind");
+            serve_fake_native(listener, server_root, 2)
+        });
+        let activation_marker = root.join("cold-app-activation");
+        let mut config = test_config(&format!("http://{address}"), Some(root), None);
+        config.native_app_activation = Some(LaunchPlan {
+            label: "IMAGE_GRID_NATIVE_APP_PATH".to_owned(),
+            program: PathBuf::from("/usr/bin/touch"),
+            arguments: vec![activation_marker.to_string_lossy().into_owned()],
+            cwd: None,
+            environment: Vec::new(),
+        });
+        config.launch_timeout = Duration::from_secs(5);
+        let input = json!({
+            "prompts": ["vector mark"],
+            "engine": "codex-svg",
+            "waitMs": 0
+        });
+
+        let result = call_generate_image_grid_with_config(&input, &config)
+            .expect("cold app activation generation response");
+        let requests = server.join().expect("delayed native server");
+
+        assert!(activation_marker.is_file());
+        assert_eq!(result["structuredContent"]["serverStarted"], true);
+        assert_eq!(
+            result["structuredContent"]["launchPlan"],
+            "IMAGE_GRID_NATIVE_APP_PATH"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/api/health", "/api/run-batch"]
+        );
     }
 
     #[test]
@@ -2406,13 +2746,29 @@ skipped PATH=(none): PATH is unavailable."
             endpoint: HttpEndpoint::parse(url).expect("test endpoint"),
             image_grid_url: url.to_owned(),
             app_dir,
+            runtime_state_dir: None,
             strict_app_dir: false,
+            native_app_activation: None,
             launch_plan,
             launch_timeout: Duration::from_secs(2),
             health_timeout: Duration::from_secs(2),
             preflight_timeout: Duration::from_secs(2),
             run_timeout: Duration::from_secs(5),
             launch_probe: Duration::from_millis(25),
+            activation_timeout: Duration::from_secs(1),
+        }
+    }
+
+    fn make_test_executable(path: &Path) {
+        fs::create_dir_all(path.parent().expect("executable parent")).expect("executable parent");
+        fs::write(path, b"#!/bin/sh\nexit 0\n").expect("test executable");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(path)
+                .expect("test executable metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("test executable permissions");
         }
     }
 

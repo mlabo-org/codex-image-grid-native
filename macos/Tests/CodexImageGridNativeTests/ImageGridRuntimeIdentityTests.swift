@@ -7,17 +7,23 @@ import Testing
         "ok": true,
         "generatedDir": "/tmp/codex-image-grid-native/generated",
         "identity": [
-            "app": "codex-image-grid-native",
-            "packageName": "codex-image-grid-native",
-            "serverRoot": "/Users/example/codex-image-grid-native",
+            "app": "codex-image-grid",
+            "packageName": "codex-image-grid",
+            "packageVersion": "0.2.0",
+            "packageRootKind": "packaged",
+            "launchTarget": "swiftui",
+            "serverRoot": "/Users/example/Applications/Codex Image Grid Native.app",
         ],
     ])
 
     let identity = try ImageGridRuntimeIdentityValidation.validate(response)
 
-    #expect(identity.app == "codex-image-grid-native")
-    #expect(identity.packageName == "codex-image-grid-native")
-    #expect(identity.serverRoot == "/Users/example/codex-image-grid-native")
+    #expect(identity.app == "codex-image-grid")
+    #expect(identity.packageName == "codex-image-grid")
+    #expect(identity.packageVersion == "0.2.0")
+    #expect(identity.packageRootKind == "packaged")
+    #expect(identity.launchTarget == "swiftui")
+    #expect(identity.serverRoot == "/Users/example/Applications/Codex Image Grid Native.app")
 }
 
 @Test func healthIdentityRequiresDeclarationAndAbsoluteServerRoot() throws {
@@ -28,8 +34,11 @@ import Testing
 
     let missingRoot = try decodeHealth([
         "ok": true,
-        "app": "codex-image-grid-native",
-        "packageName": "codex-image-grid-native",
+        "app": "codex-image-grid",
+        "packageName": "codex-image-grid",
+        "packageVersion": "0.2.0",
+        "packageRootKind": "packaged",
+        "launchTarget": "swiftui",
     ])
     do {
         _ = try ImageGridRuntimeIdentityValidation.validate(missingRoot)
@@ -40,8 +49,11 @@ import Testing
 
     let relativeRoot = try decodeHealth([
         "ok": true,
-        "app": "codex-image-grid-native",
-        "packageName": "codex-image-grid-native",
+        "app": "codex-image-grid",
+        "packageName": "codex-image-grid",
+        "packageVersion": "0.2.0",
+        "packageRootKind": "packaged",
+        "launchTarget": "swiftui",
         "serverRoot": "codex-image-grid-native",
     ])
     #expect(throws: ImageGridAPIError.self) {
@@ -49,11 +61,14 @@ import Testing
     }
 }
 
-@Test func frozenElectronHealthIdentityIsRejected() throws {
+@Test func frozenElectronHealthWithThePublicNameIsStillRejected() throws {
     let response = try decodeHealth([
         "ok": true,
         "app": "codex-image-grid",
         "packageName": "codex-image-grid",
+        "packageVersion": "0.1.0",
+        "packageRootKind": "packaged",
+        "launchTarget": "electron",
         "serverRoot": "/Users/example/codex-image-grid",
     ])
 
@@ -61,8 +76,26 @@ import Testing
         _ = try ImageGridRuntimeIdentityValidation.validate(response)
         Issue.record("The frozen Electron listener was accepted as the native runtime.")
     } catch let error as ImageGridAPIError {
-        #expect(error.message.contains("not Codex Image Grid Native"))
-        #expect(error.message.contains("codex-image-grid-native"))
+        #expect(error.message.contains("packageVersion"))
+    }
+}
+
+@Test func headlessRuntimeWithCurrentPublicMetadataIsRejected() throws {
+    let response = try decodeHealth([
+        "ok": true,
+        "app": "codex-image-grid",
+        "packageName": "codex-image-grid",
+        "packageVersion": "0.2.0",
+        "packageRootKind": "packaged",
+        "launchTarget": "mcp",
+        "serverRoot": "/Users/example/Applications/Codex Image Grid Native.app",
+    ])
+
+    do {
+        _ = try ImageGridRuntimeIdentityValidation.validate(response)
+        Issue.record("A headless runtime was accepted as the SwiftUI-owned runtime.")
+    } catch let error as ImageGridAPIError {
+        #expect(error.message.contains("launchTarget=swiftui"))
     }
 }
 

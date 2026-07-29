@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const APP_IDENTITY: &str = "codex-image-grid-native";
+pub const APP_IDENTITY: &str = "codex-image-grid";
 pub const MAX_PROMPTS: usize = 12;
 pub const MAX_VARIANTS_PER_PROMPT: u8 = 6;
 pub const MAX_RUN_JOBS: usize = 24;
@@ -302,6 +302,12 @@ mod tests {
 
     fn prompts(count: usize) -> Vec<String> {
         (0..count).map(|index| format!("prompt {index}")).collect()
+    }
+
+    #[test]
+    fn public_identity_keeps_native_bind_isolated() {
+        assert_eq!(APP_IDENTITY, "codex-image-grid");
+        assert_eq!(DEFAULT_NATIVE_BIND, "127.0.0.1:4322");
     }
 
     #[test]
