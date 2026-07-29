@@ -42,10 +42,11 @@ not claim that native generation or MCP activation succeeded.
 
 The final plugin accepts Prompt Batch requests through `generate_image_grid`
 and returns the existing run status, manifest, handoff, output paths,
-display-safe URLs, and Codex Markdown contract. Native and MCP reference
-images are local absolute paths. The Rust runtime stages a validated copy
-before starting jobs. Browser compatibility uses a separate binary/staged
-upload route.
+display-safe URLs, and Codex Markdown contract. SwiftUI may submit a validated
+local absolute reference path. MCP accepts the same path as its public tool
+input, snapshots it before startup, and submits the frozen inline data-URL
+HTTP shape. Browser clients submit that bounded inline shape directly. The
+Rust runtime stages one owned copy before starting jobs.
 
 ## Stop conditions
 
@@ -59,4 +60,3 @@ cache files, generated output, or an unbuilt placeholder binary.
 Report changed source paths, the Rust/Swift validation commands and results,
 whether MCP activation remains intentionally withheld, any parity evidence,
 and the smallest next implementation boundary.
-

@@ -51,19 +51,20 @@ The server owns the local runtime boundary:
 ### Rust MCP
 
 The MCP binary owns stdio JSON-RPC and the `generate_image_grid` tool. It must
-launch or verify the native runtime, pass local reference-image paths without
-base64 encoding, and return the existing handoff/manifest/output contract.
+validate and snapshot a requested local reference-image path before any server
+startup, convert the snapshot to the frozen inline data-URL HTTP shape, launch
+or verify the native runtime, and return the existing
+handoff/manifest/output contract.
 
 ## Reference-image policy
 
-Native and MCP requests carry a local absolute path. The Rust server resolves
-the path, validates the regular file, extension/MIME, and size, then copies it
-into the run directory before starting jobs. Jobs use the staged copy, not a
-mutable external path.
-
-Browser clients cannot provide a real local path from a normal browser
-sandbox. They use a separate binary or staged-upload route and never change
-the native/MCP path contract.
+The SwiftUI app may send a validated local absolute path as a native extension.
+The MCP public argument is also a local absolute path, but the MCP binary
+validates and reads it before health/startup, then submits an inline
+`referenceImage` data URL to `/api/run-batch`. Browser clients submit the same
+bounded inline HTTP shape. The Rust server stages either accepted form once in
+the run directory, and jobs use that owned copy rather than a mutable external
+path.
 
 ## Compatibility boundary
 
@@ -81,4 +82,3 @@ The following are public behavior and must remain stable at cutover:
 The exact image bytes are not a parity target because the upstream provider is
 stochastic. Parity means equivalent accepted inputs, state transitions,
 failure semantics, artifacts, and user-visible results.
-
