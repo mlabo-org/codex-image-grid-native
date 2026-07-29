@@ -32,17 +32,6 @@ struct ResponsiveResultGrid {
     }
 }
 
-struct ResultGridColumnCountPreferenceKey: PreferenceKey {
-    static let defaultValue = 1
-
-    static func reduce(value: inout Int, nextValue: () -> Int) {
-        let next = nextValue()
-        if next > 0 {
-            value = next
-        }
-    }
-}
-
 struct ResultCardView: View {
     @Environment(\.appShellLanguage) private var language
 
