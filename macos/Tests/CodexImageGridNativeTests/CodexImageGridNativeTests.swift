@@ -149,6 +149,22 @@ import Foundation
     #expect(tracker.unacknowledgedCount == 0)
 }
 
+@Test func activeImageLoadFailureRemainsAProgressState() {
+    let active = ImageGridJob(id: "active", status: "running")
+    let failed = ImageGridJob(id: "failed", status: "error")
+    let unavailable = ImageGridJob(id: "unavailable", status: "done")
+
+    #expect(ResultCardImageLoadFailurePresentation.resolve(for: active) == .progress)
+    #expect(
+        ResultCardImageLoadFailurePresentation.resolve(for: failed)
+            == .generationFailure
+    )
+    #expect(
+        ResultCardImageLoadFailurePresentation.resolve(for: unavailable)
+            == .imageUnavailable
+    )
+}
+
 @Test func responsiveGridUsesAvailableWidthWithoutAFixedColumnCap() {
     let grid = ResponsiveResultGrid(minimumColumnWidth: 512, spacing: 16)
 
