@@ -1,61 +1,12 @@
 import SwiftUI
 
-struct ResponsiveResultGrid: Layout {
+struct ResponsiveResultGrid {
     let minimumColumnWidth: CGFloat
     let spacing: CGFloat
 
     init(minimumColumnWidth: CGFloat, spacing: CGFloat) {
         self.minimumColumnWidth = minimumColumnWidth
         self.spacing = spacing
-    }
-
-    func sizeThatFits(
-        proposal: ProposedViewSize,
-        subviews: Subviews,
-        cache: inout ()
-    ) -> CGSize {
-        guard !subviews.isEmpty else {
-            return CGSize(width: proposal.width ?? 0, height: 0)
-        }
-        let width = proposal.width ?? minimumColumnWidth
-        let columns = columnCount(for: width, itemCount: subviews.count)
-        let columnWidth = max(0, (width - CGFloat(columns - 1) * spacing) / CGFloat(columns))
-        let heights = rowHeights(subviews: subviews, columns: columns, columnWidth: columnWidth)
-        return CGSize(
-            width: width,
-            height: heights.reduce(0, +) + CGFloat(max(0, heights.count - 1)) * spacing
-        )
-    }
-
-    func placeSubviews(
-        in bounds: CGRect,
-        proposal: ProposedViewSize,
-        subviews: Subviews,
-        cache: inout ()
-    ) {
-        guard !subviews.isEmpty else { return }
-        let columns = columnCount(for: bounds.width, itemCount: subviews.count)
-        let columnWidth = max(
-            0,
-            (bounds.width - CGFloat(columns - 1) * spacing) / CGFloat(columns)
-        )
-        let heights = rowHeights(subviews: subviews, columns: columns, columnWidth: columnWidth)
-        var rowOrigins: [CGFloat] = []
-        var origin = bounds.minY
-        for height in heights {
-            rowOrigins.append(origin)
-            origin += height + spacing
-        }
-        for (index, subview) in subviews.enumerated() {
-            let row = index / columns
-            let column = index % columns
-            let x = bounds.minX + CGFloat(column) * (columnWidth + spacing)
-            subview.place(
-                at: CGPoint(x: x, y: rowOrigins[row]),
-                anchor: .topLeading,
-                proposal: ProposedViewSize(width: columnWidth, height: nil)
-            )
-        }
     }
 
     func columnCount(for width: CGFloat, itemCount: Int) -> Int {
@@ -65,18 +16,29 @@ struct ResponsiveResultGrid: Layout {
         )
     }
 
-    private func rowHeights(
-        subviews: Subviews,
-        columns: Int,
-        columnWidth: CGFloat
-    ) -> [CGFloat] {
-        let rowCount = Int(ceil(Double(subviews.count) / Double(columns)))
-        return (0..<rowCount).map { row in
-            let start = row * columns
-            let end = min(start + columns, subviews.count)
-            return subviews[start..<end].map {
-                $0.sizeThatFits(ProposedViewSize(width: columnWidth, height: nil)).height
-            }.max() ?? 0
+    func gridItems(for width: CGFloat, itemCount: Int) -> [GridItem] {
+        gridItems(count: columnCount(for: width, itemCount: itemCount))
+    }
+
+    func gridItems(count: Int) -> [GridItem] {
+        Array(
+            repeating: GridItem(
+                .flexible(minimum: 0),
+                spacing: spacing,
+                alignment: .top
+            ),
+            count: max(1, count)
+        )
+    }
+}
+
+struct ResultGridColumnCountPreferenceKey: PreferenceKey {
+    static let defaultValue = 1
+
+    static func reduce(value: inout Int, nextValue: () -> Int) {
+        let next = nextValue()
+        if next > 0 {
+            value = next
         }
     }
 }

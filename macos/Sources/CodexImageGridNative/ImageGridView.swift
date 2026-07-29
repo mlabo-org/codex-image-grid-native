@@ -109,6 +109,7 @@ struct ImageGridView: View {
     @State private var referenceLoadGeneration = 0
     @State private var formError: String?
     @State private var draftReady = false
+    @State private var resultGridColumnCount = 1
 
     private var strings: ImageGridStrings {
         ImageGridStrings(language: selectedLanguage)
@@ -861,7 +862,14 @@ struct ImageGridView: View {
                     .padding(24)
                 }
         } else {
-            ResponsiveResultGrid(minimumColumnWidth: 512, spacing: 16) {
+            let grid = ResponsiveResultGrid(minimumColumnWidth: 512, spacing: 16)
+            LazyVGrid(
+                columns: grid.gridItems(
+                    count: min(resultGridColumnCount, visible.count)
+                ),
+                alignment: .leading,
+                spacing: grid.spacing
+            ) {
                 ForEach(visible) { job in
                     ResultCardView(
                         job: job,
@@ -875,6 +883,22 @@ struct ImageGridView: View {
                 }
             }
             .frame(maxWidth: .infinity)
+            .background {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: ResultGridColumnCountPreferenceKey.self,
+                        value: grid.columnCount(
+                            for: geometry.size.width,
+                            itemCount: visible.count
+                        )
+                    )
+                }
+            }
+            .onPreferenceChange(ResultGridColumnCountPreferenceKey.self) { columnCount in
+                if columnCount != resultGridColumnCount {
+                    resultGridColumnCount = columnCount
+                }
+            }
         }
     }
 
