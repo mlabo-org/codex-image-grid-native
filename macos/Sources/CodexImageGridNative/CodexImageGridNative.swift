@@ -17,16 +17,26 @@ struct CodexImageGridNative {
 struct CodexImageGridApp: App {
     @NSApplicationDelegateAdaptor(CodexImageGridApplicationDelegate.self)
     private var applicationDelegate
+    @StateObject private var store = ImageGridStore()
 
     var body: some Scene {
         WindowGroup("Codex Image Grid") {
-            ImageGridView()
+            ImageGridView(store: store)
                 .environmentObject(applicationDelegate.runtimeLifecycle)
         }
         .defaultSize(width: 1180, height: 820)
         .commands {
             AppShellSettingsMenu()
         }
+
+        Window(
+            "Codex Image Grid — 生成データの一括削除",
+            id: ImageGridWindowID.runDeletion
+        ) {
+            ImageGridDeletionView(store: store)
+        }
+        .defaultSize(width: 1180, height: 820)
+        .windowResizability(.contentMinSize)
 
         Settings {
             AppShellRoot {
