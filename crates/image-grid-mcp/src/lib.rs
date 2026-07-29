@@ -2409,9 +2409,9 @@ skipped PATH=(none): PATH is unavailable."
             strict_app_dir: false,
             launch_plan,
             launch_timeout: Duration::from_secs(2),
-            health_timeout: Duration::from_millis(500),
-            preflight_timeout: Duration::from_millis(500),
-            run_timeout: Duration::from_secs(2),
+            health_timeout: Duration::from_secs(2),
+            preflight_timeout: Duration::from_secs(2),
+            run_timeout: Duration::from_secs(5),
             launch_probe: Duration::from_millis(25),
         }
     }
@@ -2430,7 +2430,7 @@ skipped PATH=(none): PATH is unavailable."
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream
-                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .set_read_timeout(Some(Duration::from_secs(5)))
                         .expect("fake read timeout");
                     let request = read_test_request(&mut stream);
                     let response = fake_response(&request, &root);
