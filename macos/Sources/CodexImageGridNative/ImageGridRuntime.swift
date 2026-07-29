@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import ImageIO
 import UniformTypeIdentifiers
 
 enum RuntimeConnectionState: Sendable {
@@ -253,6 +254,7 @@ struct ImageGridAPIError: LocalizedError, Equatable, Sendable {
 
 struct ImageGridAPIClient: Sendable {
     static let defaultBaseURL = URL(string: "http://127.0.0.1:4322")!
+    static let analysisTimeout: TimeInterval = 185
 
     let baseURL: URL
     private let session: URLSession
@@ -309,17 +311,25 @@ struct ImageGridAPIClient: Sendable {
     }
 
     func analyze(referenceImagePath: String) async throws -> String {
-        let response: ImageGridAnalysisResponse = try await send(
-            path: "/api/analyze-reference",
-            method: "POST",
-            body: ImageGridAnalysisRequest(referenceImagePath: referenceImagePath)
-        )
+        let request = try analysisRequest(referenceImagePath: referenceImagePath)
+        let response: ImageGridAnalysisResponse = try await send(request: request)
         guard let premise = response.premise?.trimmingCharacters(in: .whitespacesAndNewlines),
               !premise.isEmpty
         else {
             throw ImageGridAPIError(message: "Reference analysis returned no premise.")
         }
         return premise
+    }
+
+    func analysisRequest(referenceImagePath: String) throws -> URLRequest {
+        try makeRequest(
+            path: "/api/analyze-reference",
+            method: "POST",
+            bodyData: encoder.encode(
+                ImageGridAnalysisRequest(referenceImagePath: referenceImagePath)
+            ),
+            timeout: Self.analysisTimeout
+        )
     }
 
     func consumeEvents(
@@ -371,14 +381,28 @@ struct ImageGridAPIClient: Sendable {
         method: String,
         bodyData: Data?
     ) async throws -> Response {
+        let request = try makeRequest(path: path, method: method, bodyData: bodyData)
+        return try await send(request: request)
+    }
+
+    private func makeRequest(
+        path: String,
+        method: String,
+        bodyData: Data?,
+        timeout: TimeInterval = 20
+    ) throws -> URLRequest {
         var request = URLRequest(url: endpoint(path))
         request.httpMethod = method
-        request.timeoutInterval = 20
+        request.timeoutInterval = timeout
         request.cachePolicy = .reloadIgnoringLocalCacheData
         if let bodyData {
             request.httpBody = bodyData
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
+        return request
+    }
+
+    private func send<Response: Decodable>(request: URLRequest) async throws -> Response {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw ImageGridAPIError(message: "The Image Grid server returned an invalid response.")
@@ -670,39 +694,248 @@ final class ImageGridStore: ObservableObject {
     }
 }
 
+struct ImageGridReferenceDimensions: Equatable, Sendable {
+    let width: Int
+    let height: Int
+}
+
+enum ImageGridReferencePreparationError: Error, Equatable, Sendable {
+    case unsupportedType
+    case tooLarge
+    case unsafeDimensions
+    case decodeFailed
+    case preparationFailed
+}
+
+enum ImageGridReferencePolicy {
+    static let maximumDimension = 32_768
+    static let maximumPixels = 32 * 1_024 * 1_024
+    static let downscaleDimension = 4_096
+
+    static func preparedDimensions(
+        width: Int,
+        height: Int
+    ) throws -> ImageGridReferenceDimensions {
+        guard width > 0, height > 0 else {
+            throw ImageGridReferencePreparationError.unsafeDimensions
+        }
+        guard width <= maximumDimension, height <= maximumDimension else {
+            throw ImageGridReferencePreparationError.unsafeDimensions
+        }
+        let pixels = Int64(width) * Int64(height)
+        guard pixels <= Int64(maximumPixels) else {
+            throw ImageGridReferencePreparationError.unsafeDimensions
+        }
+        let longest = max(width, height)
+        guard longest > downscaleDimension else {
+            return ImageGridReferenceDimensions(width: width, height: height)
+        }
+        let scale = Double(downscaleDimension) / Double(longest)
+        return ImageGridReferenceDimensions(
+            width: max(1, Int((Double(width) * scale).rounded())),
+            height: max(1, Int((Double(height) * scale).rounded()))
+        )
+    }
+}
+
+private enum ImageGridReferenceFormat {
+    case png
+    case jpeg
+    case webP
+
+    var type: UTType {
+        switch self {
+        case .png: .png
+        case .jpeg: .jpeg
+        case .webP: .webP
+        }
+    }
+
+    var fileExtension: String {
+        switch self {
+        case .png: "png"
+        case .jpeg: "jpg"
+        case .webP: "webp"
+        }
+    }
+
+    var encodingProperties: CFDictionary? {
+        switch self {
+        case .png:
+            nil
+        case .jpeg, .webP:
+            [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary
+        }
+    }
+
+    init?(sourceType: CFString, allowsTIFFSource: Bool) {
+        guard let type = UTType(sourceType as String) else { return nil }
+        if type.conforms(to: .png) {
+            self = .png
+        } else if type.conforms(to: .jpeg) {
+            self = .jpeg
+        } else if type.conforms(to: .webP) {
+            self = .webP
+        } else if allowsTIFFSource, type.conforms(to: .tiff) {
+            self = .png
+        } else {
+            return nil
+        }
+    }
+}
+
+struct ImageGridReferenceCandidate: Sendable {
+    let url: URL
+    let ownsTemporaryFile: Bool
+    let allowsTIFFSource: Bool
+
+    init(url: URL, ownsTemporaryFile: Bool, allowsTIFFSource: Bool = false) {
+        self.url = url
+        self.ownsTemporaryFile = ownsTemporaryFile
+        self.allowsTIFFSource = allowsTIFFSource
+    }
+
+    func removeOwnedTemporaryFile() {
+        guard ownsTemporaryFile else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
 struct ImageGridReference: Equatable, Sendable {
     static let maximumBytes: Int64 = 100 * 1_024 * 1_024
     static let supportedExtensions = Set(["png", "jpg", "jpeg", "webp"])
 
     let url: URL
     let size: Int64
+    let pixelWidth: Int
+    let pixelHeight: Int
     let ownsTemporaryFile: Bool
 
-    static func validate(url: URL, ownsTemporaryFile: Bool = false) throws -> Self {
+    static func prepare(candidate: ImageGridReferenceCandidate) throws -> Self {
+        defer {
+            candidate.removeOwnedTemporaryFile()
+        }
+        return try prepare(url: candidate.url, allowsTIFFSource: candidate.allowsTIFFSource)
+    }
+
+    static func prepare(url: URL, allowsTIFFSource: Bool = false) throws -> Self {
+        do {
+            return try prepareValidated(url: url, allowsTIFFSource: allowsTIFFSource)
+        } catch let error as ImageGridReferencePreparationError {
+            throw error
+        } catch {
+            throw ImageGridReferencePreparationError.preparationFailed
+        }
+    }
+
+    private static func prepareValidated(
+        url: URL,
+        allowsTIFFSource: Bool
+    ) throws -> Self {
         guard url.isFileURL else {
-            throw ImageGridAPIError(message: "Choose a local PNG, JPEG, or WebP image.")
+            throw ImageGridReferencePreparationError.unsupportedType
         }
         let standardized = url.standardizedFileURL.resolvingSymlinksInPath()
-        guard supportedExtensions.contains(standardized.pathExtension.lowercased()) else {
-            throw ImageGridAPIError(message: "Choose a PNG, JPEG, or WebP image.")
+        let pathExtension = standardized.pathExtension.lowercased()
+        guard supportedExtensions.contains(pathExtension)
+            || (allowsTIFFSource && ["tif", "tiff"].contains(pathExtension))
+        else {
+            throw ImageGridReferencePreparationError.unsupportedType
         }
-        let values = try standardized.resourceValues(
-            forKeys: [.isRegularFileKey, .fileSizeKey, .contentTypeKey]
-        )
+        let values = try standardized.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
         guard values.isRegularFile == true else {
-            throw ImageGridAPIError(message: "The reference image must be a regular file.")
-        }
-        if let contentType = values.contentType {
-            let allowed = [UTType.png, .jpeg, .webP].contains { contentType.conforms(to: $0) }
-            guard allowed else {
-                throw ImageGridAPIError(message: "Choose a PNG, JPEG, or WebP image.")
-            }
+            throw ImageGridReferencePreparationError.preparationFailed
         }
         let size = Int64(values.fileSize ?? 0)
-        guard size > 0, size <= maximumBytes else {
-            throw ImageGridAPIError(message: "The reference image must be 100 MiB or smaller.")
+        guard size > 0 else {
+            throw ImageGridReferencePreparationError.decodeFailed
         }
-        return Self(url: standardized, size: size, ownsTemporaryFile: ownsTemporaryFile)
+        guard size <= maximumBytes else {
+            throw ImageGridReferencePreparationError.tooLarge
+        }
+
+        let sourceOptions = [
+            kCGImageSourceShouldCache: false,
+            kCGImageSourceShouldCacheImmediately: false,
+        ] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(standardized as CFURL, sourceOptions),
+              CGImageSourceGetCount(source) > 0,
+              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+              let sourceType = CGImageSourceGetType(source)
+        else {
+            throw ImageGridReferencePreparationError.decodeFailed
+        }
+        guard let format = ImageGridReferenceFormat(
+            sourceType: sourceType,
+            allowsTIFFSource: allowsTIFFSource
+        ) else {
+            throw ImageGridReferencePreparationError.unsupportedType
+        }
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, sourceOptions)
+                as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue
+        else {
+            throw ImageGridReferencePreparationError.decodeFailed
+        }
+        let dimensions = try ImageGridReferencePolicy.preparedDimensions(
+            width: width,
+            height: height
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-image-grid-native/references", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let destinationURL = directory.appendingPathComponent(
+            "reference-\(UUID().uuidString).\(format.fileExtension)"
+        )
+
+        do {
+            if dimensions.width == width, dimensions.height == height {
+                try FileManager.default.copyItem(at: standardized, to: destinationURL)
+            } else {
+                let thumbnailOptions = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: ImageGridReferencePolicy.downscaleDimension,
+                    kCGImageSourceShouldCacheImmediately: true,
+                ] as CFDictionary
+                guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions),
+                      let destination = CGImageDestinationCreateWithURL(
+                          destinationURL as CFURL,
+                          format.type.identifier as CFString,
+                          1,
+                          nil
+                )
+                else {
+                    throw ImageGridReferencePreparationError.preparationFailed
+                }
+                CGImageDestinationAddImage(destination, image, format.encodingProperties)
+                guard CGImageDestinationFinalize(destination) else {
+                    throw ImageGridReferencePreparationError.preparationFailed
+                }
+            }
+
+            let outputValues = try destinationURL.resourceValues(
+                forKeys: [.isRegularFileKey, .fileSizeKey]
+            )
+            let outputSize = Int64(outputValues.fileSize ?? 0)
+            guard outputValues.isRegularFile == true, outputSize > 0 else {
+                throw ImageGridReferencePreparationError.preparationFailed
+            }
+            guard outputSize <= maximumBytes else {
+                throw ImageGridReferencePreparationError.tooLarge
+            }
+            return Self(
+                url: destinationURL,
+                size: outputSize,
+                pixelWidth: dimensions.width,
+                pixelHeight: dimensions.height,
+                ownsTemporaryFile: true
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: destinationURL)
+            throw error
+        }
     }
 
     func removeOwnedTemporaryFile() {
@@ -713,40 +946,111 @@ struct ImageGridReference: Equatable, Sendable {
 
 @MainActor
 enum NativeReferencePasteboard {
-    static func reference() throws -> ImageGridReference? {
+    static func candidate() throws -> ImageGridReferenceCandidate? {
         let pasteboard = NSPasteboard.general
         let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
         if let urls = pasteboard.readObjects(
             forClasses: [NSURL.self],
             options: options
         ) as? [URL], let first = urls.first {
-            return try ImageGridReference.validate(url: first)
+            return ImageGridReferenceCandidate(url: first, ownsTemporaryFile: false)
         }
 
         let data: Data?
+        let fileExtension: String
+        let allowsTIFFSource: Bool
         if let png = pasteboard.data(forType: .png) {
             data = png
-        } else if let tiff = pasteboard.data(forType: .tiff),
-                  let representation = NSBitmapImageRep(data: tiff)
-        {
-            data = representation.representation(using: .png, properties: [:])
+            fileExtension = "png"
+            allowsTIFFSource = false
+        } else if let tiff = pasteboard.data(forType: .tiff) {
+            data = tiff
+            fileExtension = "tiff"
+            allowsTIFFSource = true
         } else {
             data = nil
+            fileExtension = "png"
+            allowsTIFFSource = false
         }
         guard let data else { return nil }
         guard Int64(data.count) <= ImageGridReference.maximumBytes else {
-            throw ImageGridAPIError(message: "The pasted image must be 100 MiB or smaller.")
+            throw ImageGridReferencePreparationError.tooLarge
         }
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-image-grid-native", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let url = directory.appendingPathComponent("pasted-\(UUID().uuidString).png")
+        let url = directory.appendingPathComponent(
+            "pasted-\(UUID().uuidString).\(fileExtension)"
+        )
         try data.write(to: url, options: .atomic)
-        do {
-            return try ImageGridReference.validate(url: url, ownsTemporaryFile: true)
-        } catch {
-            try? FileManager.default.removeItem(at: url)
-            throw error
+        return ImageGridReferenceCandidate(
+            url: url,
+            ownsTemporaryFile: true,
+            allowsTIFFSource: allowsTIFFSource
+        )
+    }
+
+    static func candidate(from providers: [NSItemProvider]) async throws
+        -> ImageGridReferenceCandidate?
+    {
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                let item = try await provider.loadItem(
+                    forTypeIdentifier: UTType.fileURL.identifier,
+                    options: nil
+                )
+                if let url = item as? URL {
+                    return ImageGridReferenceCandidate(url: url, ownsTemporaryFile: false)
+                }
+                if let data = item as? Data,
+                   let url = URL(dataRepresentation: data, relativeTo: nil)
+                {
+                    return ImageGridReferenceCandidate(url: url, ownsTemporaryFile: false)
+                }
+            }
+            for type in [UTType.png, .jpeg, .webP] {
+                guard provider.hasItemConformingToTypeIdentifier(type.identifier) else {
+                    continue
+                }
+                guard let data = try await loadData(
+                    from: provider,
+                    typeIdentifier: type.identifier
+                ) else {
+                    continue
+                }
+                guard Int64(data.count) <= ImageGridReference.maximumBytes else {
+                    throw ImageGridReferencePreparationError.tooLarge
+                }
+                let directory = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("codex-image-grid-native/incoming", isDirectory: true)
+                try FileManager.default.createDirectory(
+                    at: directory,
+                    withIntermediateDirectories: true
+                )
+                let url = directory.appendingPathComponent(
+                    "pasted-\(UUID().uuidString).\(type.preferredFilenameExtension ?? "png")"
+                )
+                try data.write(to: url, options: .atomic)
+                return ImageGridReferenceCandidate(url: url, ownsTemporaryFile: true)
+            }
+        }
+        return nil
+    }
+
+    private static func loadData(
+        from provider: NSItemProvider,
+        typeIdentifier: String
+    ) async throws -> Data? {
+        try await withCheckedThrowingContinuation { continuation in
+            _ = provider.loadDataRepresentation(
+                forTypeIdentifier: typeIdentifier
+            ) { data, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: data)
+                }
+            }
         }
     }
 }

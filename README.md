@@ -58,8 +58,9 @@ The provider-free first runnable slice now includes:
   preflight checks, and compatible success summaries/structured content;
 - a responsive SwiftUI runtime client with the frozen language, theme, prompt,
   generation-option, reference-image, and result-filter controls, plus
-  health/preflight/run calls, SSE progress, native file actions, and adaptive
-  result cards.
+  health/preflight/run calls, SSE progress, validated/downscaled
+  choose/drop/paste references, reference analysis states, native file
+  actions, and adaptive result cards.
 
 The provider-free fixture now completes real HTTP and MCP runs through the
 owned App Server transport and validates generated images, local reference
