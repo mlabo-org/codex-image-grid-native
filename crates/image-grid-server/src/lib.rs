@@ -284,16 +284,24 @@ async fn events(
 async fn run_single(
     State(state): State<RuntimeState>,
     Query(query): Query<HashMap<String, String>>,
-    Json(body): Json<Value>,
+    request: AxumRequest,
 ) -> Response {
+    let body = match http_json::read_json_body(request).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
     create_run_response(state, body, false, query.get("waitMs").map(String::as_str)).await
 }
 
 async fn run_batch(
     State(state): State<RuntimeState>,
     Query(query): Query<HashMap<String, String>>,
-    Json(body): Json<Value>,
+    request: AxumRequest,
 ) -> Response {
+    let body = match http_json::read_json_body(request).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
     create_run_response(state, body, true, query.get("waitMs").map(String::as_str)).await
 }
 
@@ -816,6 +824,190 @@ done
                 .expect("compatibility route response");
             assert_eq!(response.status(), StatusCode::OK);
         }
+    }
+
+    #[tokio::test]
+    async fn provider_free_run_batch_stages_frozen_inline_reference_once() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let server_root = temporary.path().join("server");
+        let data_dir = temporary.path().join("data");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&server_root).expect("server root");
+        fs::create_dir_all(&data_dir).expect("data root");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let request_log = temporary.path().join("app-server-requests.jsonl");
+        let captured_reference = temporary.path().join("captured-reference.jpg");
+        assert!(!request_log.to_string_lossy().contains('\''));
+        assert!(!captured_reference.to_string_lossy().contains('\''));
+        let fake = temporary.path().join("fake-codex");
+        let fake_source = r#"#!/bin/sh
+test "$1" = "app-server" || exit 2
+request_log='__REQUEST_LOG__'
+captured_reference='__CAPTURED_REFERENCE__'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >>"$request_log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"fixture-thread"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      staged_path=$(printf '%s\n' "$line" | /usr/bin/sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
+      /bin/cp "$staged_path" "$captured_reference" || exit 3
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"fixture-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"fixture-thread","turnId":"fixture-turn","item":{"type":"imageGeneration","id":"fixture-image","status":"completed","revisedPrompt":null,"result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'
+      ;;
+  esac
+done
+"#
+        .replace("__REQUEST_LOG__", &request_log.to_string_lossy())
+        .replace(
+            "__CAPTURED_REFERENCE__",
+            &captured_reference.to_string_lossy(),
+        );
+        let mut file = fs::File::create(&fake).expect("fake executable");
+        file.write_all(fake_source.as_bytes()).expect("fake source");
+        file.flush().expect("fake source flushed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = file.metadata().expect("fake metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&fake, permissions).expect("fake executable permissions");
+        }
+
+        let config = RuntimeConfig::new(
+            server_root,
+            data_dir.clone(),
+            Some(workspace),
+            "server".to_owned(),
+        );
+        let app = router_with_launch_config(config, AppServerLaunchConfig::single("fixture", fake));
+        let reference_bytes = [0xff, 0xd8, 0xff, 0xd9];
+        let unused_http_path = temporary.path().join("must-not-be-read.png");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/run-batch?waitMs=5000")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "prompts": ["inline reference fixture"],
+                            "count": 1,
+                            "mood": "warm-mascot",
+                            "engine": "app-server-image",
+                            "aspectRatio": "16:9",
+                            "referenceImage": {
+                                "dataUrl": format!(
+                                    "data:image/jpeg;base64,{}",
+                                    BASE64_STANDARD.encode(reference_bytes)
+                                ),
+                                "mimeType": "image/jpeg",
+                                "name": "browser-reference.jpeg",
+                                "size": reference_bytes.len()
+                            },
+                            "referenceImagePath": unused_http_path.to_string_lossy()
+                        })
+                        .to_string(),
+                    ))
+                    .expect("run request"),
+            )
+            .await
+            .expect("run response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("run body")
+            .to_bytes();
+        let run: Value = serde_json::from_slice(&body).expect("run JSON");
+        let run_id = run["runId"].as_str().expect("run id");
+        assert_eq!(run["status"], "done");
+        assert_eq!(run["completed"], true);
+        let staged_path = fs::canonicalize(
+            data_dir
+                .join("generated")
+                .join(run_id)
+                .join("reference.jpg"),
+        )
+        .expect("staged reference");
+        let staged_path_display = display_path(&staged_path);
+        let reference_url = format!("/generated/{run_id}/reference.jpg");
+        assert_eq!(
+            fs::read(&staged_path).expect("staged bytes"),
+            reference_bytes
+        );
+        assert_eq!(
+            fs::read(&captured_reference).expect("captured reference"),
+            reference_bytes
+        );
+        for output in [&run["jobs"][0], &run["outputs"][0]] {
+            assert_eq!(output["referenceImagePath"], staged_path_display);
+            assert_eq!(output["referenceImageUrl"], reference_url);
+            assert_eq!(output["outputPath"].as_str().is_some(), true);
+        }
+
+        let request_messages = fs::read_to_string(&request_log).expect("App Server request log");
+        assert!(!request_messages.contains(&display_path(&unused_http_path)));
+        let messages = request_messages
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("logged JSON request"))
+            .collect::<Vec<_>>();
+        let turn_start = messages
+            .iter()
+            .find(|message| message["method"] == "turn/start")
+            .expect("turn/start request");
+        assert_eq!(
+            turn_start["params"]["input"][1],
+            json!({
+                "type": "localImage",
+                "path": staged_path_display
+            })
+        );
+
+        let manifest_path = PathBuf::from(
+            run["manifestPath"]
+                .as_str()
+                .expect("manifest path in response"),
+        );
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(manifest_path).expect("persisted manifest bytes"))
+                .expect("manifest JSON");
+        assert_eq!(
+            manifest["request"]["referenceImage"],
+            json!({
+                "path": staged_path_display,
+                "url": reference_url
+            })
+        );
+        assert_eq!(
+            manifest["outputs"][0]["referenceImagePath"],
+            staged_path_display
+        );
+        assert_eq!(manifest["outputs"][0]["referenceImageUrl"], reference_url);
+        assert_eq!(
+            manifest["outputs"][0]["outputPath"],
+            run["outputs"][0]["outputPath"]
+        );
+
+        let handoff = fs::read_to_string(
+            run["handoffPath"]
+                .as_str()
+                .expect("handoff path in response"),
+        )
+        .expect("persisted handoff");
+        assert!(handoff.contains(&format!("- Reference image: {staged_path_display}")));
+        assert!(handoff.contains("## Outputs"));
+        assert!(!unused_http_path.exists());
     }
 
     #[tokio::test]
