@@ -87,6 +87,7 @@ private enum ReferenceInteractionState: Equatable {
 
 struct ImageGridView: View {
     @Environment(\.appShellLanguage) private var language
+    @EnvironmentObject private var runtimeLifecycle: NativeRuntimeLifecycle
     @AppStorage(AppShellPreferenceKeys.language) private var selectedLanguage =
         AppShellLanguage.system
     @AppStorage(AppShellPreferenceKeys.theme) private var selectedTheme = AppShellTheme.system
@@ -130,7 +131,9 @@ struct ImageGridView: View {
         .frame(minHeight: 560)
         .onAppear {
             store.applyRetentionMode(resultLimit: resultLimit)
-            store.start()
+        }
+        .onChange(of: runtimeLifecycle.state, initial: true) { _, state in
+            store.synchronize(with: state)
         }
         .onDisappear {
             store.stop()
