@@ -152,6 +152,7 @@ struct ImageGridRunEnvelope: Decodable, Sendable {
     let outputs: [ImageGridJob]?
     let manifestViewUrl: String?
     let handoffViewUrl: String?
+    let server: ImageGridRuntimeIdentity?
 
     var hydratedJobs: [ImageGridJob] {
         let candidates = (jobs ?? []) + (outputs ?? [])
@@ -179,15 +180,32 @@ private struct ImageGridRunEvent: Decodable {
     let jobs: [ImageGridJob]
 }
 
-private struct ImageGridHealthResponse: Decodable {
+struct ImageGridRuntimeIdentity: Decodable, Equatable, Sendable {
+    let app: String?
+    let serverRoot: String?
+    let packageName: String?
+}
+
+struct ImageGridHealthResponse: Decodable {
     let ok: Bool
     let app: String?
+    let serverRoot: String?
+    let packageName: String?
     let generatedDir: String?
     let appServerImageReady: Bool?
     let appServerImageDiagnostics: ImageGridDiagnostics?
+    let identity: ImageGridRuntimeIdentity?
+
+    var topLevelIdentity: ImageGridRuntimeIdentity {
+        ImageGridRuntimeIdentity(
+            app: app,
+            serverRoot: serverRoot,
+            packageName: packageName
+        )
+    }
 }
 
-private struct ImageGridDiagnostics: Decodable {
+struct ImageGridDiagnostics: Decodable {
     let ready: Bool?
     let status: String?
 }
@@ -252,6 +270,66 @@ struct ImageGridAPIError: LocalizedError, Equatable, Sendable {
     var errorDescription: String? { message }
 }
 
+enum ImageGridRuntimeIdentityValidation {
+    static let expectedIdentity = "codex-image-grid-native"
+
+    static func validate(_ response: ImageGridHealthResponse) throws -> ImageGridRuntimeIdentity {
+        guard response.ok else {
+            throw ImageGridAPIError(
+                message: "Disconnected: the local Image Grid health endpoint did not report ok=true."
+            )
+        }
+        return try validate(
+            topLevel: response.topLevelIdentity,
+            nested: response.identity
+        )
+    }
+
+    static func validate(_ identity: ImageGridRuntimeIdentity?) throws
+        -> ImageGridRuntimeIdentity
+    {
+        try validate(
+            topLevel: identity ?? ImageGridRuntimeIdentity(
+                app: nil,
+                serverRoot: nil,
+                packageName: nil
+            ),
+            nested: nil
+        )
+    }
+
+    private static func validate(
+        topLevel: ImageGridRuntimeIdentity,
+        nested: ImageGridRuntimeIdentity?
+    ) throws -> ImageGridRuntimeIdentity {
+        let app = nested?.app ?? topLevel.app
+        let packageName = nested?.packageName ?? topLevel.packageName
+        guard app == expectedIdentity, packageName == expectedIdentity else {
+            throw ImageGridAPIError(
+                message: "Disconnected: the listener is not Codex Image Grid Native "
+                    + "(expected app and packageName \(expectedIdentity))."
+            )
+        }
+
+        let serverRoot = (nested?.serverRoot ?? topLevel.serverRoot)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let serverRoot,
+              !serverRoot.isEmpty,
+              (serverRoot as NSString).isAbsolutePath
+        else {
+            throw ImageGridAPIError(
+                message: "Disconnected: Codex Image Grid Native did not report "
+                    + "a nonempty absolute serverRoot."
+            )
+        }
+        return ImageGridRuntimeIdentity(
+            app: app,
+            serverRoot: serverRoot,
+            packageName: packageName
+        )
+    }
+}
+
 struct ImageGridAPIClient: Sendable {
     static let defaultBaseURL = URL(string: "http://127.0.0.1:4322")!
     static let analysisTimeout: TimeInterval = 185
@@ -271,9 +349,7 @@ struct ImageGridAPIClient: Sendable {
         generatedDirectory: URL?
     ) {
         let response: ImageGridHealthResponse = try await send(path: "/api/health")
-        guard response.ok, response.app == nil || response.app == "codex-image-grid-native" else {
-            throw ImageGridAPIError(message: "The local Image Grid server identity is invalid.")
-        }
+        _ = try ImageGridRuntimeIdentityValidation.validate(response)
         let diagnostics = response.appServerImageDiagnostics
         let ready = response.appServerImageReady == true || diagnostics?.ready == true
             || diagnostics?.status == "ready"
@@ -283,6 +359,7 @@ struct ImageGridAPIClient: Sendable {
     }
 
     func preflight() async throws {
+        _ = try await health()
         let response: ImageGridPreflightResponse = try await send(
             path: "/api/preflight/app-server-image",
             method: "POST"
@@ -298,19 +375,27 @@ struct ImageGridAPIClient: Sendable {
         request: ImageGridGenerationRequest,
         batch: Bool
     ) async throws -> ImageGridRunEnvelope {
-        try await send(
+        _ = try await health()
+        let response: ImageGridRunEnvelope = try await send(
             path: batch ? "/api/run-batch" : "/api/run",
             method: "POST",
             body: request
         )
+        _ = try ImageGridRuntimeIdentityValidation.validate(response.server)
+        return response
     }
 
     func runs() async throws -> [ImageGridRunEnvelope] {
+        _ = try await health()
         let response: ImageGridRunListResponse = try await send(path: "/api/runs")
+        for run in response.data {
+            _ = try ImageGridRuntimeIdentityValidation.validate(run.server)
+        }
         return response.data
     }
 
     func analyze(referenceImagePath: String) async throws -> String {
+        _ = try await health()
         let request = try analysisRequest(referenceImagePath: referenceImagePath)
         let response: ImageGridAnalysisResponse = try await send(request: request)
         guard let premise = response.premise?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -335,6 +420,7 @@ struct ImageGridAPIClient: Sendable {
     func consumeEvents(
         onEvent: @escaping @Sendable (ImageGridSSEEvent) async -> Void
     ) async throws {
+        _ = try await health()
         var request = URLRequest(url: endpoint("/events"))
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 60 * 60
