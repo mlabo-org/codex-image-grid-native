@@ -9,6 +9,7 @@ use image_grid_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -180,6 +181,14 @@ pub(crate) struct GeneratedFile {
 pub(crate) struct RunApiError {
     pub error: String,
     pub code: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) enum GeneratedJobFileError {
+    JobNotFound,
+    GeneratedFileNotFound,
+    Forbidden,
+    Io(io::Error),
 }
 
 impl RunApiError {
@@ -493,6 +502,11 @@ impl GenerationRuntime {
 
     pub(crate) async fn job_count(&self) -> usize {
         self.inner.jobs.read().await.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_test_job(&self, job: ImageGridJob) {
+        self.inner.jobs.write().await.insert(job.id.clone(), job);
     }
 
     pub(crate) fn scheduler_snapshot(&self) -> SchedulerSnapshot {
@@ -829,6 +843,61 @@ impl GenerationRuntime {
             return Err(RunApiError::message("invalid generated file"));
         }
         Ok(self.inner.config.generated_dir.join(run_id).join(filename))
+    }
+
+    pub(crate) async fn generated_file_for_job(
+        &self,
+        job_id: &str,
+    ) -> Result<PathBuf, GeneratedJobFileError> {
+        let job = self
+            .inner
+            .jobs
+            .read()
+            .await
+            .get(job_id)
+            .cloned()
+            .ok_or(GeneratedJobFileError::JobNotFound)?;
+        if job.output_path.is_empty() {
+            return Err(GeneratedJobFileError::GeneratedFileNotFound);
+        }
+
+        let generated_root = absolute_lexical_path(&self.inner.config.generated_dir)
+            .map_err(GeneratedJobFileError::Io)?;
+        let candidate = absolute_lexical_path(Path::new(&job.output_path))
+            .map_err(GeneratedJobFileError::Io)?;
+        if candidate == generated_root || !candidate.starts_with(&generated_root) {
+            return Err(GeneratedJobFileError::Forbidden);
+        }
+
+        let candidate_metadata = fs::symlink_metadata(&candidate).await.map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                GeneratedJobFileError::GeneratedFileNotFound
+            } else {
+                GeneratedJobFileError::Io(error)
+            }
+        })?;
+        let real_generated_root = fs::canonicalize(&generated_root)
+            .await
+            .map_err(GeneratedJobFileError::Io)?;
+        let real_file = fs::canonicalize(&candidate).await.map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                GeneratedJobFileError::GeneratedFileNotFound
+            } else {
+                GeneratedJobFileError::Io(error)
+            }
+        })?;
+        if real_file == real_generated_root || !real_file.starts_with(&real_generated_root) {
+            return Err(GeneratedJobFileError::Forbidden);
+        }
+        if candidate_metadata.file_type().is_symlink()
+            || !fs::metadata(&real_file)
+                .await
+                .map_err(GeneratedJobFileError::Io)?
+                .is_file()
+        {
+            return Err(GeneratedJobFileError::GeneratedFileNotFound);
+        }
+        Ok(real_file)
     }
 
     pub(crate) fn artifact_path(
@@ -2390,6 +2459,27 @@ fn safe_filename(value: &str) -> Option<&str> {
         return None;
     }
     Some(value)
+}
+
+fn absolute_lexical_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR.to_string()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Ok(normalized)
 }
 
 fn expected_file_state(path: &Path) -> ExpectedFileState {
