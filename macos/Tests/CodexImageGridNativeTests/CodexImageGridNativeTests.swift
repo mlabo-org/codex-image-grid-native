@@ -116,6 +116,39 @@ import Foundation
     #expect(english.showFailedResults == "Show failed results")
 }
 
+@Test func failureNoticeTracksOnlyJobsObservedActiveInThisSession() {
+    var tracker = ImageGridFailureNoticeTracker()
+    let historicalFailure = ImageGridJob(
+        id: "historical-failure",
+        status: "error",
+        updatedAt: ImageGridTimestamp(milliseconds: 1)
+    )
+    tracker.observe(previous: nil, incoming: historicalFailure)
+    #expect(tracker.unacknowledgedCount == 0)
+
+    let active = ImageGridJob(
+        id: "current-job",
+        status: "running",
+        updatedAt: ImageGridTimestamp(milliseconds: 2)
+    )
+    tracker.observe(previous: nil, incoming: active)
+    #expect(tracker.unacknowledgedCount == 0)
+
+    let currentFailure = ImageGridJob(
+        id: "current-job",
+        status: "error",
+        updatedAt: ImageGridTimestamp(milliseconds: 3)
+    )
+    tracker.observe(previous: active, incoming: currentFailure)
+    #expect(tracker.unacknowledgedCount == 1)
+
+    tracker.acknowledgeFailures()
+    #expect(tracker.unacknowledgedCount == 0)
+
+    tracker.observe(previous: currentFailure, incoming: currentFailure)
+    #expect(tracker.unacknowledgedCount == 0)
+}
+
 @Test func responsiveGridUsesAvailableWidthWithoutAFixedColumnCap() {
     let grid = ResponsiveResultGrid(minimumColumnWidth: 512, spacing: 16)
 

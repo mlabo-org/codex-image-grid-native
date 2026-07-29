@@ -162,6 +162,16 @@ struct ImageGridView: View {
                 }
             }
         }
+        .onChange(of: showFailed) { _, isShowingFailedResults in
+            if isShowingFailedResults {
+                store.acknowledgeFailureNotice()
+            }
+        }
+        .onChange(of: store.unacknowledgedFailureCount) { _, count in
+            if showFailed, count > 0 {
+                store.acknowledgeFailureNotice()
+            }
+        }
         .onPasteCommand(of: [.fileURL, .png, .jpeg, .webP]) { providers in
             pasteReference(providers: providers)
         }
@@ -913,7 +923,7 @@ struct ImageGridView: View {
     }
 
     private var hiddenFailureCount: Int {
-        showFailed ? 0 : store.counts.failed
+        showFailed ? 0 : store.unacknowledgedFailureCount
     }
 
     private func hiddenFailureNotice(count: Int, minimumHeight: CGFloat? = nil) -> some View {
@@ -958,6 +968,7 @@ struct ImageGridView: View {
 
     private var showFailedResultsButton: some View {
         Button(strings.showFailedResults) {
+            store.acknowledgeFailureNotice()
             showFailed = true
         }
         .buttonStyle(.bordered)
