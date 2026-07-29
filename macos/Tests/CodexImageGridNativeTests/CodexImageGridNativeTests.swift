@@ -165,6 +165,22 @@ import Foundation
     )
 }
 
+@Test func completedJobGetsANewImageRequestIdentityForAutomaticRetry() throws {
+    let imageURL = try #require(URL(string: "http://127.0.0.1:4322/generated/result.png"))
+    let activeIdentity = ResultCardImageRequestIdentity(
+        jobID: "job",
+        jobStatus: "running",
+        imageURL: imageURL
+    )
+    let completedIdentity = ResultCardImageRequestIdentity(
+        jobID: "job",
+        jobStatus: "done",
+        imageURL: imageURL
+    )
+
+    #expect(activeIdentity != completedIdentity)
+}
+
 @Test func responsiveGridUsesAvailableWidthWithoutAFixedColumnCap() {
     let grid = ResponsiveResultGrid(minimumColumnWidth: 512, spacing: 16)
 

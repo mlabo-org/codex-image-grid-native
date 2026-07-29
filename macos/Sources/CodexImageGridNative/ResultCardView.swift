@@ -45,6 +45,12 @@ enum ResultCardImageLoadFailurePresentation: Equatable {
     }
 }
 
+struct ResultCardImageRequestIdentity: Hashable {
+    let jobID: String
+    let jobStatus: String
+    let imageURL: URL
+}
+
 struct ResultCardView: View {
     @Environment(\.appShellLanguage) private var language
 
@@ -127,6 +133,7 @@ struct ResultCardView: View {
                         EmptyView()
                     }
                 }
+                .id(imageRequestIdentity(imageURL))
             } else if job.isActive {
                 activeImagePlaceholder
             } else if job.status == "error" {
@@ -287,6 +294,7 @@ struct ResultCardView: View {
                         EmptyView()
                     }
                 }
+                .id(imageRequestIdentity(imageURL))
             }
         }
         .padding(18)
@@ -298,6 +306,14 @@ struct ResultCardView: View {
             ? "Prompt \(job.promptIndex ?? 1)/\(job.promptTotal ?? 1) · "
             : ""
         return "\(promptPart)Variant \(job.variant ?? 1)/\(job.total ?? 1) · \(job.model ?? job.engine ?? "job")"
+    }
+
+    private func imageRequestIdentity(_ imageURL: URL) -> ResultCardImageRequestIdentity {
+        ResultCardImageRequestIdentity(
+            jobID: job.id,
+            jobStatus: job.status,
+            imageURL: imageURL
+        )
     }
 
     private var activeStatusText: String {
