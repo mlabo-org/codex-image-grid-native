@@ -9,7 +9,7 @@ INSTALL_TARGET="$INSTALL_PARENT/$APP_NAME"
 APP_EXECUTABLE="CodexImageGridNative"
 MCP_EXECUTABLE="image-grid-mcp"
 SERVER_EXECUTABLE="image-grid-server"
-PACKAGE_VERSION="0.2.1"
+PACKAGE_VERSION="0.2.2"
 BUNDLE_IDENTIFIER="local.codex.image-grid.native"
 DATA_ROOT="/Users/suzukimakoto/Library/Application Support/codex-image-grid"
 INFO_PLIST_SOURCE="$REPO_ROOT/macos/App/Info.plist"
@@ -40,7 +40,7 @@ print_plan() {
     echo "displayName: Codex Image Grid"
     echo "packageVersion: $PACKAGE_VERSION"
     echo "dataRoot: $DATA_ROOT"
-    echo "appServerImageMaxRetries: 0"
+    echo "appServerImageMaxRetries: 1 (frozen baseline runtime default; no app override)"
     echo "infoPlistSource: $INFO_PLIST_SOURCE"
     echo "build:"
     echo "- cargo build --release -p image-grid-mcp -p image-grid-server"
@@ -75,8 +75,8 @@ if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_P
     echo "Info.plist package version does not match $PACKAGE_VERSION" >&2
     exit 65
 fi
-if [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSEnvironment:IMAGE_GRID_APP_SERVER_IMAGE_MAX_RETRIES' "$INFO_PLIST_SOURCE")" != "0" ]]; then
-    echo "Info.plist must bind IMAGE_GRID_APP_SERVER_IMAGE_MAX_RETRIES=0" >&2
+if /usr/libexec/PlistBuddy -c 'Print :LSEnvironment:IMAGE_GRID_APP_SERVER_IMAGE_MAX_RETRIES' "$INFO_PLIST_SOURCE" >/dev/null 2>&1; then
+    echo "Info.plist must not override the frozen baseline App Server image retry default" >&2
     exit 65
 fi
 
