@@ -2225,7 +2225,7 @@ mod tests {
             responses[0]["result"]["serverInfo"]["name"],
             "codex-image-grid"
         );
-        assert_eq!(responses[0]["result"]["serverInfo"]["version"], "0.2.0");
+        assert_eq!(responses[0]["result"]["serverInfo"]["version"], "0.2.1");
         assert_eq!(responses[1]["id"], 2);
         assert_eq!(
             responses[1]["result"]["tools"].as_array().map(Vec::len),

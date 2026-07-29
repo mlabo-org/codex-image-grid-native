@@ -13,6 +13,12 @@ func draftMetadataRoundTripAndInvalidValuesUseFrozenDefaults() async throws {
         applicationSupportDirectory: supportDirectory
     )
     #expect(ImageGridDraftPersistence.debounceMilliseconds == 250)
+    #expect(
+        persistence.draftDirectory
+            == supportDirectory
+                .appendingPathComponent("codex-image-grid", isDirectory: true)
+                .appendingPathComponent("ui-draft", isDirectory: true)
+    )
 
     let first = ImageGridDraftMetadata(
         referencePremise: "first premise",

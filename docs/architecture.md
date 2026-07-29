@@ -27,17 +27,19 @@ The implementation keeps separate internal identities:
 - public runtime, health, manifest, and MCP server identity:
   `codex-image-grid`;
 - loopback endpoint: `127.0.0.1:4322`;
-- data root: `~/Library/Application Support/codex-image-grid-native`;
+- compatible data and image-history root:
+  `~/Library/Application Support/codex-image-grid`;
 - installed app: `~/Applications/Codex Image Grid Native.app`;
 - bundle identifier and Swift executable:
   `local.codex.image-grid.native` / `CodexImageGridNative`.
 
 The nested public root gives the plugin a folder matching its public manifest
-name without taking over the frozen repository path. The isolated port, data
-root, bundle identifier, executable, and install path prevent process and state
-collisions; they are not alternate public plugin names. The old Electron app
-and repository are frozen, out of scope for runtime dispatch, and never a
-fallback.
+name without taking over the frozen repository path. Port, bundle identifier,
+executable, and install path remain isolated implementation details. Generated
+images, manifests, handoffs, and restored history deliberately retain the
+original product data root. The old Electron app and repository are frozen,
+out of scope for runtime dispatch, and never a fallback; the Electron runtime
+must remain stopped so it cannot write the shared data root concurrently.
 
 ## Ownership
 

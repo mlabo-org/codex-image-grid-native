@@ -181,7 +181,7 @@ fn default_data_directory() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     home.join("Library")
         .join("Application Support")
-        .join("codex-image-grid-native")
+        .join("codex-image-grid")
 }
 
 fn default_server_root() -> PathBuf {

@@ -84,7 +84,7 @@ import Testing
     #expect(plan.source == .bundledResource)
     #expect(plan.executableURL == bundled.resolvingSymlinksInPath().standardizedFileURL)
     #expect(plan.serverRoot == fixture.bundleRoot.resolvingSymlinksInPath().standardizedFileURL)
-    #expect(plan.dataRoot.lastPathComponent == "codex-image-grid-native")
+    #expect(plan.dataRoot.lastPathComponent == "codex-image-grid")
     #expect(plan.workspaceRoot == plan.dataRoot)
     #expect(plan.arguments.contains(plan.serverRoot.path))
     #expect(plan.arguments.suffix(2) == ["--launch-target", "swiftui"])

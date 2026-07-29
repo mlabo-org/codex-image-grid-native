@@ -163,7 +163,7 @@ final class ImageGridDraftPersistence: ObservableObject {
                 in: .userDomainMask
             ).first!
         let directory = supportDirectory
-            .appendingPathComponent("codex-image-grid-native", isDirectory: true)
+            .appendingPathComponent("codex-image-grid", isDirectory: true)
             .appendingPathComponent("ui-draft", isDirectory: true)
         draftDirectory = directory
         metadataURL = directory.appendingPathComponent("draft.json", isDirectory: false)
