@@ -66,9 +66,10 @@ Validation rules:
 - MCP `waitMs` must be an integer from 0 through 120,000. The HTTP body/query
   normalization rounds finite numeric values and clamps them to that range.
 - MCP reference paths must be absolute regular PNG, JPEG, or WebP files no
-  larger than 100 MiB. The frozen transport embeds the bytes as a data URL;
-  the native contract replaces this transport with a validated local path and
-  staged copy without changing these semantic constraints.
+  larger than 100 MiB. MCP validates and snapshots the file before server
+  startup, embeds the bytes as the frozen data-URL HTTP shape, and the server
+  stages one owned run copy. SwiftUI additionally has a native local-path
+  extension with the same semantic constraints.
 
 ## 3. HTTP and event surface
 
@@ -84,7 +85,7 @@ The Rust server must preserve the following meanings:
 | `GET /api/runs/<runId>` | Returns the run response; rejects malformed ids with `400` and unknown ids with `404`. |
 | `POST /api/analyze-reference` | Sends a validated reference image to App Server analysis and returns a concise premise. Failure is a `400` response with an error. |
 | `GET/POST /api/preflight/app-server-image` | Performs App Server selection/initialization. Returns `200` when ready and `503` with complete diagnostics otherwise. |
-| `GET /api/generated/<run>/<file>` | Serves generated files only inside the generated root. Traversal is rejected. |
+| `GET /generated/<run>/<file>` | Serves generated files only inside the generated root. Traversal is rejected. |
 | `GET /artifacts/<run>/manifest` | Renders the manifest as a safe artifact view. |
 | `GET /artifacts/<run>/handoff` | Renders the handoff as a safe artifact view. |
 | `GET /artifacts/<run>/image?file=...` | Renders a safe image artifact view. |
@@ -247,4 +248,3 @@ The frozen repository's tests are the initial executable evidence set:
 The native project must convert each required behavior into an executable Rust
 or Swift test, a protocol fixture, or a focused parity harness. This document
 is the index and explanation; it is not the sole runtime validator.
-

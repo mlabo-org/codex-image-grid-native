@@ -27,8 +27,11 @@ and the existing test evidence that the native implementation must reproduce.
 - `macos/`: SwiftUI native app. It owns the window, native file picker,
   display preferences, image grid, and lifecycle of the Rust runtime.
 
-Native and MCP callers pass local reference-image paths. A browser client, if
-retained, uses a separate streamed/staged upload route.
+The SwiftUI app passes a validated local reference-image path to the Rust
+runtime. The MCP tool also accepts a local absolute path, but snapshots the
+file before startup and submits the frozen inline data-URL HTTP shape. Browser
+clients use that same bounded inline HTTP contract. In every case, the Rust
+runtime stages an owned copy in the run directory before starting jobs.
 
 ## Current status
 
