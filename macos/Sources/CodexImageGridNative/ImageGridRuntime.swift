@@ -431,6 +431,12 @@ struct ImageGridAPIClient: Sendable {
         return response.data
     }
 
+    func run(id: String) async throws -> ImageGridRunEnvelope {
+        let response: ImageGridRunEnvelope = try await send(path: "/api/runs/\(id)")
+        _ = try ImageGridRuntimeIdentityValidation.validate(response.server)
+        return response
+    }
+
     func analyze(referenceImagePath: String) async throws -> String {
         _ = try await health()
         let request = try analysisRequest(referenceImagePath: referenceImagePath)
@@ -640,13 +646,20 @@ final class ImageGridStore: ObservableObject {
 
     let client: ImageGridAPIClient
     private var lifecycleTask: Task<Void, Never>?
+    private let activeRunReconciliationInterval: Duration
+    private var activeRunReconciliationTask: Task<Void, Never>?
+    private var activeRunReconciliationToken: UUID?
     private var clearedBefore: Int64 = 0
     private var clearedJobIDs: Set<String> = []
     private var retainedCompletedLimit: Int? = ImageGridJobSelection.maximumCompletedJobs
     private var connectivityMessage: String?
 
-    init(client: ImageGridAPIClient = ImageGridAPIClient()) {
+    init(
+        client: ImageGridAPIClient = ImageGridAPIClient(),
+        activeRunReconciliationInterval: Duration = .milliseconds(500)
+    ) {
         self.client = client
+        self.activeRunReconciliationInterval = activeRunReconciliationInterval
     }
 
     func synchronize(with nativeState: NativeRuntimeLifecycleState) {
@@ -666,17 +679,22 @@ final class ImageGridStore: ObservableObject {
     }
 
     func start() {
-        guard lifecycleTask == nil else { return }
-        lifecycleTask = Task { [weak self] in
-            guard let self else { return }
-            await consumeEventsWithBoundedRecovery()
-            lifecycleTask = nil
+        if lifecycleTask == nil {
+            lifecycleTask = Task { [weak self] in
+                guard let self else { return }
+                await consumeEventsWithRecovery()
+                lifecycleTask = nil
+            }
         }
+        updateActiveRunReconciliation()
     }
 
     func stop() {
         lifecycleTask?.cancel()
         lifecycleTask = nil
+        activeRunReconciliationToken = nil
+        activeRunReconciliationTask?.cancel()
+        activeRunReconciliationTask = nil
     }
 
     func refreshHealth() async {
@@ -813,30 +831,28 @@ final class ImageGridStore: ObservableObject {
         pasteboard.setString(prompt, forType: .string)
     }
 
-    private func consumeEventsWithBoundedRecovery() async {
+    private func consumeEventsWithRecovery() async {
         var failures = 0
-        while !Task.isCancelled, failures < 5 {
+        while !Task.isCancelled {
             do {
                 try await connectAndHydrate()
+                failures = 0
                 try await client.consumeEvents { [weak self] event in
                     await self?.receive(event)
                 }
             } catch is CancellationError {
                 return
             } catch {
-                failures += 1
+                failures = min(5, failures + 1)
                 runtimeState = .disconnected
                 recordConnectivityFailure(error.localizedDescription)
-                if failures < 5 {
-                    let delay = Double(min(16, 1 << (failures - 1)))
-                    try? await Task.sleep(for: .seconds(delay))
+                let delay = Double(min(16, 1 << (failures - 1)))
+                do {
+                    try await Task.sleep(for: .seconds(delay))
+                } catch {
+                    return
                 }
             }
-        }
-        if !Task.isCancelled {
-            recordConnectivityFailure(
-                "Live result updates disconnected. Generate again to retry."
-            )
         }
     }
 
@@ -906,6 +922,7 @@ final class ImageGridStore: ObservableObject {
             jobs[job.id] = job
         }
         pruneRetainedJobs()
+        updateActiveRunReconciliation()
     }
 
     private func pruneRetainedJobs() {
@@ -915,6 +932,67 @@ final class ImageGridStore: ObservableObject {
         )
         let retainedIDs = Set(retained.map(\.id))
         jobs = jobs.filter { retainedIDs.contains($0.key) }
+    }
+
+    private func updateActiveRunReconciliation() {
+        guard jobs.values.contains(where: \.isActive) else {
+            activeRunReconciliationToken = nil
+            activeRunReconciliationTask?.cancel()
+            activeRunReconciliationTask = nil
+            return
+        }
+        guard activeRunReconciliationTask == nil else { return }
+
+        let token = UUID()
+        activeRunReconciliationToken = token
+        activeRunReconciliationTask = Task { [weak self] in
+            guard let self else { return }
+            await reconcileActiveRuns(token: token)
+        }
+    }
+
+    private func reconcileActiveRuns(token: UUID) async {
+        defer {
+            if activeRunReconciliationToken == token {
+                activeRunReconciliationToken = nil
+                activeRunReconciliationTask = nil
+            }
+        }
+
+        while !Task.isCancelled, activeRunReconciliationToken == token {
+            do {
+                try await Task.sleep(for: activeRunReconciliationInterval)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, activeRunReconciliationToken == token else {
+                return
+            }
+
+            let runIDs = Set(
+                jobs.values
+                    .filter(\.isActive)
+                    .compactMap(\.runId)
+            ).sorted()
+            guard !runIDs.isEmpty else { return }
+
+            for runID in runIDs {
+                guard !Task.isCancelled, activeRunReconciliationToken == token else {
+                    return
+                }
+                do {
+                    let run = try await client.run(id: runID)
+                    guard !Task.isCancelled, activeRunReconciliationToken == token else {
+                        return
+                    }
+                    merge(run.hydratedJobs)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    continue
+                }
+            }
+        }
     }
 }
 

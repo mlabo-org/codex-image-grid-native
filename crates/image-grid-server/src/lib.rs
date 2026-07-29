@@ -470,6 +470,18 @@ fn json_string(value: &Value) -> String {
     }
 }
 
+fn broadcast_event_or_reconnect<T>(
+    result: Result<T, tokio::sync::broadcast::error::RecvError>,
+) -> Option<T> {
+    match result {
+        Ok(event) => Some(event),
+        Err(
+            tokio::sync::broadcast::error::RecvError::Lagged(_)
+            | tokio::sync::broadcast::error::RecvError::Closed,
+        ) => None,
+    }
+}
+
 async fn events(
     State(state): State<RuntimeState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
@@ -496,8 +508,8 @@ async fn events(
                     }
                 }
                 result = runtime_events.recv() => {
-                    let Ok(event) = result else {
-                        continue;
+                    let Some(event) = broadcast_event_or_reconnect(result) else {
+                        break;
                     };
                     let Ok(data) = serde_json::to_string(&event.data) else {
                         continue;
@@ -511,8 +523,10 @@ async fn events(
                     }
                 }
                 result = app_server_events.recv() => {
-                    let Ok(AppServerEvent { name, data }) = result else {
-                        continue;
+                    let Some(AppServerEvent { name, data }) =
+                        broadcast_event_or_reconnect(result)
+                    else {
+                        break;
                     };
                     let Ok(data) = serde_json::to_string(&data) else {
                         continue;
@@ -755,6 +769,23 @@ mod tests {
     use std::io::Write;
     use std::sync::Mutex as StdMutex;
     use tower::ServiceExt;
+
+    #[test]
+    fn sse_reconnects_after_broadcast_loss_or_close() {
+        assert_eq!(broadcast_event_or_reconnect(Ok(7_u8)), Some(7));
+        assert_eq!(
+            broadcast_event_or_reconnect::<u8>(Err(
+                tokio::sync::broadcast::error::RecvError::Lagged(1),
+            )),
+            None
+        );
+        assert_eq!(
+            broadcast_event_or_reconnect::<u8>(Err(
+                tokio::sync::broadcast::error::RecvError::Closed,
+            )),
+            None
+        );
+    }
 
     #[test]
     fn fresh_health_uses_public_identity_with_native_paths() {
