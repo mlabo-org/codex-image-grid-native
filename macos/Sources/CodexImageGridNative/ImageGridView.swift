@@ -95,6 +95,7 @@ struct ImageGridView: View {
     @AppStorage("imageGrid.promptHistory") private var promptHistoryData = "[]"
 
     @StateObject private var store = ImageGridStore()
+    @StateObject private var draftPersistence = ImageGridDraftPersistence()
     @State private var referencePremise = ""
     @State private var prompt = ImageGridContract.defaultPrompt
     @State private var promptMode = PromptMode.single
@@ -107,6 +108,7 @@ struct ImageGridView: View {
     @State private var referenceState = ReferenceInteractionState.empty
     @State private var referenceLoadGeneration = 0
     @State private var formError: String?
+    @State private var draftReady = false
 
     private var strings: ImageGridStrings {
         ImageGridStrings(language: language)
@@ -131,7 +133,21 @@ struct ImageGridView: View {
         }
         .onDisappear {
             store.stop()
-            referenceImage?.removeOwnedTemporaryFile()
+            if draftReady {
+                draftPersistence.flush(draftMetadata)
+            }
+            let referenceToRemove = referenceImage
+            Task {
+                await draftPersistence.drain()
+                referenceToRemove?.removeOwnedTemporaryFile()
+            }
+        }
+        .task {
+            await restoreDraft()
+        }
+        .onChange(of: draftMetadata) { _, metadata in
+            guard draftReady else { return }
+            draftPersistence.schedule(metadata)
         }
         .onChange(of: resultLimit) { _, value in
             if value == .all {
@@ -691,6 +707,7 @@ struct ImageGridView: View {
         referenceState = .ready
         store.referenceAnalysisMessage = nil
         formError = nil
+        draftPersistence.persistReference(next, metadata: draftMetadata)
     }
 
     private func clearReference() {
@@ -701,6 +718,7 @@ struct ImageGridView: View {
         referencePremise = ""
         store.referenceAnalysisMessage = nil
         formError = nil
+        draftPersistence.clearReference(metadata: draftMetadata)
     }
 
     private var referenceIsBusy: Bool {
@@ -734,6 +752,67 @@ struct ImageGridView: View {
         case let .displayError(message):
             message
         }
+    }
+
+    private var draftMetadata: ImageGridDraftMetadata {
+        ImageGridDraftMetadata(
+            referencePremise: referencePremise,
+            prompt: prompt,
+            promptMode: promptMode.rawValue,
+            batchPrompts: batchPrompts,
+            mood: mood.rawValue,
+            engine: engine.rawValue,
+            count: count,
+            aspectRatio: aspectRatio.rawValue,
+            hasReferenceImage: referenceImage != nil,
+            referenceStatusKey: draftReferenceStatusKey.rawValue
+        )
+    }
+
+    private var draftReferenceStatusKey: ImageGridDraftReferenceStatusKey {
+        switch referenceState {
+        case .empty:
+            .empty
+        case .preparing:
+            .preparing
+        case .ready:
+            .ready
+        case .analyzing:
+            .analyzing
+        case .analyzed:
+            .analyzed
+        case .preparationError, .displayError:
+            referenceImage == nil ? .empty : .ready
+        }
+    }
+
+    private func restoreDraft() async {
+        guard !draftReady else { return }
+        let restoration = await draftPersistence.restore()
+        guard !Task.isCancelled else {
+            restoration.referenceImage?.removeOwnedTemporaryFile()
+            return
+        }
+        let state = restoration.state
+        referencePremise = state.referencePremise
+        prompt = state.prompt
+        promptMode = state.promptMode
+        batchPrompts = state.batchPrompts
+        mood = state.mood
+        engine = state.engine
+        count = state.count
+        aspectRatio = state.aspectRatio
+        referenceImage?.removeOwnedTemporaryFile()
+        referenceImage = restoration.referenceImage
+        switch state.referenceStatusKey {
+        case .analyzed:
+            referenceState = restoration.referenceImage == nil ? .empty : .analyzed
+        case .empty:
+            referenceState = .empty
+        case .preparing, .ready, .analyzing:
+            referenceState = restoration.referenceImage == nil ? .empty : .ready
+        }
+        draftReady = true
     }
 
     private var resultsPanel: some View {
