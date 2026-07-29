@@ -160,6 +160,181 @@ import Testing
     )
 }
 
+@Test @MainActor
+func joinedRuntimeShutdownNeverSignalsTheUnownedProcess() async {
+    let process = NativeRuntimeProcessDouble(
+        processIdentifier: 41,
+        exitsOnTerminate: false
+    )
+    let lifecycle = NativeRuntimeLifecycle(
+        shutdownGracePeriod: .milliseconds(5),
+        initialProcess: process,
+        initialOwnership: .joined
+    )
+
+    await lifecycle.stop()
+
+    let snapshot = await process.snapshot()
+    #expect(snapshot.terminateCount == 0)
+    #expect(snapshot.forceKillProcessIdentifiers.isEmpty)
+    #expect(lifecycle.state == .idle)
+}
+
+@Test @MainActor
+func ownedRuntimeShutdownSendsOneTerminateAndWaitsForExit() async {
+    let process = NativeRuntimeProcessDouble(
+        processIdentifier: 42,
+        exitsOnTerminate: true
+    )
+    let lifecycle = NativeRuntimeLifecycle(
+        initialProcess: process,
+        initialOwnership: .launched
+    )
+
+    await lifecycle.stop()
+
+    let snapshot = await process.snapshot()
+    #expect(snapshot.terminateCount == 1)
+    #expect(snapshot.waitCount == 1)
+    #expect(snapshot.forceKillProcessIdentifiers.isEmpty)
+    #expect(!snapshot.isRunning)
+    #expect(lifecycle.state == .idle)
+}
+
+@Test @MainActor
+func concurrentAndRepeatedShutdownCallersShareOneCompletion() async {
+    let process = NativeRuntimeProcessDouble(
+        processIdentifier: 43,
+        exitsOnTerminate: false
+    )
+    let lifecycle = NativeRuntimeLifecycle(
+        shutdownGracePeriod: .seconds(1),
+        initialProcess: process,
+        initialOwnership: .launched
+    )
+
+    let first = Task { @MainActor in
+        await lifecycle.stop()
+    }
+    let second = Task { @MainActor in
+        await lifecycle.stop()
+    }
+    await waitUntilTerminateWasSent(to: process)
+    await process.exitNormally()
+    await first.value
+    await second.value
+    await lifecycle.stop()
+
+    let snapshot = await process.snapshot()
+    #expect(snapshot.terminateCount == 1)
+    #expect(snapshot.forceKillProcessIdentifiers.isEmpty)
+    #expect(!snapshot.isRunning)
+    #expect(lifecycle.state == .idle)
+}
+
+@Test @MainActor
+func ownedRuntimeUsesBoundedExactPidForceKillFallback() async {
+    let processIdentifier: Int32 = 44
+    let process = NativeRuntimeProcessDouble(
+        processIdentifier: processIdentifier,
+        exitsOnTerminate: false
+    )
+    let lifecycle = NativeRuntimeLifecycle(
+        shutdownGracePeriod: .milliseconds(5),
+        initialProcess: process,
+        initialOwnership: .launched
+    )
+
+    await lifecycle.stop()
+
+    let snapshot = await process.snapshot()
+    #expect(NativeRuntimeLifecycle.shutdownGracePeriod == .seconds(6))
+    #expect(snapshot.terminateCount == 1)
+    #expect(snapshot.forceKillProcessIdentifiers == [processIdentifier])
+    #expect(!snapshot.isRunning)
+    #expect(lifecycle.state == .idle)
+}
+
+private struct NativeRuntimeProcessSnapshot: Sendable {
+    let isRunning: Bool
+    let terminateCount: Int
+    let waitCount: Int
+    let forceKillProcessIdentifiers: [Int32]
+}
+
+private actor NativeRuntimeProcessDouble: NativeRuntimeProcessHandle {
+    let processIdentifier: Int32
+    private let exitsOnTerminate: Bool
+    private var running = true
+    private var terminateCount = 0
+    private var waitCount = 0
+    private var forceKillProcessIdentifiers: [Int32] = []
+
+    init(processIdentifier: Int32, exitsOnTerminate: Bool) {
+        self.processIdentifier = processIdentifier
+        self.exitsOnTerminate = exitsOnTerminate
+    }
+
+    func isRunning() -> Bool {
+        running
+    }
+
+    func terminationStatus() -> Int32 {
+        running ? 0 : 15
+    }
+
+    func sendTerminate() {
+        terminateCount += 1
+        if exitsOnTerminate {
+            running = false
+        }
+    }
+
+    func waitUntilExit() async {
+        waitCount += 1
+        while running {
+            guard !Task.isCancelled else { return }
+            do {
+                try await Task.sleep(for: .milliseconds(1))
+            } catch {
+                return
+            }
+        }
+    }
+
+    func forceKill(expectedProcessIdentifier: Int32) {
+        forceKillProcessIdentifiers.append(expectedProcessIdentifier)
+        if expectedProcessIdentifier == processIdentifier {
+            running = false
+        }
+    }
+
+    func exitNormally() {
+        running = false
+    }
+
+    func snapshot() -> NativeRuntimeProcessSnapshot {
+        NativeRuntimeProcessSnapshot(
+            isRunning: running,
+            terminateCount: terminateCount,
+            waitCount: waitCount,
+            forceKillProcessIdentifiers: forceKillProcessIdentifiers
+        )
+    }
+}
+
+private func waitUntilTerminateWasSent(
+    to process: NativeRuntimeProcessDouble
+) async {
+    for _ in 0..<100 {
+        if await process.snapshot().terminateCount == 1 {
+            return
+        }
+        await Task.yield()
+    }
+    Issue.record("The lifecycle did not send SIGTERM to its owned process.")
+}
+
 private struct NativeRuntimeFixture {
     let root: URL
     let repositoryRoot: URL

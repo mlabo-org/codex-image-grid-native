@@ -41,13 +41,26 @@ struct CodexImageGridApp: App {
 @MainActor
 final class CodexImageGridApplicationDelegate: NSObject, NSApplicationDelegate {
     let runtimeLifecycle = NativeRuntimeLifecycle()
+    private var terminationReplyTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         runtimeLifecycle.start()
     }
 
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        if terminationReplyTask == nil {
+            terminationReplyTask = Task { @MainActor [runtimeLifecycle] in
+                await runtimeLifecycle.stop()
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
-        runtimeLifecycle.stop()
+        // applicationShouldTerminate owns the one shared graceful-stop completion.
     }
 }
 
