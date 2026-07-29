@@ -5,11 +5,14 @@ edition = "2024"
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
 image-grid-core = { path = "../image-grid-core" }
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 http-body-util = "0.1"

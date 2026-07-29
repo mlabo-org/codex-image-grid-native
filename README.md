@@ -41,17 +41,26 @@ The provider-free first runnable slice now includes:
 - deterministic Codex executable selection, an owned `codex app-server`
   JSONL child, and compatible `GET`/`POST
   `/api/preflight/app-server-image` diagnostics;
+- compatible `/api/run`, `/api/run-batch`, `/api/runs`, `/events`, generated
+  file, manifest, handoff, and safe artifact-view routes for
+  `app-server-image`;
+- the frozen `queued → starting → running → done|error` primary job state,
+  global 24-slot image scheduler, exact output naming, prompt construction,
+  stable App Server image notifications, and atomic image/artifact writes;
 - stdio MCP JSONL handling for `initialize`, `ping`, `tools/list`, and
   `tools/call`, including the frozen `generate_image_grid` schema and
   validation errors;
 - a responsive SwiftUI compatibility shell with the frozen language, theme,
   prompt, generation-option, reference-image, and result-filter controls.
 
-Image generation turns, run artifacts, and successful `generate_image_grid`
-execution remain outside this slice. A valid generation call therefore reports
-that execution is not implemented instead of falling back to the Electron
-runtime. `.mcp.json` remains intentionally empty until that run boundary is
-implemented and smoke-validated.
+The provider-free fixture now completes a real run through the owned App Server
+transport and validates the generated image, run response, manifest, handoff,
+history, and artifact routes. Live-provider confirmation, `codex-svg`, retry
+branches, reference analysis, successful MCP execution, and Native UI runtime
+binding remain in progress. A valid MCP generation call therefore still
+reports that execution is not connected instead of falling back to the
+Electron runtime. `.mcp.json` remains intentionally empty until the live
+primary path and MCP launch route are smoke-validated.
 
 ## First checks
 
@@ -60,10 +69,11 @@ scripts/check.sh
 ```
 
 The check script validates the Rust workspace and Swift package scaffold. It
-also runs the provider-free health, fake-App-Server preflight, and MCP process
-smoke with an isolated temporary native data root. It does not start a
-provider, launch or modify the frozen Electron app, refresh plugin cache,
-connect `.mcp.json`, or write runtime state into this repository.
+also runs the provider-free health, fake-App-Server preflight, complete
+one-image run/artifact, and MCP process smoke with an isolated temporary native
+data root. It does not start a provider, launch or modify the frozen Electron
+app, refresh plugin cache, connect `.mcp.json`, or write runtime state into
+this repository.
 
 ## Runtime identity during migration
 

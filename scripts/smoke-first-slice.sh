@@ -38,6 +38,14 @@ printf '%s\n' \
   '      ;;' \
   '    *'"'"'"method":"initialized"'"'"'*)' \
   '      ;;' \
+  '    *'"'"'"method":"thread/start"'"'"'*)' \
+  '      printf '"'"'%s\n'"'"' '"'"'{"id":2,"result":{"thread":{"id":"fixture-thread"}}}'"'"'' \
+  '      ;;' \
+  '    *'"'"'"method":"turn/start"'"'"'*)' \
+  '      printf '"'"'%s\n'"'"' '"'"'{"id":3,"result":{"turn":{"id":"fixture-turn"}}}'"'"'' \
+  '      printf '"'"'%s\n'"'"' '"'"'{"method":"item/completed","params":{"threadId":"fixture-thread","turnId":"fixture-turn","item":{"type":"imageGeneration","id":"fixture-image","status":"completed","revisedPrompt":null,"result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}}'"'"'' \
+  '      printf '"'"'%s\n'"'"' '"'"'{"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'"'"'' \
+  '      ;;' \
   '  esac' \
   'done' \
   >"$fake_codex"
@@ -135,6 +143,60 @@ jq --exit-status \
     and .codexAppServer.status == "ready"
     and .identity.codexAppServer.status == "ready"
   ' "$ready_health_json" >/dev/null
+
+run_json="$temporary_root/run.json"
+curl --fail --silent --show-error \
+  --request POST \
+  --header 'content-type: application/json' \
+  --data '{"prompts":["fixture prompt"],"count":1,"mood":"warm-mascot","engine":"app-server-image","aspectRatio":"16:9","waitMs":5000}' \
+  "$server_url/api/run-batch" \
+  >"$run_json"
+jq --exit-status \
+  '
+    .status == "done"
+    and .completed == true
+    and .counts == {"total":1,"done":1,"running":0,"failed":0}
+    and .jobs[0].status == "queued"
+    and .outputs[0].status == "done"
+    and .outputs[0].filename == "variant-01.png"
+    and .outputs[0].threadId == "fixture-thread"
+    and .outputs[0].turnId == "fixture-turn"
+  ' "$run_json" >/dev/null
+
+image_url="$(jq --raw-output '.outputs[0].imageUrl' "$run_json")"
+manifest_url="$(jq --raw-output '.manifestUrl' "$run_json")"
+handoff_url="$(jq --raw-output '.handoffUrl' "$run_json")"
+run_id="$(jq --raw-output '.runId' "$run_json")"
+image_path="$temporary_root/generated.png"
+expected_image_path="$temporary_root/expected.png"
+curl --fail --silent --show-error "$server_url$image_url" >"$image_path"
+printf '%s' \
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=' \
+  | /usr/bin/base64 -D >"$expected_image_path"
+cmp "$expected_image_path" "$image_path"
+
+manifest_path="$temporary_root/manifest.json"
+handoff_path="$temporary_root/handoff.md"
+curl --fail --silent --show-error "$server_url$manifest_url" >"$manifest_path"
+curl --fail --silent --show-error "$server_url$handoff_url" >"$handoff_path"
+jq --exit-status \
+  --arg runId "$run_id" \
+  '.schemaVersion == 1 and .runId == $runId and .outputs[0].status == "done"' \
+  "$manifest_path" >/dev/null
+rg --quiet '^# Codex Image Grid Handoff$' "$handoff_path"
+rg --quiet '^## Request$' "$handoff_path"
+rg --quiet '^## Diagnostics$' "$handoff_path"
+rg --quiet '^## Outputs$' "$handoff_path"
+
+for route in \
+  "/api/runs/$run_id" \
+  "/api/runs" \
+  "/api/generated" \
+  "$(jq --raw-output '.manifestViewUrl' "$run_json")" \
+  "$(jq --raw-output '.handoffViewUrl' "$run_json")" \
+  "/artifacts/$run_id/image?file=variant-01.png"; do
+  curl --fail --silent --show-error "$server_url$route" >/dev/null
+done
 
 mcp_output="$temporary_root/mcp.jsonl"
 printf '%s\n' \
