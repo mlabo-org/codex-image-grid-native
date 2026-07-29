@@ -13,6 +13,7 @@ PACKAGE_VERSION="0.2.4"
 BUNDLE_IDENTIFIER="local.codex.image-grid.native"
 DATA_ROOT="/Users/suzukimakoto/Library/Application Support/codex-image-grid"
 INFO_PLIST_SOURCE="$REPO_ROOT/macos/App/Info.plist"
+APP_ICON_SOURCE="$REPO_ROOT/macos/App/AppIcon.icns"
 
 mode="dry-run"
 case "${1:-}" in
@@ -42,12 +43,14 @@ print_plan() {
     echo "dataRoot: $DATA_ROOT"
     echo "appServerImageMaxRetries: 1 (frozen baseline runtime default; no app override)"
     echo "infoPlistSource: $INFO_PLIST_SOURCE"
+    echo "appIconSource: $APP_ICON_SOURCE"
     echo "build:"
     echo "- cargo build --release -p image-grid-mcp -p image-grid-server"
     echo "- swift build -c release --package-path $REPO_ROOT/macos"
     echo "bundleContents:"
     echo "- Contents/Info.plist"
     echo "- Contents/MacOS/$APP_EXECUTABLE"
+    echo "- Contents/Resources/AppIcon.icns"
     echo "- Contents/Resources/$MCP_EXECUTABLE"
     echo "- Contents/Resources/$SERVER_EXECUTABLE"
     echo "signing: ad-hoc codesign followed by deep strict verification"
@@ -67,12 +70,20 @@ for tool in cargo swift codesign plutil; do
     fi
 done
 /usr/bin/plutil -lint "$INFO_PLIST_SOURCE" >/dev/null
+if [[ ! -f "$APP_ICON_SOURCE" ]]; then
+    echo "app icon is unavailable: $APP_ICON_SOURCE" >&2
+    exit 66
+fi
 if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST_SOURCE")" != "$BUNDLE_IDENTIFIER" ]]; then
     echo "Info.plist bundle identifier does not match $BUNDLE_IDENTIFIER" >&2
     exit 65
 fi
 if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST_SOURCE")" != "$PACKAGE_VERSION" ]]; then
     echo "Info.plist package version does not match $PACKAGE_VERSION" >&2
+    exit 65
+fi
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$INFO_PLIST_SOURCE")" != "AppIcon.icns" ]]; then
+    echo "Info.plist must declare AppIcon.icns" >&2
     exit 65
 fi
 if /usr/libexec/PlistBuddy -c 'Print :LSEnvironment:IMAGE_GRID_APP_SERVER_IMAGE_MAX_RETRIES' "$INFO_PLIST_SOURCE" >/dev/null 2>&1; then
@@ -125,6 +136,7 @@ trap rollback EXIT
 
 /bin/mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources"
 /usr/bin/install -m 755 "$APP_SOURCE" "$STAGED_APP/Contents/MacOS/$APP_EXECUTABLE"
+/usr/bin/install -m 644 "$APP_ICON_SOURCE" "$STAGED_APP/Contents/Resources/AppIcon.icns"
 /usr/bin/install -m 755 "$MCP_SOURCE" "$STAGED_APP/Contents/Resources/$MCP_EXECUTABLE"
 /usr/bin/install -m 755 "$SERVER_SOURCE" "$STAGED_APP/Contents/Resources/$SERVER_EXECUTABLE"
 /usr/bin/install -m 644 "$INFO_PLIST_SOURCE" "$STAGED_APP/Contents/Info.plist"
