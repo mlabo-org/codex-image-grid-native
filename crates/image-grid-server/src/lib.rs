@@ -1,4 +1,6 @@
+mod analysis;
 mod app_server;
+mod http_json;
 mod runtime;
 
 pub use app_server::{
@@ -6,11 +8,12 @@ pub use app_server::{
     AppServerPreflightResponse,
 };
 
+use analysis::ReferenceAnalysisRuntime;
 use app_server::{AppServerBridge, AppServerLaunchConfig};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{Path as AxumPath, Query, Request as AxumRequest, State};
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -179,6 +182,7 @@ impl HealthResponse {
 struct RuntimeState {
     config: Arc<RuntimeConfig>,
     app_server: AppServerBridge,
+    analysis: ReferenceAnalysisRuntime,
     generation: GenerationRuntime,
 }
 
@@ -186,10 +190,12 @@ impl RuntimeState {
     fn new(config: RuntimeConfig, launch: AppServerLaunchConfig) -> Self {
         let app_server = AppServerBridge::new(config.workspace_dir.clone(), launch);
         let config = Arc::new(config);
+        let analysis = ReferenceAnalysisRuntime::new(config.clone(), app_server.clone());
         let generation = GenerationRuntime::new(config.clone(), app_server.clone());
         Self {
             config,
             app_server,
+            analysis,
             generation,
         }
     }
@@ -206,6 +212,10 @@ fn router_with_launch_config(config: RuntimeConfig, launch: AppServerLaunchConfi
         .route("/events", get(events))
         .route("/api/run", axum::routing::post(run_single))
         .route("/api/run-batch", axum::routing::post(run_batch))
+        .route(
+            "/api/analyze-reference",
+            axum::routing::post(analyze_reference),
+        )
         .route("/api/runs", get(run_list))
         .route("/api/runs/{run_id}", get(run_status))
         .route("/api/generated", get(generated_list))
@@ -244,6 +254,17 @@ async fn preflight(
         status,
         Json(AppServerPreflightResponse::from_diagnostics(diagnostics)),
     )
+}
+
+async fn analyze_reference(State(state): State<RuntimeState>, request: AxumRequest) -> Response {
+    let body = match http_json::read_json_body(request).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    match state.analysis.analyze(body).await {
+        Ok(premise) => (StatusCode::OK, Json(json!({ "premise": premise }))).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn events(
@@ -795,5 +816,166 @@ done
                 .expect("compatibility route response");
             assert_eq!(response.status(), StatusCode::OK);
         }
+    }
+
+    #[tokio::test]
+    async fn provider_free_reference_analysis_stages_local_image_and_cleans_up() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let server_root = temporary.path().join("server");
+        let data_dir = temporary.path().join("data");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(&server_root).expect("server root");
+        fs::create_dir_all(&data_dir).expect("data root");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let reference_path = temporary.path().join("selected-reference.png");
+        let reference_bytes = b"provider-free reference fixture";
+        fs::write(&reference_path, reference_bytes).expect("reference fixture");
+        let request_log = temporary.path().join("app-server-requests.jsonl");
+        let captured_reference = temporary.path().join("captured-reference.png");
+        assert!(!request_log.to_string_lossy().contains('\''));
+        assert!(!captured_reference.to_string_lossy().contains('\''));
+
+        let fake = temporary.path().join("fake-codex");
+        let fake_source = r#"#!/bin/sh
+test "$1" = "app-server" || exit 2
+request_log='__REQUEST_LOG__'
+captured_reference='__CAPTURED_REFERENCE__'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >>"$request_log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"analysis-thread"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      staged_path=$(printf '%s\n' "$line" | /usr/bin/sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
+      /bin/cp "$staged_path" "$captured_reference" || exit 3
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"analysis-turn"}}}'
+      printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"analysis-thread","turnId":"analysis-turn","itemId":"analysis-item","delta":"- ignored delta\n"}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"analysis-thread","turnId":"analysis-turn","completedAtMs":1,"item":{"type":"agentMessage","id":"analysis-item","text":"  - 青い髪\n- 星型アクセサリー  "}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"analysis-thread","turn":{"id":"analysis-turn","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'
+      ;;
+  esac
+done
+"#
+        .replace("__REQUEST_LOG__", &request_log.to_string_lossy())
+        .replace(
+            "__CAPTURED_REFERENCE__",
+            &captured_reference.to_string_lossy(),
+        );
+        let mut file = fs::File::create(&fake).expect("fake executable");
+        file.write_all(fake_source.as_bytes()).expect("fake source");
+        file.flush().expect("fake source flushed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = file.metadata().expect("fake metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&fake, permissions).expect("fake executable permissions");
+        }
+
+        let config = RuntimeConfig::new(
+            server_root,
+            data_dir.clone(),
+            Some(workspace.clone()),
+            "server".to_owned(),
+        );
+        let app = router_with_launch_config(config, AppServerLaunchConfig::single("fixture", fake));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/analyze-reference")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "referenceImagePath": reference_path.to_string_lossy()
+                        })
+                        .to_string(),
+                    ))
+                    .expect("analysis request"),
+            )
+            .await
+            .expect("analysis response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("analysis body")
+            .to_bytes();
+        let payload: Value = serde_json::from_slice(&body).expect("analysis JSON");
+        assert_eq!(payload["premise"], "- 青い髪\n- 星型アクセサリー");
+        assert_eq!(
+            fs::read(&captured_reference).expect("captured staged bytes"),
+            reference_bytes
+        );
+
+        let messages = fs::read_to_string(&request_log).expect("App Server request log");
+        let messages = messages
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("logged JSON request"))
+            .collect::<Vec<_>>();
+        let thread_start = messages
+            .iter()
+            .find(|message| message["method"] == "thread/start")
+            .expect("thread/start request");
+        assert_eq!(thread_start["params"]["cwd"], display_path(&workspace));
+        assert_eq!(thread_start["params"]["approvalPolicy"], "never");
+        assert_eq!(thread_start["params"]["sandbox"], "read-only");
+        assert_eq!(
+            thread_start["params"]["serviceName"],
+            "codex_image_grid_reference_analysis"
+        );
+        assert_eq!(thread_start["params"]["ephemeral"], true);
+
+        let turn_start = messages
+            .iter()
+            .find(|message| message["method"] == "turn/start")
+            .expect("turn/start request");
+        assert_eq!(turn_start["params"]["threadId"], "analysis-thread");
+        assert_eq!(turn_start["params"]["cwd"], display_path(&workspace));
+        assert_eq!(turn_start["params"]["approvalPolicy"], "never");
+        assert_eq!(turn_start["params"]["effort"], "medium");
+        assert_eq!(
+            turn_start["params"]["sandboxPolicy"],
+            json!({ "type": "readOnly", "networkAccess": false })
+        );
+        assert_eq!(
+            turn_start["params"]["input"][0],
+            json!({
+                "type": "text",
+                "text": analysis::ANALYZE_PROMPT,
+                "text_elements": []
+            })
+        );
+        let staged_path = PathBuf::from(
+            turn_start["params"]["input"][1]["path"]
+                .as_str()
+                .expect("local image path"),
+        );
+        assert_eq!(turn_start["params"]["input"][1]["type"], "localImage");
+        let analysis_root = data_dir.join(".run").join("reference-analysis");
+        assert!(staged_path.starts_with(
+            fs::canonicalize(&analysis_root).expect("canonical reference-analysis root")
+        ));
+        assert_eq!(
+            staged_path.file_name().and_then(|name| name.to_str()),
+            Some("reference.png")
+        );
+        assert!(!staged_path.exists());
+
+        assert!(
+            fs::read_dir(analysis_root)
+                .expect("analysis root")
+                .next()
+                .is_none()
+        );
     }
 }

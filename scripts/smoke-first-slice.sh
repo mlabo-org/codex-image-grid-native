@@ -27,6 +27,7 @@ server_stdout="$temporary_root/server.stdout"
 server_stderr="$temporary_root/server.stderr"
 data_root="$temporary_root/data"
 fake_codex="$temporary_root/fake-codex"
+analysis_reference_capture="$temporary_root/analysis-reference-capture.jpeg"
 
 printf '%s\n' \
   '#!/bin/sh' \
@@ -41,13 +42,27 @@ printf '%s\n' \
   '      ;;' \
   '    *'"'"'"method":"thread/start"'"'"'*)' \
   '      request_id="$(printf "%s" "$line" | jq --raw-output ".id")"' \
-  '      printf '"'"'{"id":%s,"result":{"thread":{"id":"fixture-thread"}}}\n'"'"' "$request_id"' \
+  '      service_name="$(printf "%s" "$line" | jq --raw-output ".params.serviceName // empty")"' \
+  '      if [ "$service_name" = "codex_image_grid_reference_analysis" ]; then' \
+  '        printf '"'"'{"id":%s,"result":{"thread":{"id":"analysis-thread"}}}\n'"'"' "$request_id"' \
+  '      else' \
+  '        printf '"'"'{"id":%s,"result":{"thread":{"id":"fixture-thread"}}}\n'"'"' "$request_id"' \
+  '      fi' \
   '      ;;' \
   '    *'"'"'"method":"turn/start"'"'"'*)' \
   '      request_id="$(printf "%s" "$line" | jq --raw-output ".id")"' \
-  '      printf '"'"'{"id":%s,"result":{"turn":{"id":"fixture-turn"}}}\n'"'"' "$request_id"' \
-  '      printf '"'"'%s\n'"'"' '"'"'{"method":"item/completed","params":{"threadId":"fixture-thread","turnId":"fixture-turn","item":{"type":"imageGeneration","id":"fixture-image","status":"completed","revisedPrompt":null,"result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}}'"'"'' \
-  '      printf '"'"'%s\n'"'"' '"'"'{"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'"'"'' \
+  '      thread_id="$(printf "%s" "$line" | jq --raw-output ".params.threadId // empty")"' \
+  '      if [ "$thread_id" = "analysis-thread" ]; then' \
+  '        local_image_path="$(printf "%s" "$line" | jq --raw-output '"'"'.params.input[] | select(.type == "localImage") | .path'"'"' | head -n 1)"' \
+  '        cp "$local_image_path" "$IMAGE_GRID_SMOKE_ANALYSIS_CAPTURE"' \
+  '        printf '"'"'{"id":%s,"result":{"turn":{"id":"analysis-turn"}}}\n'"'"' "$request_id"' \
+  '        printf '"'"'%s\n'"'"' '"'"'{"method":"item/completed","params":{"threadId":"analysis-thread","turnId":"analysis-turn","item":{"type":"agentMessage","id":"analysis-message","text":"- 青いマスコット\n- 柔らかな光"}}}'"'"'' \
+  '        printf '"'"'%s\n'"'"' '"'"'{"method":"turn/completed","params":{"threadId":"analysis-thread","turn":{"id":"analysis-turn","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'"'"'' \
+  '      else' \
+  '        printf '"'"'{"id":%s,"result":{"turn":{"id":"fixture-turn"}}}\n'"'"' "$request_id"' \
+  '        printf '"'"'%s\n'"'"' '"'"'{"method":"item/completed","params":{"threadId":"fixture-thread","turnId":"fixture-turn","item":{"type":"imageGeneration","id":"fixture-image","status":"completed","revisedPrompt":null,"result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}}'"'"'' \
+  '        printf '"'"'%s\n'"'"' '"'"'{"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'"'"'' \
+  '      fi' \
   '      ;;' \
   '  esac' \
   'done' \
@@ -61,6 +76,7 @@ printf '%s' \
   | /usr/bin/base64 -D >"$expected_image_path"
 cp "$expected_image_path" "$reference_image"
 
+IMAGE_GRID_SMOKE_ANALYSIS_CAPTURE="$analysis_reference_capture" \
 IMAGE_GRID_CODEX_BIN="$fake_codex" "$repo_root/target/debug/image-grid-server" \
   --bind 127.0.0.1:0 \
   --data-root "$data_root" \
@@ -153,6 +169,29 @@ jq --exit-status \
     and .codexAppServer.status == "ready"
     and .identity.codexAppServer.status == "ready"
   ' "$ready_health_json" >/dev/null
+
+analysis_json="$temporary_root/analysis.json"
+analysis_request="$temporary_root/analysis-request.json"
+jq --null-input \
+  --arg referenceImagePath "$reference_image" \
+  '{referenceImagePath: $referenceImagePath}' \
+  >"$analysis_request"
+curl --fail --silent --show-error \
+  --request POST \
+  --header 'content-type: application/json' \
+  --data-binary @"$analysis_request" \
+  "$server_url/api/analyze-reference" \
+  >"$analysis_json"
+jq --exit-status \
+  '.premise == "- 青いマスコット\n- 柔らかな光"' \
+  "$analysis_json" >/dev/null
+cmp "$reference_image" "$analysis_reference_capture"
+analysis_staging_root="$data_root/.run/reference-analysis"
+if [[ -d "$analysis_staging_root" ]] \
+  && [[ -n "$(find "$analysis_staging_root" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  echo "reference analysis staging directory was not cleaned up" >&2
+  exit 1
+fi
 
 run_json="$temporary_root/run.json"
 run_request="$temporary_root/run-request.json"
