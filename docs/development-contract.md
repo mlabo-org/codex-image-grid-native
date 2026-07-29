@@ -31,7 +31,8 @@ index; executable Rust/Swift tests and protocol fixtures remain the validators.
   `/Users/suzukimakoto/plugins/codex-image-grid-native`.
 - Public runtime, health, manifest, and MCP server identity:
   `codex-image-grid`.
-- Internal data namespace: `codex-image-grid-native`.
+- Compatible generated-image and history root:
+  `~/Library/Application Support/codex-image-grid`.
 - Internal loopback endpoint: `127.0.0.1:4322`.
 - Installed app: `~/Applications/Codex Image Grid Native.app`.
 - Internal bundle identifier and executable:
@@ -41,6 +42,9 @@ Source edits, cache refresh, installation, and active-session pickup are
 separate boundaries. Cache or installed copies are not edited in place. The
 old Electron plugin is frozen and out of scope; no registration or failure
 path may dispatch to it.
+
+The frozen Electron runtime must remain stopped because rollback and Native
+share the original user-visible data root and may not write it concurrently.
 
 ## Parent-orchestrated work units
 
@@ -72,5 +76,5 @@ The native release acceptance bundle covers:
 
 The public plugin `.mcp.json` executes the MCP binary inside the verified
 installed app. A valid call opens or re-activates that exact app, requires its
-packaged `0.2.0` SwiftUI-owned health identity on the isolated port, and never
+packaged `0.2.1` SwiftUI-owned health identity on the isolated port, and never
 uses the frozen Electron or a headless server fallback.

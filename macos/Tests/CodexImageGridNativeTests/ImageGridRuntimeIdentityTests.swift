@@ -5,11 +5,11 @@ import Testing
 @Test func validNativeHealthIdentityDecodesAndValidates() throws {
     let response = try decodeHealth([
         "ok": true,
-        "generatedDir": "/tmp/codex-image-grid-native/generated",
+        "generatedDir": "/tmp/codex-image-grid/generated",
         "identity": [
             "app": "codex-image-grid",
             "packageName": "codex-image-grid",
-            "packageVersion": "0.2.0",
+            "packageVersion": "0.2.1",
             "packageRootKind": "packaged",
             "launchTarget": "swiftui",
             "serverRoot": "/Users/example/Applications/Codex Image Grid Native.app",
@@ -20,7 +20,7 @@ import Testing
 
     #expect(identity.app == "codex-image-grid")
     #expect(identity.packageName == "codex-image-grid")
-    #expect(identity.packageVersion == "0.2.0")
+    #expect(identity.packageVersion == "0.2.1")
     #expect(identity.packageRootKind == "packaged")
     #expect(identity.launchTarget == "swiftui")
     #expect(identity.serverRoot == "/Users/example/Applications/Codex Image Grid Native.app")
@@ -36,7 +36,7 @@ import Testing
         "ok": true,
         "app": "codex-image-grid",
         "packageName": "codex-image-grid",
-        "packageVersion": "0.2.0",
+        "packageVersion": "0.2.1",
         "packageRootKind": "packaged",
         "launchTarget": "swiftui",
     ])
@@ -51,7 +51,7 @@ import Testing
         "ok": true,
         "app": "codex-image-grid",
         "packageName": "codex-image-grid",
-        "packageVersion": "0.2.0",
+        "packageVersion": "0.2.1",
         "packageRootKind": "packaged",
         "launchTarget": "swiftui",
         "serverRoot": "codex-image-grid-native",
@@ -85,7 +85,7 @@ import Testing
         "ok": true,
         "app": "codex-image-grid",
         "packageName": "codex-image-grid",
-        "packageVersion": "0.2.0",
+        "packageVersion": "0.2.1",
         "packageRootKind": "packaged",
         "launchTarget": "mcp",
         "serverRoot": "/Users/example/Applications/Codex Image Grid Native.app",

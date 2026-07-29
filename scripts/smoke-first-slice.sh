@@ -121,7 +121,7 @@ jq --exit-status \
     and .workspaceDir == $dataDir
     and .launchTarget == "server"
     and .packageName == "codex-image-grid"
-    and .packageVersion == "0.2.0"
+    and .packageVersion == "0.2.1"
     and .packageRootKind == "source"
     and .codexAppServer.status == "not-started"
     and .codexAppServer.ready == false

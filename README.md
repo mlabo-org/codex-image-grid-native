@@ -33,18 +33,20 @@ provider-free and live App Server acceptance slices. The public plugin's
 - Public runtime, health, manifest, and MCP server identity:
   `codex-image-grid`.
 - Internal loopback port: `127.0.0.1:4322`.
-- Internal runtime data:
-  `~/Library/Application Support/codex-image-grid-native`.
+- Compatible runtime data and image history:
+  `~/Library/Application Support/codex-image-grid`.
 - Installed app:
   `~/Applications/Codex Image Grid Native.app`.
 - Internal bundle identifier and executable:
   `local.codex.image-grid.native` / `CodexImageGridNative`.
 
 The nested public root lets its folder and manifest both use
-`codex-image-grid` without reusing the frozen repository path. Port, data,
-bundle, executable, and install identities remain isolated so the native
-runtime cannot collide with the frozen Electron app. They do not create a
-second public generation route.
+`codex-image-grid` without reusing the frozen repository path. The native
+port, bundle, executable, and install identities remain isolated, while the
+user-visible generated images, manifests, handoffs, and restored history keep
+the frozen product's original data root. The frozen Electron runtime must
+remain stopped so both implementations never write that shared data root
+concurrently.
 
 The detailed baseline contract is [docs/frozen-baseline-spec.md](docs/frozen-baseline-spec.md).
 It records the frozen source commit, observable API/MCP/job/artifact behavior,
