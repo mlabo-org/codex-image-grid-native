@@ -326,11 +326,13 @@ private actor NativeRuntimeProcessDouble: NativeRuntimeProcessHandle {
 private func waitUntilTerminateWasSent(
     to process: NativeRuntimeProcessDouble
 ) async {
-    for _ in 0..<100 {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(1))
+    while clock.now < deadline {
         if await process.snapshot().terminateCount == 1 {
             return
         }
-        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(1))
     }
     Issue.record("The lifecycle did not send SIGTERM to its owned process.")
 }
