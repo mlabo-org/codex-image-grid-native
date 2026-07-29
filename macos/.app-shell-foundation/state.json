@@ -1,0 +1,13 @@
+{
+  "files": {
+    "Sources/CodexImageGridNative/AppShellFoundation.swift": "3399aa3639b22f06c6b9302e38bd185ea6b1405891af87f8cd604b06b50dd610"
+  },
+  "platform": "swiftui",
+  "schemaVersion": 1,
+  "sourceDir": "Sources/CodexImageGridNative",
+  "task": {
+    "deliveryMode": "iterative",
+    "id": "native-ui-parity-20260729"
+  },
+  "templateVersion": "0.1.0"
+}
