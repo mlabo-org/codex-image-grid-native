@@ -522,6 +522,8 @@ struct ImageGridAPIClient: Sendable {
 }
 
 enum ImageGridJobSelection {
+    static let maximumCompletedJobs = 96
+
     static func visible(
         jobs: some Sequence<ImageGridJob>,
         completedLimit: Int?,
@@ -532,9 +534,41 @@ enum ImageGridJobSelection {
         var terminal = all.filter { !$0.isActive && (showFailed || $0.status != "error") }
             .sorted(by: orderedBefore)
         if let completedLimit {
-            terminal = Array(terminal.prefix(max(0, min(96, completedLimit))))
+            terminal = Array(terminal.prefix(max(0, min(maximumCompletedJobs, completedLimit))))
         }
         return active + terminal
+    }
+
+    static func retained(
+        jobs: some Sequence<ImageGridJob>,
+        completedLimit: Int?
+    ) -> [ImageGridJob] {
+        let all = Array(jobs)
+        guard let completedLimit else {
+            return all
+        }
+
+        let boundedLimit = max(0, min(maximumCompletedJobs, completedLimit))
+        let active = all.filter(\.isActive)
+        let visibleWithFailures = visible(
+            jobs: all,
+            completedLimit: boundedLimit,
+            showFailed: true
+        )
+        let visibleWithoutFailures = visible(
+            jobs: all,
+            completedLimit: boundedLimit,
+            showFailed: false
+        )
+
+        var retainedIDs: Set<String> = []
+        var retained: [ImageGridJob] = []
+        for job in active + visibleWithFailures + visibleWithoutFailures {
+            if retainedIDs.insert(job.id).inserted {
+                retained.append(job)
+            }
+        }
+        return retained
     }
 
     static func orderedBefore(_ lhs: ImageGridJob, _ rhs: ImageGridJob) -> Bool {
@@ -571,6 +605,7 @@ final class ImageGridStore: ObservableObject {
     private var lifecycleTask: Task<Void, Never>?
     private var clearedBefore: Int64 = 0
     private var clearedJobIDs: Set<String> = []
+    private var retainedCompletedLimit: Int? = ImageGridJobSelection.maximumCompletedJobs
 
     init(client: ImageGridAPIClient = ImageGridAPIClient()) {
         self.client = client
@@ -661,6 +696,13 @@ final class ImageGridStore: ObservableObject {
             completedLimit: resultLimit.completedLimit,
             showFailed: showFailed
         )
+    }
+
+    func applyRetentionMode(resultLimit: ResultLimit) {
+        retainedCompletedLimit = resultLimit == .all
+            ? nil
+            : ImageGridJobSelection.maximumCompletedJobs
+        pruneRetainedJobs()
     }
 
     var counts: (done: Int, running: Int, failed: Int) {
@@ -777,6 +819,16 @@ final class ImageGridStore: ObservableObject {
             }
             jobs[job.id] = job
         }
+        pruneRetainedJobs()
+    }
+
+    private func pruneRetainedJobs() {
+        let retained = ImageGridJobSelection.retained(
+            jobs: jobs.values,
+            completedLimit: retainedCompletedLimit
+        )
+        let retainedIDs = Set(retained.map(\.id))
+        jobs = jobs.filter { retainedIDs.contains($0.key) }
     }
 }
 

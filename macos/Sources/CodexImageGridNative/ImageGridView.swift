@@ -129,6 +129,7 @@ struct ImageGridView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .frame(minHeight: 560)
         .onAppear {
+            store.applyRetentionMode(resultLimit: resultLimit)
             store.start()
         }
         .onDisappear {
@@ -150,6 +151,7 @@ struct ImageGridView: View {
             draftPersistence.schedule(metadata)
         }
         .onChange(of: resultLimit) { _, value in
+            store.applyRetentionMode(resultLimit: value)
             if value == .all {
                 Task {
                     await store.hydrateRuns()
