@@ -1015,16 +1015,13 @@ struct ImageGridView: View {
                     store.openGeneratedDirectory()
                 }
                 .disabled(store.generatedDirectory == nil)
-                Button(strings.clearScreen) {
-                    store.clearTerminalJobs()
-                }
-                .disabled(!store.hasTerminalJobs)
                 Button {
                     beginRunDeletionMode()
                 } label: {
                     Label(strings.beginDeletionMode, systemImage: "trash")
                 }
                 .disabled(store.generatedDirectory == nil)
+                .help(strings.beginDeletionModeHelp)
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -1036,16 +1033,13 @@ struct ImageGridView: View {
                         store.openGeneratedDirectory()
                     }
                     .disabled(store.generatedDirectory == nil)
-                    Button(strings.clearScreen) {
-                        store.clearTerminalJobs()
-                    }
-                    .disabled(!store.hasTerminalJobs)
                     Button {
                         beginRunDeletionMode()
                     } label: {
                         Label(strings.beginDeletionMode, systemImage: "trash")
                     }
                     .disabled(store.generatedDirectory == nil)
+                    .help(strings.beginDeletionModeHelp)
                 }
             }
         }
@@ -1431,8 +1425,13 @@ struct ImageGridStrings {
         localized("失敗した結果を表示", "Show failed results")
     }
     var openInFinder: String { localized("Finderで開く", "Open in Finder") }
-    var clearScreen: String { localized("画面をクリア", "Clear screen") }
     var beginDeletionMode: String { localized("削除モード", "Deletion mode") }
+    var beginDeletionModeHelp: String {
+        localized(
+            "生成データを確認して、runディレクトリ単位で削除します",
+            "Review generated data and delete complete run directories"
+        )
+    }
     var deletionModeActive: String { localized("削除モード中", "Deletion mode active") }
     var finishDeletionMode: String { localized("削除モードを終了", "Exit deletion mode") }
     var deletionModeTitle: String { localized("生成データの一括削除", "Delete generated data") }
