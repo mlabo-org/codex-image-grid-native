@@ -104,6 +104,8 @@ import Foundation
     #expect(grid.columnCount(for: 1_600, itemCount: 20) == 3)
     #expect(grid.columnCount(for: 3_840, itemCount: 20) == 7)
     #expect(grid.columnCount(for: 3_840, itemCount: 2) == 2)
+    #expect(grid.gridItems(for: 3_840, itemCount: 20).count == 7)
+    #expect(grid.gridItems(for: 3_840, itemCount: 2).count == 2)
 }
 
 @Test func referenceContractMatchesNativeServerLimitAndFormats() {
