@@ -8,13 +8,13 @@ use image_grid_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use tokio::fs;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore, broadcast};
 use tokio::time::{Instant, sleep, timeout_at};
@@ -218,21 +218,21 @@ struct NormalizedRunRequest {
     wait_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PromptRecord {
     index: usize,
     prompt: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ReferenceRecord {
     path: String,
     url: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunRequestRecord {
     prompts: Vec<PromptRecord>,
@@ -246,7 +246,7 @@ struct RunRequestRecord {
     reference_image: Option<ReferenceRecord>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct RunArtifacts {
     manifest_path: String,
@@ -266,6 +266,75 @@ struct RunRecord {
     artifacts: RunArtifacts,
     created_at: i64,
     notify: Arc<Notify>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedRunManifest {
+    schema_version: u32,
+    run_id: String,
+    created_at: String,
+    updated_at: String,
+    artifacts: RunArtifacts,
+    request: RunRequestRecord,
+    outputs: Vec<PersistedOutput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedOutput {
+    id: String,
+    prompt: String,
+    prompt_index: usize,
+    prompt_total: usize,
+    variant: usize,
+    total: usize,
+    status: String,
+    status_text: String,
+    engine: String,
+    model: String,
+    mood: String,
+    aspect_ratio: String,
+    filename: String,
+    output_format: String,
+    #[serde(default)]
+    output_path: Option<String>,
+    #[serde(default)]
+    image_url: Option<String>,
+    #[serde(default)]
+    reference_image_path: Option<String>,
+    #[serde(default)]
+    reference_image_url: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    turn_id: Option<String>,
+    #[serde(default)]
+    error_code: Option<String>,
+    #[serde(default)]
+    error_message: Option<String>,
+    #[serde(default)]
+    upstream_status: Option<String>,
+    #[serde(default)]
+    diagnostic_log: String,
+    #[serde(default)]
+    retry_count: u32,
+    timing: JobTiming,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Default)]
+struct RestoredRuntimeState {
+    jobs: HashMap<String, ImageGridJob>,
+    runs: HashMap<String, RunRecord>,
+    normalized_run_ids: Vec<String>,
+}
+
+enum ExpectedFileState {
+    Missing,
+    Regular,
+    Unsafe,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -340,13 +409,14 @@ impl GenerationRuntime {
         app_server: AppServerBridge,
         recovery: RecoveryConfig,
     ) -> Self {
+        let restored = restore_persisted_runtime(&config);
         let (events, _) = broadcast::channel(1024);
-        Self {
+        let runtime = Self {
             inner: Arc::new(RuntimeInner {
                 config,
                 app_server,
-                jobs: RwLock::new(HashMap::new()),
-                runs: RwLock::new(HashMap::new()),
+                jobs: RwLock::new(restored.jobs),
+                runs: RwLock::new(restored.runs),
                 events,
                 image_slots: Arc::new(Semaphore::new(MAX_RUN_JOBS)),
                 svg_slots: Arc::new(Semaphore::new(CODEX_SVG_CONCURRENCY)),
@@ -356,6 +426,44 @@ impl GenerationRuntime {
                 attempts: RwLock::new(HashMap::new()),
                 rate_limit_cooldown_until: Mutex::new(Instant::now()),
             }),
+        };
+        runtime.persist_normalized_restorations(restored.normalized_run_ids);
+        runtime
+    }
+
+    fn persist_normalized_restorations(&self, run_ids: Vec<String>) {
+        if run_ids.is_empty() {
+            return;
+        }
+        let runtime = self.clone();
+        let worker = std::thread::Builder::new()
+            .name("image-grid-startup-restoration".to_owned())
+            .spawn(move || -> Result<(), String> {
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("could not start restoration executor: {error}"))?;
+                executor.block_on(async move {
+                    for run_id in run_ids {
+                        runtime.write_artifacts(&run_id).await.map_err(|error| {
+                            format!(
+                                "could not persist restored artifacts for {run_id}: {}",
+                                error.error
+                            )
+                        })?;
+                    }
+                    Ok(())
+                })
+            });
+        match worker {
+            Ok(worker) => match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("image-grid-server: {error}"),
+                Err(_) => eprintln!("image-grid-server: startup restoration thread panicked"),
+            },
+            Err(error) => {
+                eprintln!("image-grid-server: could not start restoration thread: {error}")
+            }
         }
     }
 
@@ -1880,6 +1988,401 @@ impl GenerationRuntime {
     }
 }
 
+fn restore_persisted_runtime(config: &RuntimeConfig) -> RestoredRuntimeState {
+    let Ok(generated_root) = std::fs::canonicalize(&config.generated_dir) else {
+        return RestoredRuntimeState::default();
+    };
+    let Ok(entries) = std::fs::read_dir(&generated_root) else {
+        return RestoredRuntimeState::default();
+    };
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    let mut restored = RestoredRuntimeState::default();
+    let mut restored_job_ids = HashSet::new();
+    for entry in entries {
+        let Some(run_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !valid_restored_run_id(&run_id)
+            || !entry
+                .file_type()
+                .is_ok_and(|file_type| file_type.is_dir() && !file_type.is_symlink())
+        {
+            continue;
+        }
+        let Ok(run_directory) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        if run_directory.parent() != Some(generated_root.as_path()) {
+            continue;
+        }
+        let Some((run, jobs, normalized)) = restore_persisted_run(config, &run_id, &run_directory)
+        else {
+            continue;
+        };
+        if jobs
+            .iter()
+            .any(|job| restored_job_ids.contains(job.id.as_str()))
+        {
+            continue;
+        }
+        restored_job_ids.extend(jobs.iter().map(|job| job.id.clone()));
+        for job in jobs {
+            restored.jobs.insert(job.id.clone(), job);
+        }
+        if normalized {
+            restored.normalized_run_ids.push(run_id.clone());
+        }
+        restored.runs.insert(run_id, run);
+    }
+    restored
+}
+
+fn restore_persisted_run(
+    config: &RuntimeConfig,
+    run_id: &str,
+    run_directory: &Path,
+) -> Option<(RunRecord, Vec<ImageGridJob>, bool)> {
+    let manifest_path = run_directory.join("manifest.json");
+    if !matches!(
+        expected_file_state(&manifest_path),
+        ExpectedFileState::Regular
+    ) {
+        return None;
+    }
+    if matches!(
+        expected_file_state(&run_directory.join("handoff.md")),
+        ExpectedFileState::Unsafe
+    ) {
+        return None;
+    }
+    let manifest: PersistedRunManifest =
+        serde_json::from_slice(&std::fs::read(&manifest_path).ok()?).ok()?;
+    if manifest.schema_version != 1 || manifest.run_id != run_id {
+        return None;
+    }
+    let artifacts = run_artifacts(&config.generated_dir, run_id);
+    if manifest.artifacts != artifacts {
+        return None;
+    }
+    let created_at = parse_iso_millis(&manifest.created_at)?;
+    let updated_at = parse_iso_millis(&manifest.updated_at)?;
+    if updated_at < created_at {
+        return None;
+    }
+    let request = validate_restored_request(run_id, run_directory, manifest.request)?;
+    if manifest.outputs.is_empty()
+        || manifest.outputs.len()
+            != request
+                .prompts
+                .len()
+                .checked_mul(request.variants_per_prompt)?
+    {
+        return None;
+    }
+
+    let restoration_time = now_millis();
+    let mut normalized = false;
+    let mut jobs = Vec::with_capacity(manifest.outputs.len());
+    let mut job_ids = HashSet::new();
+    let mut filenames = HashSet::new();
+    let mut positions = HashSet::new();
+    for output in manifest.outputs {
+        let (job, job_normalized) = restore_persisted_output(
+            run_id,
+            run_directory,
+            &request,
+            &artifacts,
+            output,
+            restoration_time,
+        )?;
+        if !job_ids.insert(job.id.clone())
+            || !filenames.insert(job.filename.clone())
+            || !positions.insert((job.prompt_index, job.variant))
+        {
+            return None;
+        }
+        normalized |= job_normalized;
+        jobs.push(job);
+    }
+    jobs.sort_by(compare_jobs);
+    let job_ids = jobs.iter().map(|job| job.id.clone()).collect::<Vec<_>>();
+    let run = RunRecord {
+        run_id: run_id.to_owned(),
+        job_ids,
+        initial_jobs: jobs.clone(),
+        request,
+        artifacts,
+        created_at,
+        notify: Arc::new(Notify::new()),
+    };
+    Some((run, jobs, normalized))
+}
+
+fn validate_restored_request(
+    run_id: &str,
+    run_directory: &Path,
+    mut request: RunRequestRecord,
+) -> Option<RunRequestRecord> {
+    if request.prompts.is_empty()
+        || request.prompts.len() > MAX_PROMPTS
+        || request.prompt_total != request.prompts.len()
+        || !(1..=usize::from(MAX_VARIANTS_PER_PROMPT)).contains(&request.variants_per_prompt)
+        || request
+            .prompts
+            .len()
+            .checked_mul(request.variants_per_prompt)?
+            > MAX_RUN_JOBS
+        || !matches!(request.engine.as_str(), "app-server-image" | "codex-svg")
+        || request.model.is_empty()
+        || !MOODS.contains(&request.mood.as_str())
+        || !ASPECT_RATIOS.contains(&request.aspect_ratio.as_str())
+    {
+        return None;
+    }
+    for (index, prompt) in request.prompts.iter().enumerate() {
+        if prompt.index != index + 1 || prompt.prompt.trim().is_empty() {
+            return None;
+        }
+    }
+    request.reference_image = match request.reference_image {
+        Some(reference) => Some(validate_restored_reference(
+            run_id,
+            run_directory,
+            reference,
+        )?),
+        None => None,
+    };
+    Some(request)
+}
+
+fn validate_restored_reference(
+    run_id: &str,
+    run_directory: &Path,
+    reference: ReferenceRecord,
+) -> Option<ReferenceRecord> {
+    let url_prefix = format!("/generated/{run_id}/");
+    let url_filename = reference.url.strip_prefix(&url_prefix)?;
+    let filename = safe_filename(url_filename)?;
+    if !matches!(
+        Path::new(filename)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("png" | "jpg" | "jpeg" | "webp")
+    ) {
+        return None;
+    }
+    let expected_path = run_directory.join(filename);
+    if Path::new(&reference.path) != expected_path
+        || matches!(
+            expected_file_state(&expected_path),
+            ExpectedFileState::Unsafe
+        )
+    {
+        return None;
+    }
+    Some(ReferenceRecord {
+        path: display_path(&expected_path),
+        url: format!("{url_prefix}{filename}"),
+    })
+}
+
+fn restore_persisted_output(
+    run_id: &str,
+    run_directory: &Path,
+    request: &RunRequestRecord,
+    artifacts: &RunArtifacts,
+    output: PersistedOutput,
+    restoration_time: i64,
+) -> Option<(ImageGridJob, bool)> {
+    if output.id.is_empty()
+        || !matches!(
+            output.status.as_str(),
+            "queued" | "starting" | "running" | "done" | "error"
+        )
+        || output.timing.phase != output.status
+        || output.prompt_index == 0
+        || output.prompt_index > request.prompts.len()
+        || output.prompt_total != request.prompt_total
+        || output.variant == 0
+        || output.variant > request.variants_per_prompt
+        || output.total != request.variants_per_prompt
+        || output.engine != request.engine
+        || output.model != request.model
+        || output.mood != request.mood
+        || output.aspect_ratio != request.aspect_ratio
+        || output.prompt != request.prompts[output.prompt_index - 1].prompt
+    {
+        return None;
+    }
+
+    let filename = safe_filename(&output.filename)?;
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())?;
+    let extension_matches_engine = if output.engine == "codex-svg" {
+        extension == "svg"
+    } else {
+        matches!(extension, "png" | "jpg" | "jpeg" | "webp")
+    };
+    if !extension_matches_engine || output.output_format != extension {
+        return None;
+    }
+    let expected_output_path = run_directory.join(filename);
+    if output
+        .output_path
+        .as_deref()
+        .is_some_and(|path| Path::new(path) != expected_output_path)
+    {
+        return None;
+    }
+    let expected_image_url = format!("/generated/{run_id}/{filename}");
+    if output
+        .image_url
+        .as_deref()
+        .is_some_and(|url| url != expected_image_url)
+    {
+        return None;
+    }
+
+    let expected_reference_path = request
+        .reference_image
+        .as_ref()
+        .map(|reference| reference.path.as_str());
+    let expected_reference_url = request
+        .reference_image
+        .as_ref()
+        .map(|reference| reference.url.as_str());
+    if output.reference_image_path.as_deref() != expected_reference_path
+        || output.reference_image_url.as_deref() != expected_reference_url
+    {
+        return None;
+    }
+
+    let created_at = parse_iso_millis(&output.created_at)?;
+    let mut updated_at = parse_iso_millis(&output.updated_at)?;
+    if updated_at < created_at {
+        return None;
+    }
+    let file_state = expected_file_state(&expected_output_path);
+    if matches!(file_state, ExpectedFileState::Unsafe) {
+        return None;
+    }
+    let file_exists = matches!(file_state, ExpectedFileState::Regular);
+    let was_active = matches!(output.status.as_str(), "queued" | "starting" | "running");
+    let claimed_done_without_file = output.status == "done" && !file_exists;
+    let mut normalized = was_active || claimed_done_without_file || output.output_path.is_none();
+
+    let mut status = output.status;
+    let mut status_text = output.status_text;
+    let mut image_url = output.image_url;
+    let error_code = output.error_code;
+    let mut error_message = output.error_message;
+    let mut timing = output.timing;
+    if was_active {
+        if file_exists {
+            status = "done".to_owned();
+            status_text = "Restored after restart".to_owned();
+            image_url = Some(expected_image_url.clone());
+        } else {
+            status = "error".to_owned();
+            status_text = "Interrupted by restart".to_owned();
+            image_url = None;
+            error_message = Some("Interrupted by restart".to_owned());
+        }
+        timing.transition(&status, restoration_time);
+        updated_at = restoration_time;
+    } else if claimed_done_without_file {
+        status = "error".to_owned();
+        status_text = "Interrupted by restart".to_owned();
+        image_url = None;
+        error_message = Some("Interrupted by restart".to_owned());
+        timing.transition("error", restoration_time);
+        updated_at = restoration_time;
+    } else if status == "done" && image_url.is_none() {
+        image_url = Some(expected_image_url.clone());
+        normalized = true;
+    } else if status == "error" && !file_exists && image_url.is_some() {
+        image_url = None;
+        normalized = true;
+    }
+
+    Some((
+        ImageGridJob {
+            id: output.id,
+            run_id: run_id.to_owned(),
+            engine: output.engine,
+            model: output.model,
+            prompt: output.prompt,
+            reference_premise: request.reference_premise.clone(),
+            mood: output.mood,
+            prompt_index: output.prompt_index,
+            prompt_total: output.prompt_total,
+            variant: output.variant,
+            total: output.total,
+            filename: filename.to_owned(),
+            output_path: display_path(&expected_output_path),
+            aspect_ratio: output.aspect_ratio,
+            reference_image_path: expected_reference_path.map(str::to_owned),
+            reference_image_url: expected_reference_url.map(str::to_owned),
+            manifest_path: artifacts.manifest_path.clone(),
+            manifest_url: artifacts.manifest_url.clone(),
+            manifest_view_url: artifacts.manifest_view_url.clone(),
+            handoff_path: artifacts.handoff_path.clone(),
+            handoff_url: artifacts.handoff_url.clone(),
+            handoff_view_url: artifacts.handoff_view_url.clone(),
+            output_format: output.output_format,
+            status,
+            status_text,
+            image_url,
+            log: String::new(),
+            thread_id: output.thread_id,
+            turn_id: output.turn_id,
+            error_code,
+            error_message,
+            upstream_status: output.upstream_status,
+            diagnostic_log: output.diagnostic_log,
+            retry_count: output.retry_count,
+            timing,
+            created_at,
+            updated_at,
+        },
+        normalized,
+    ))
+}
+
+fn valid_restored_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f' | b'-'))
+}
+
+fn safe_filename(value: &str) -> Option<&str> {
+    if value.is_empty()
+        || value.contains('/')
+        || value.contains('\\')
+        || Path::new(value)
+            .file_name()
+            .and_then(|filename| filename.to_str())
+            != Some(value)
+        || matches!(value, "." | ".." | "manifest.json" | "handoff.md")
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn expected_file_state(path: &Path) -> ExpectedFileState {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => ExpectedFileState::Regular,
+        Ok(_) => ExpectedFileState::Unsafe,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ExpectedFileState::Missing,
+        Err(_) => ExpectedFileState::Unsafe,
+    }
+}
+
 fn normalize_request(
     body: &Value,
     require_prompts_array: bool,
@@ -2580,6 +3083,47 @@ fn iso_time(milliseconds: i64) -> String {
         .unwrap_or_else(|_| milliseconds.to_string())
 }
 
+fn parse_iso_millis(value: &str) -> Option<i64> {
+    let value = value.strip_suffix('Z')?;
+    let (date, time) = value.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i32>().ok()?;
+    let month = date_parts.next()?.parse::<u8>().ok()?;
+    let day = date_parts.next()?.parse::<u8>().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<u8>().ok()?;
+    let minute = time_parts.next()?.parse::<u8>().ok()?;
+    let seconds = time_parts.next()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+    let (second, nanosecond) = if let Some((second, fraction)) = seconds.split_once('.') {
+        if fraction.is_empty()
+            || fraction.len() > 9
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let scale = 10_u32.pow(u32::try_from(9_usize.saturating_sub(fraction.len())).ok()?);
+        (
+            second.parse::<u8>().ok()?,
+            fraction.parse::<u32>().ok()?.checked_mul(scale)?,
+        )
+    } else {
+        (seconds.parse::<u8>().ok()?, 0)
+    };
+    let date = Date::from_calendar_date(year, Month::try_from(month).ok()?, day).ok()?;
+    let time = Time::from_hms_nano(hour, minute, second, nanosecond).ok()?;
+    let milliseconds = PrimitiveDateTime::new(date, time)
+        .assume_utc()
+        .unix_timestamp_nanos()
+        / 1_000_000;
+    i64::try_from(milliseconds).ok()
+}
+
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -3208,5 +3752,242 @@ done
         );
         assert!(requests.contains("\"method\":\"turn/interrupt\""));
         assert_eq!(runtime.scheduler_snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_restoration_normalizes_interrupted_jobs_without_requeueing_unsafe_artifacts() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary_root =
+            std_fs::canonicalize(temporary.path()).expect("canonical temporary directory");
+        let server_root = temporary_root.join("server");
+        let data_dir = temporary_root.join("data");
+        let workspace = temporary_root.join("workspace");
+        std_fs::create_dir_all(&server_root).expect("server root");
+        std_fs::create_dir_all(&workspace).expect("workspace");
+        let config = Arc::new(RuntimeConfig::new(
+            server_root,
+            data_dir,
+            Some(workspace.clone()),
+            "server".to_owned(),
+        ));
+        config.prepare_directories().expect("runtime directories");
+        let fake = temporary.path().join("unused-codex");
+        std_fs::write(&fake, "#!/bin/sh\nexit 97\n").expect("fake executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std_fs::metadata(&fake)
+                .expect("fake metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std_fs::set_permissions(&fake, permissions).expect("fake executable permissions");
+        }
+
+        let manifest_for = |run_id: &str, jobs: &[ImageGridJob]| {
+            let artifacts = run_artifacts(&config.generated_dir, run_id);
+            let first = &jobs[0];
+            let request = RunRequestRecord {
+                prompts: vec![PromptRecord {
+                    index: 1,
+                    prompt: first.prompt.clone(),
+                }],
+                mood: first.mood.clone(),
+                engine: first.engine.clone(),
+                model: first.model.clone(),
+                aspect_ratio: first.aspect_ratio.clone(),
+                variants_per_prompt: jobs.len(),
+                prompt_total: 1,
+                reference_premise: first.reference_premise.clone(),
+                reference_image: None,
+            };
+            json!({
+                "schemaVersion": 1,
+                "app": APP_IDENTITY,
+                "runId": run_id,
+                "createdAt": iso_time(jobs.iter().map(|job| job.created_at).min().unwrap()),
+                "updatedAt": iso_time(jobs.iter().map(|job| job.updated_at).max().unwrap()),
+                "cwd": display_path(&workspace),
+                "server": {},
+                "artifacts": artifacts,
+                "request": request,
+                "diagnostics": [],
+                "outputs": jobs.iter().map(output_value).collect::<Vec<_>>()
+            })
+        };
+        let write_manifest = |run_id: &str, manifest: &Value| {
+            let run_directory = config.generated_dir.join(run_id);
+            std_fs::create_dir_all(&run_directory).expect("run directory");
+            let mut bytes = serde_json::to_vec_pretty(manifest).expect("manifest JSON");
+            bytes.push(b'\n');
+            std_fs::write(run_directory.join("manifest.json"), bytes).expect("manifest fixture");
+        };
+
+        let now = now_millis();
+        let safe_run_id = "abc123ef";
+        let safe_run_directory = config.generated_dir.join(safe_run_id);
+        std_fs::create_dir_all(&safe_run_directory).expect("safe run directory");
+        let mut active_with_file =
+            svg_fixture_job(safe_run_id, &safe_run_directory.join("variant-01.svg"), now);
+        active_with_file.id = "active-with-file".to_owned();
+        active_with_file.prompt = "restore persisted jobs".to_owned();
+        active_with_file.total = 4;
+        active_with_file.status = "running".to_owned();
+        active_with_file.status_text = "Generating".to_owned();
+        active_with_file.timing.transition("starting", now);
+        active_with_file.timing.transition("running", now);
+        std_fs::write(&active_with_file.output_path, "<svg/>").expect("completed output fixture");
+
+        let mut active_without_file = active_with_file.clone();
+        active_without_file.id = "active-without-file".to_owned();
+        active_without_file.variant = 2;
+        active_without_file.filename = "variant-02.svg".to_owned();
+        active_without_file.output_path =
+            display_path(&safe_run_directory.join(&active_without_file.filename));
+        active_without_file.status = "queued".to_owned();
+        active_without_file.status_text = "Queued".to_owned();
+        active_without_file.image_url = None;
+        active_without_file.timing = JobTiming::queued(now);
+
+        let mut claimed_done_without_file = active_without_file.clone();
+        claimed_done_without_file.id = "claimed-done-without-file".to_owned();
+        claimed_done_without_file.variant = 3;
+        claimed_done_without_file.filename = "variant-03.svg".to_owned();
+        claimed_done_without_file.output_path =
+            display_path(&safe_run_directory.join(&claimed_done_without_file.filename));
+        claimed_done_without_file.status = "done".to_owned();
+        claimed_done_without_file.status_text = "Generated".to_owned();
+        claimed_done_without_file.timing.transition("done", now);
+
+        let mut terminal_error = active_without_file.clone();
+        terminal_error.id = "terminal-error".to_owned();
+        terminal_error.variant = 4;
+        terminal_error.filename = "variant-04.svg".to_owned();
+        terminal_error.output_path =
+            display_path(&safe_run_directory.join(&terminal_error.filename));
+        terminal_error.status = "error".to_owned();
+        terminal_error.status_text = "Upstream failed".to_owned();
+        terminal_error.error_message = Some("fixture failure".to_owned());
+        terminal_error.timing.transition("error", now);
+
+        let safe_jobs = vec![
+            active_with_file,
+            active_without_file,
+            claimed_done_without_file,
+            terminal_error,
+        ];
+        write_manifest(safe_run_id, &manifest_for(safe_run_id, &safe_jobs));
+
+        let unsafe_run_id = "deadbeef";
+        let unsafe_run_directory = config.generated_dir.join(unsafe_run_id);
+        let unsafe_output_path = unsafe_run_directory.join("variant-01.svg");
+        let mut unsafe_job = svg_fixture_job(unsafe_run_id, &unsafe_output_path, now);
+        unsafe_job.id = "unsafe-output-path".to_owned();
+        unsafe_job.prompt = "unsafe persisted path".to_owned();
+        unsafe_job.total = 1;
+        let mut unsafe_manifest = manifest_for(unsafe_run_id, &[unsafe_job]);
+        unsafe_manifest["outputs"][0]["outputPath"] =
+            Value::String(display_path(&temporary_root.join("outside.svg")));
+        write_manifest(unsafe_run_id, &unsafe_manifest);
+
+        let uppercase_run_id = "ABCDEF01";
+        let uppercase_run_directory = config.generated_dir.join(uppercase_run_id);
+        let mut uppercase_job = svg_fixture_job(
+            uppercase_run_id,
+            &uppercase_run_directory.join("variant-01.svg"),
+            now,
+        );
+        uppercase_job.id = "uppercase-run".to_owned();
+        uppercase_job.prompt = "uppercase run".to_owned();
+        uppercase_job.total = 1;
+        write_manifest(
+            uppercase_run_id,
+            &manifest_for(uppercase_run_id, &[uppercase_job]),
+        );
+
+        let app_server =
+            AppServerBridge::new(workspace, AppServerLaunchConfig::single("fixture", fake));
+        let runtime = GenerationRuntime::new_with_recovery_config(
+            config.clone(),
+            app_server,
+            RecoveryConfig::default(),
+        );
+
+        let jobs = runtime.snapshot().await;
+        assert_eq!(jobs.len(), 4);
+        let restored_with_file = jobs
+            .iter()
+            .find(|job| job.id == "active-with-file")
+            .expect("active job with output");
+        assert_eq!(restored_with_file.status, "done");
+        assert_eq!(restored_with_file.status_text, "Restored after restart");
+        assert_eq!(
+            restored_with_file.image_url.as_deref(),
+            Some("/generated/abc123ef/variant-01.svg")
+        );
+        let restored_without_file = jobs
+            .iter()
+            .find(|job| job.id == "active-without-file")
+            .expect("active job without output");
+        assert_eq!(restored_without_file.status, "error");
+        assert_eq!(restored_without_file.status_text, "Interrupted by restart");
+        assert_eq!(
+            restored_without_file.error_message.as_deref(),
+            Some("Interrupted by restart")
+        );
+        let restored_claimed_done = jobs
+            .iter()
+            .find(|job| job.id == "claimed-done-without-file")
+            .expect("claimed done job");
+        assert_eq!(restored_claimed_done.status, "error");
+        assert_eq!(
+            restored_claimed_done.error_message.as_deref(),
+            Some("Interrupted by restart")
+        );
+        let restored_terminal_error = jobs
+            .iter()
+            .find(|job| job.id == "terminal-error")
+            .expect("terminal error job");
+        assert_eq!(restored_terminal_error.status, "error");
+        assert_eq!(restored_terminal_error.status_text, "Upstream failed");
+        assert_eq!(
+            restored_terminal_error.error_message.as_deref(),
+            Some("fixture failure")
+        );
+        assert!(runtime.run_response(unsafe_run_id, false).await.is_none());
+        assert!(
+            runtime
+                .run_response(uppercase_run_id, false)
+                .await
+                .is_none()
+        );
+        assert_eq!(runtime.scheduler_snapshot().queued, 0);
+        assert_eq!(runtime.scheduler_snapshot().active, 0);
+        assert!(runtime.inner.attempts.read().await.is_empty());
+
+        let persisted: Value = serde_json::from_slice(
+            &std_fs::read(safe_run_directory.join("manifest.json"))
+                .expect("persisted restored manifest"),
+        )
+        .expect("persisted restored JSON");
+        assert_eq!(persisted["outputs"][0]["status"], "done");
+        assert_eq!(
+            persisted["outputs"][0]["statusText"],
+            "Restored after restart"
+        );
+        assert_eq!(persisted["outputs"][1]["status"], "error");
+        assert_eq!(
+            persisted["outputs"][1]["errorMessage"],
+            "Interrupted by restart"
+        );
+        let handoff =
+            std_fs::read_to_string(safe_run_directory.join("handoff.md")).expect("handoff");
+        assert!(handoff.contains("Restored after restart"));
+        assert!(handoff.contains("Interrupted by restart"));
+        assert!(
+            std_fs::read_dir(&safe_run_directory)
+                .expect("safe run entries")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
     }
 }
