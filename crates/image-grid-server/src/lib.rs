@@ -773,7 +773,7 @@ mod tests {
         assert_eq!(health.app_server_image_diagnostics.status, "not-started");
         assert_eq!(health.identity.app, "codex-image-grid");
         assert_eq!(health.identity.package_name, "codex-image-grid");
-        assert_eq!(health.identity.package_version, "0.2.2");
+        assert_eq!(health.identity.package_version, "0.2.3");
         assert_eq!(health.identity.data_dir, "/tmp/codex-image-grid-native");
         assert_eq!(health.identity.package_root_kind, "source");
         assert_eq!(

@@ -76,5 +76,5 @@ The native release acceptance bundle covers:
 
 The public plugin `.mcp.json` executes the MCP binary inside the verified
 installed app. A valid call opens or re-activates that exact app, requires its
-packaged `0.2.2` SwiftUI-owned health identity on the isolated port, and never
+packaged `0.2.3` SwiftUI-owned health identity on the isolated port, and never
 uses the frozen Electron or a headless server fallback.

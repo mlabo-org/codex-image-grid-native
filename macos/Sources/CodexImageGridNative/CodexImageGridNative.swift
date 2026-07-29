@@ -20,10 +20,8 @@ struct CodexImageGridApp: App {
 
     var body: some Scene {
         WindowGroup("Codex Image Grid") {
-            AppShellRoot {
-                ImageGridView()
-                    .environmentObject(applicationDelegate.runtimeLifecycle)
-            }
+            ImageGridView()
+                .environmentObject(applicationDelegate.runtimeLifecycle)
         }
         .defaultSize(width: 1180, height: 820)
         .commands {
