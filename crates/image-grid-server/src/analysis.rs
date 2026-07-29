@@ -1,5 +1,7 @@
 use crate::RuntimeConfig;
-use crate::app_server::{AppServerBridge, AppServerDiagnostics, RUNTIME_CLOSED_MESSAGE};
+use crate::app_server::{
+    AppServerBridge, AppServerDiagnostics, AppServerThreadNotifications, RUNTIME_CLOSED_MESSAGE,
+};
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -13,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
-use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -117,7 +118,7 @@ impl ReferenceAnalysisRuntime {
             .ok_or_else(|| AnalysisError::new("thread/start returned no thread id"))?
             .to_owned();
 
-        let mut notifications = client.subscribe();
+        let mut notifications = client.subscribe_thread(&thread_id);
         let turn_client = client.clone();
         let turn_thread_id = thread_id.clone();
         let turn_workspace = display_path(&self.config.workspace_dir);
@@ -151,7 +152,7 @@ impl ReferenceAnalysisRuntime {
                 )
                 .await
         });
-        let completion = collect_analysis_notifications(&mut notifications, &thread_id);
+        let completion = collect_analysis_notifications(&mut notifications);
         tokio::pin!(completion);
 
         match timeout(ANALYSIS_TIMEOUT, async {
@@ -174,28 +175,19 @@ impl ReferenceAnalysisRuntime {
 }
 
 async fn collect_analysis_notifications(
-    notifications: &mut tokio::sync::broadcast::Receiver<Value>,
-    thread_id: &str,
+    notifications: &mut AppServerThreadNotifications,
 ) -> Result<String, AnalysisError> {
     let mut text = String::new();
     loop {
         let message = match notifications.recv().await {
-            Ok(message) => message,
-            Err(RecvError::Lagged(_)) => {
-                return Err(AnalysisError::new(
-                    "reference analysis notification stream lagged",
-                ));
-            }
-            Err(RecvError::Closed) => {
+            Some(message) => message,
+            None => {
                 return Err(AnalysisError::new(
                     "Codex App Server notification stream closed",
                 ));
             }
         };
         let params = message.get("params").unwrap_or(&Value::Null);
-        if notification_thread_id(params) != Some(thread_id) {
-            continue;
-        }
 
         match message.get("method").and_then(Value::as_str) {
             Some("item/agentMessage/delta") => {
@@ -245,13 +237,6 @@ async fn collect_analysis_notifications(
             _ => {}
         }
     }
-}
-
-fn notification_thread_id(params: &Value) -> Option<&str> {
-    params
-        .get("threadId")
-        .and_then(Value::as_str)
-        .or_else(|| params.pointer("/thread/id").and_then(Value::as_str))
 }
 
 enum ReferenceSource {

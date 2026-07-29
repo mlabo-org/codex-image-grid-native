@@ -13,7 +13,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, broadcast, oneshot, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 pub const APP_SERVER_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -286,6 +286,65 @@ impl fmt::Display for AppServerClientError {
 
 type PendingResponse = oneshot::Sender<Result<Value, AppServerClientError>>;
 type PendingMap = Arc<StdMutex<HashMap<String, PendingResponse>>>;
+type ThreadNotificationRoutes = Arc<StdMutex<HashMap<String, ThreadNotificationRoute>>>;
+
+#[derive(Clone)]
+struct ThreadNotificationRoute {
+    subscription_id: u64,
+    sender: mpsc::UnboundedSender<Value>,
+}
+
+pub(crate) struct AppServerThreadNotifications {
+    thread_id: String,
+    subscription_id: u64,
+    receiver: mpsc::UnboundedReceiver<Value>,
+    routes: ThreadNotificationRoutes,
+}
+
+impl AppServerThreadNotifications {
+    pub(crate) async fn recv(&mut self) -> Option<Value> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for AppServerThreadNotifications {
+    fn drop(&mut self) {
+        let mut routes = self
+            .routes
+            .lock()
+            .expect("App Server thread notification routes poisoned");
+        if routes
+            .get(&self.thread_id)
+            .is_some_and(|route| route.subscription_id == self.subscription_id)
+        {
+            routes.remove(&self.thread_id);
+        }
+    }
+}
+
+fn subscribe_thread_notifications(
+    routes: &ThreadNotificationRoutes,
+    subscription_id: u64,
+    thread_id: &str,
+) -> AppServerThreadNotifications {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    routes
+        .lock()
+        .expect("App Server thread notification routes poisoned")
+        .insert(
+            thread_id.to_owned(),
+            ThreadNotificationRoute {
+                subscription_id,
+                sender,
+            },
+        );
+    AppServerThreadNotifications {
+        thread_id: thread_id.to_owned(),
+        subscription_id,
+        receiver,
+        routes: routes.clone(),
+    }
+}
 
 struct AppServerLifecycle {
     public_events: broadcast::Sender<AppServerEvent>,
@@ -386,7 +445,8 @@ pub(crate) struct AppServerClient {
     child: Mutex<Child>,
     pending: PendingMap,
     next_id: AtomicU64,
-    notifications: broadcast::Sender<Value>,
+    thread_notifications: ThreadNotificationRoutes,
+    next_subscription_id: AtomicU64,
     closed: Arc<AtomicBool>,
     lifecycle: Arc<AppServerLifecycle>,
     shutdown_gate: Mutex<()>,
@@ -440,24 +500,25 @@ impl AppServerClient {
         })?;
 
         let pending = Arc::new(StdMutex::new(HashMap::new()));
-        let (notifications, _) = broadcast::channel(256);
+        let thread_notifications = Arc::new(StdMutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         spawn_stdout_reader(
             stdout,
             pending.clone(),
-            notifications.clone(),
+            thread_notifications.clone(),
             public_events.clone(),
             lifecycle.clone(),
             closed.clone(),
         );
-        spawn_stderr_reader(stderr, notifications.clone(), public_events);
+        spawn_stderr_reader(stderr, public_events);
 
         Ok(Arc::new(Self {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
             pending,
             next_id: AtomicU64::new(1),
-            notifications,
+            thread_notifications,
+            next_subscription_id: AtomicU64::new(1),
             closed,
             lifecycle,
             shutdown_gate: Mutex::new(()),
@@ -535,8 +596,9 @@ impl AppServerClient {
         self.write_message(&message).await
     }
 
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<Value> {
-        self.notifications.subscribe()
+    pub(crate) fn subscribe_thread(&self, thread_id: &str) -> AppServerThreadNotifications {
+        let subscription_id = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
+        subscribe_thread_notifications(&self.thread_notifications, subscription_id, thread_id)
     }
 
     async fn write_message(&self, message: &Value) -> Result<(), AppServerClientError> {
@@ -598,6 +660,10 @@ impl AppServerClient {
         for sender in pending_responses {
             let _ = sender.send(Err(runtime_closed_error()));
         }
+        self.thread_notifications
+            .lock()
+            .expect("App Server thread notification routes poisoned")
+            .clear();
         let mut child = self.child.lock().await;
         terminate_owned_child(&mut child).await;
     }
@@ -634,7 +700,7 @@ fn runtime_closed_error() -> AppServerClientError {
 fn spawn_stdout_reader(
     stdout: tokio::process::ChildStdout,
     pending: PendingMap,
-    notifications: broadcast::Sender<Value>,
+    thread_notifications: ThreadNotificationRoutes,
     public_events: broadcast::Sender<AppServerEvent>,
     lifecycle: Arc<AppServerLifecycle>,
     closed: Arc<AtomicBool>,
@@ -645,14 +711,7 @@ fn spawn_stdout_reader(
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                        emit_server_log(&public_events, "stdout", line.clone());
-                        let _ = notifications.send(json!({
-                            "method": "server-log",
-                            "params": {
-                                "stream": "stdout",
-                                "message": line
-                            }
-                        }));
+                        emit_server_log(&public_events, "stdout", line);
                         continue;
                     };
                     if message.get("method").and_then(Value::as_str) == Some("server-log") {
@@ -698,19 +757,12 @@ fn spawn_stdout_reader(
                         }
                     }
 
-                    let _ = notifications.send(message);
+                    route_thread_notification(&thread_notifications, message);
                 }
                 Ok(None) => break,
                 Err(error) => {
                     let text = format!("App Server stdout failed: {error}");
-                    emit_server_log(&public_events, "stdout", text.clone());
-                    let _ = notifications.send(json!({
-                        "method": "server-log",
-                        "params": {
-                            "stream": "stdout",
-                            "message": text
-                        }
-                    }));
+                    emit_server_log(&public_events, "stdout", text);
                     break;
                 }
             }
@@ -729,38 +781,55 @@ fn spawn_stdout_reader(
                 "App Server stdout closed",
             )));
         }
+        thread_notifications
+            .lock()
+            .expect("App Server thread notification routes poisoned")
+            .clear();
         if !closed.load(Ordering::Acquire) {
-            let message = "Codex App Server stopped";
-            let _ = notifications.send(json!({
-                "method": "server-status",
-                "params": {
-                    "status": "stopped",
-                    "message": message
-                }
-            }));
-            lifecycle.defer_terminal("stopped", message);
+            lifecycle.defer_terminal("stopped", "Codex App Server stopped");
         }
     });
 }
 
 fn spawn_stderr_reader(
     stderr: tokio::process::ChildStderr,
-    notifications: broadcast::Sender<Value>,
     public_events: broadcast::Sender<AppServerEvent>,
 ) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            emit_server_log(&public_events, "stderr", line.clone());
-            let _ = notifications.send(json!({
-                "method": "server-log",
-                "params": {
-                    "stream": "stderr",
-                    "message": line
-                }
-            }));
+            emit_server_log(&public_events, "stderr", line);
         }
     });
+}
+
+fn route_thread_notification(routes: &ThreadNotificationRoutes, message: Value) {
+    let Some(thread_id) = message["params"]["threadId"]
+        .as_str()
+        .or_else(|| message["params"]["thread"]["id"].as_str())
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let route = routes
+        .lock()
+        .expect("App Server thread notification routes poisoned")
+        .get(&thread_id)
+        .cloned();
+    let Some(route) = route else {
+        return;
+    };
+    if route.sender.send(message).is_err() {
+        let mut routes = routes
+            .lock()
+            .expect("App Server thread notification routes poisoned");
+        if routes
+            .get(&thread_id)
+            .is_some_and(|current| current.subscription_id == route.subscription_id)
+        {
+            routes.remove(&thread_id);
+        }
+    }
 }
 
 fn emit_server_log(public_events: &broadcast::Sender<AppServerEvent>, stream: &str, text: String) {
@@ -1069,6 +1138,38 @@ mod tests {
             }),
             receiver,
         )
+    }
+
+    #[tokio::test]
+    async fn thread_notification_route_keeps_terminal_event_after_a_large_burst() {
+        let routes = Arc::new(StdMutex::new(HashMap::new()));
+        let mut notifications = subscribe_thread_notifications(&routes, 1, "thread-lossless");
+        for sequence in 0..512 {
+            route_thread_notification(
+                &routes,
+                json!({
+                    "method": if sequence == 511 {
+                        "turn/completed"
+                    } else {
+                        "item/agentMessage/delta"
+                    },
+                    "params": {
+                        "threadId": "thread-lossless",
+                        "sequence": sequence
+                    }
+                }),
+            );
+        }
+
+        for sequence in 0..512 {
+            let message = timeout(Duration::from_secs(1), notifications.recv())
+                .await
+                .expect("notification deadline")
+                .expect("thread notification");
+            assert_eq!(message["params"]["sequence"], sequence);
+        }
+        drop(notifications);
+        assert!(routes.lock().expect("notification routes").is_empty());
     }
 
     #[test]
