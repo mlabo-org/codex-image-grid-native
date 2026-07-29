@@ -846,60 +846,121 @@ struct ImageGridView: View {
     private var resultGrid: some View {
         let visible = store.visibleJobs(resultLimit: resultLimit, showFailed: showFailed)
         if visible.isEmpty {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.55))
-                .frame(minHeight: 180)
-                .overlay {
-                    VStack(spacing: 8) {
-                        Image(systemName: "photo.on.rectangle.angled")
-                            .foregroundStyle(.secondary)
-                            .accessibilityHidden(true)
-                        Text(strings.readyMessage(engine: engine))
-                            .appFont(.body)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
+            if hiddenFailureCount > 0 {
+                hiddenFailureNotice(count: hiddenFailureCount, minimumHeight: 180)
+            } else {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+                    .frame(minHeight: 180)
+                    .overlay {
+                        VStack(spacing: 8) {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
+                            Text(strings.readyMessage(engine: engine))
+                                .appFont(.body)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(24)
                     }
-                    .padding(24)
-                }
+            }
         } else {
             let grid = ResponsiveResultGrid(minimumColumnWidth: 512, spacing: 16)
-            LazyVGrid(
-                columns: grid.gridItems(
-                    count: min(resultGridColumnCount, visible.count)
-                ),
-                alignment: .leading,
-                spacing: grid.spacing
-            ) {
-                ForEach(visible) { job in
-                    ResultCardView(
-                        job: job,
-                        imageURL: store.client.resolvedURL(job.imageUrl),
-                        onCopy: { store.copyPrompt(job.prompt) },
-                        onReveal: { store.reveal(job) },
-                        onManifest: { store.openArtifact(job.manifestViewUrl) },
-                        onHandoff: { store.openArtifact(job.handoffViewUrl) }
-                    )
-                    .frame(maxWidth: .infinity, alignment: .top)
+            VStack(alignment: .leading, spacing: 16) {
+                if hiddenFailureCount > 0 {
+                    hiddenFailureNotice(count: hiddenFailureCount)
                 }
-            }
-            .frame(maxWidth: .infinity)
-            .background {
-                GeometryReader { geometry in
-                    Color.clear
-                        .onChange(
-                            of: grid.columnCount(
-                                for: geometry.size.width,
-                                itemCount: visible.count
-                            ),
-                            initial: true
-                        ) { _, columnCount in
-                            if columnCount != resultGridColumnCount {
-                                resultGridColumnCount = columnCount
+
+                LazyVGrid(
+                    columns: grid.gridItems(
+                        count: min(resultGridColumnCount, visible.count)
+                    ),
+                    alignment: .leading,
+                    spacing: grid.spacing
+                ) {
+                    ForEach(visible) { job in
+                        ResultCardView(
+                            job: job,
+                            imageURL: store.client.resolvedURL(job.imageUrl),
+                            onCopy: { store.copyPrompt(job.prompt) },
+                            onReveal: { store.reveal(job) },
+                            onManifest: { store.openArtifact(job.manifestViewUrl) },
+                            onHandoff: { store.openArtifact(job.handoffViewUrl) }
+                        )
+                        .frame(maxWidth: .infinity, alignment: .top)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .background {
+                    GeometryReader { geometry in
+                        Color.clear
+                            .onChange(
+                                of: grid.columnCount(
+                                    for: geometry.size.width,
+                                    itemCount: visible.count
+                                ),
+                                initial: true
+                            ) { _, columnCount in
+                                if columnCount != resultGridColumnCount {
+                                    resultGridColumnCount = columnCount
+                                }
                             }
-                        }
+                    }
                 }
             }
         }
+    }
+
+    private var hiddenFailureCount: Int {
+        showFailed ? 0 : store.counts.failed
+    }
+
+    private func hiddenFailureNotice(count: Int, minimumHeight: CGFloat? = nil) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 14) {
+                hiddenFailureCopy(count: count)
+                Spacer(minLength: 16)
+                showFailedResultsButton
+            }
+
+            VStack(alignment: .leading, spacing: 14) {
+                hiddenFailureCopy(count: count)
+                showFailedResultsButton
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, minHeight: minimumHeight, alignment: .leading)
+        .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.red.opacity(0.45), lineWidth: 1)
+        }
+    }
+
+    private func hiddenFailureCopy(count: Int) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(.red)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(strings.generationFailed)
+                    .appFont(.body, weight: .semibold)
+                Text(strings.hiddenFailureMessage(count: count))
+                    .appFont(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var showFailedResultsButton: some View {
+        Button(strings.showFailedResults) {
+            showFailed = true
+        }
+        .buttonStyle(.bordered)
     }
 
     private var resultsHeading: some View {
@@ -1086,8 +1147,23 @@ struct ImageGridStrings {
     var runs: String { localized("実行結果", "Runs") }
     var latest: String { localized("表示件数", "Latest") }
     var showFailed: String { localized("失敗も表示", "Show failed") }
+    var generationFailed: String {
+        localized("画像生成に失敗しました", "Image generation failed")
+    }
+    var showFailedResults: String {
+        localized("失敗した結果を表示", "Show failed results")
+    }
     var openInFinder: String { localized("Finderで開く", "Open in Finder") }
     var clearScreen: String { localized("画面をクリア", "Clear screen") }
+
+    func hiddenFailureMessage(count: Int) -> String {
+        if resolvedLanguage == .japanese {
+            return "\(count)件の失敗結果は表示設定により非表示です。"
+        }
+        return count == 1
+            ? "1 failed result is hidden by your display setting."
+            : "\(count) failed results are hidden by your display setting."
+    }
 
     func languageName(_ value: AppShellLanguage) -> String {
         switch value {

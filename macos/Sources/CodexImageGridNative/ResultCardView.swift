@@ -72,7 +72,12 @@ struct ResultCardView: View {
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                .stroke(
+                    job.status == "error"
+                        ? Color.red.opacity(0.55)
+                        : Color(nsColor: .separatorColor),
+                    lineWidth: job.status == "error" ? 1.5 : 1
+                )
         }
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .sheet(isPresented: $showsPreview) {
@@ -93,9 +98,11 @@ struct ResultCardView: View {
                             .resizable()
                             .scaledToFill()
                     case .failure:
-                        Image(systemName: "photo.badge.exclamationmark")
-                            .foregroundStyle(.secondary)
-                            .accessibilityLabel(strings.imageUnavailable)
+                        if job.status == "error" {
+                            generationFailurePlaceholder
+                        } else {
+                            imageUnavailablePlaceholder
+                        }
                     @unknown default:
                         EmptyView()
                     }
@@ -107,14 +114,50 @@ struct ResultCardView: View {
                         .appFont(.caption)
                 }
                 .foregroundStyle(.secondary)
+            } else if job.status == "error" {
+                generationFailurePlaceholder
             } else {
-                Image(systemName: "photo.badge.exclamationmark")
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel(strings.imageUnavailable)
+                imageUnavailablePlaceholder
             }
         }
         .aspectRatio(aspectRatio, contentMode: .fit)
         .clipped()
+        .accessibilityElement(children: .combine)
+    }
+
+    private var generationFailurePlaceholder: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundStyle(.red)
+                .accessibilityHidden(true)
+            Text(strings.generationFailed)
+                .appFont(.body, weight: .semibold)
+            if let errorMessage = job.errorMessage, !errorMessage.isEmpty {
+                Text(errorMessage)
+                    .appFont(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .multilineTextAlignment(.center)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var imageUnavailablePlaceholder: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "photo.badge.exclamationmark")
+                .font(.system(size: 24, weight: .medium))
+                .accessibilityHidden(true)
+            Text(strings.imageUnavailable)
+                .appFont(.caption, weight: .semibold)
+        }
+        .padding(20)
+        .foregroundStyle(.secondary)
+        .multilineTextAlignment(.center)
         .accessibilityElement(children: .combine)
     }
 
@@ -279,6 +322,7 @@ private struct ResultCardStrings {
         localized("この生成のPromptは残っていません。", "The prompt for this generation is unavailable.")
     }
     var generationLog: String { localized("生成ログ", "Generation log") }
+    var generationFailed: String { localized("画像生成に失敗しました", "Image generation failed") }
     var imageUnavailable: String { localized("画像を読み込めません", "Image unavailable") }
     var image: String { localized("画像", "Image") }
 
