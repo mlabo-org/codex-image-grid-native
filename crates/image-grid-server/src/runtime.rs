@@ -1108,7 +1108,6 @@ impl GenerationRuntime {
                 return AttemptOutcome::Failed;
             }
         };
-        let mut notifications = client.subscribe();
         let thread_result = client
             .request(
                 "thread/start",
@@ -1146,6 +1145,7 @@ impl GenerationRuntime {
             .await;
             return AttemptOutcome::Failed;
         };
+        let mut notifications = client.subscribe_thread(&thread_id);
         if !self
             .update_job_for_attempt(job_id, attempt_id, |job, now| {
                 job.thread_id = Some(thread_id.clone());
@@ -1217,9 +1217,8 @@ impl GenerationRuntime {
                 received = notifications.recv() => received,
             };
             let message = match received {
-                Ok(message) => message,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => {
+                Some(message) => message,
+                None => {
                     self.record_attempt_failure(
                         job_id,
                         attempt_id,
@@ -1231,9 +1230,6 @@ impl GenerationRuntime {
                     return AttemptOutcome::Failed;
                 }
             };
-            if notification_thread_id(&message).as_deref() != Some(thread_id.as_str()) {
-                continue;
-            }
             let method = message
                 .get("method")
                 .and_then(Value::as_str)
@@ -1391,7 +1387,6 @@ impl GenerationRuntime {
                 return;
             }
         };
-        let mut notifications = client.subscribe();
         let thread_result = client
             .request(
                 "thread/start",
@@ -1426,6 +1421,7 @@ impl GenerationRuntime {
             .await;
             return;
         };
+        let mut notifications = client.subscribe_thread(&thread_id);
         self.update_job(job_id, |job, now| {
             job.thread_id = Some(thread_id.clone());
             job.status = "running".to_owned();
@@ -1491,9 +1487,8 @@ impl GenerationRuntime {
                 received = timeout_at(deadline, notifications.recv()) => received,
             };
             let message = match received {
-                Ok(Ok(message)) => message,
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                Ok(Some(message)) => message,
+                Ok(None) => {
                     self.fail_job(
                         job_id,
                         "AppServerClosed",
@@ -1524,9 +1519,6 @@ impl GenerationRuntime {
                     return;
                 }
             };
-            if notification_thread_id(&message).as_deref() != Some(thread_id.as_str()) {
-                continue;
-            }
             let method = message
                 .get("method")
                 .and_then(Value::as_str)
@@ -3265,13 +3257,6 @@ fn mood_direction(mood: &str) -> &'static str {
             "warm anime blog mascot portrait, soft desk lighting, charming and wholesome, gentle expression, polished illustration"
         }
     }
-}
-
-fn notification_thread_id(message: &Value) -> Option<String> {
-    message["params"]["threadId"]
-        .as_str()
-        .or_else(|| message["params"]["thread"]["id"].as_str())
-        .map(str::to_owned)
 }
 
 fn append_job_diagnostic(job: &mut ImageGridJob, entry: impl Into<String>) {
