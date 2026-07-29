@@ -1,15 +1,15 @@
 use image_grid_core::{
-    MAX_PROMPTS, MAX_RUN_JOBS, MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS, validate_reference_image,
+    MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES, MAX_RUN_JOBS, MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS,
 };
 use serde_json::{Value, json};
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const TOOL_NAME: &str = "generate_image_grid";
@@ -123,8 +123,15 @@ struct NormalizedArguments {
     engine: String,
     aspect_ratio: String,
     reference_premise: Option<String>,
-    reference_image_path: Option<String>,
+    reference_image: Option<InlineReferenceImage>,
     wait_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct InlineReferenceImage {
+    data_url: String,
+    mime_type: &'static str,
+    name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +139,7 @@ struct BridgeConfig {
     endpoint: HttpEndpoint,
     image_grid_url: String,
     app_dir: Option<PathBuf>,
+    strict_app_dir: bool,
     launch_plan: Option<LaunchPlan>,
     launch_timeout: Duration,
     health_timeout: Duration,
@@ -145,10 +153,17 @@ impl BridgeConfig {
         let image_grid_url = first_nonempty_env(&["IMAGE_GRID_URL", "IMAGE_GRID_NATIVE_URL"])
             .unwrap_or_else(|| DEFAULT_IMAGE_GRID_URL.to_owned());
         let endpoint = HttpEndpoint::parse(&image_grid_url)?;
+        let strict_app_dir = env_flag("IMAGE_GRID_STRICT_APP_DIR");
         let app_dir = first_nonempty_env(&["IMAGE_GRID_APP_DIR", "IMAGE_GRID_NATIVE_APP_DIR"])
             .map(PathBuf::from)
             .map(|path| canonical_directory(&path, "IMAGE_GRID_APP_DIR"))
             .transpose()?;
+        if strict_app_dir && app_dir.is_none() {
+            return Err(
+                "IMAGE_GRID_STRICT_APP_DIR=1 requires IMAGE_GRID_APP_DIR for the installed native server route"
+                    .to_owned(),
+            );
+        }
 
         let start_command = first_nonempty_env(&[
             "IMAGE_GRID_START_COMMAND",
@@ -179,11 +194,18 @@ impl BridgeConfig {
         } else {
             None
         };
+        if strict_app_dir && launch_plan.is_none() {
+            return Err(
+                "IMAGE_GRID_STRICT_APP_DIR=1 requires IMAGE_GRID_START_COMMAND or IMAGE_GRID_NATIVE_SERVER_BIN for the installed native server route"
+                    .to_owned(),
+            );
+        }
 
         Ok(Self {
             endpoint,
             image_grid_url: image_grid_url.trim_end_matches('/').to_owned(),
             app_dir,
+            strict_app_dir,
             launch_plan,
             launch_timeout: bounded_env_duration(
                 "IMAGE_GRID_LAUNCH_TIMEOUT_MS",
@@ -326,13 +348,21 @@ struct HttpResponse {
 }
 
 fn call_generate_image_grid(arguments: &Value) -> Result<Value, String> {
-    validate_tool_arguments(arguments)?;
-    let normalized = normalize_tool_arguments(arguments);
+    let normalized = prepare_tool_arguments(arguments)?;
     let config = BridgeConfig::from_environment()?;
-    call_generate_image_grid_with_config(&normalized, &config)
+    submit_generate_image_grid(&normalized, &config)
 }
 
+#[cfg(test)]
 fn call_generate_image_grid_with_config(
+    arguments: &Value,
+    config: &BridgeConfig,
+) -> Result<Value, String> {
+    let normalized = prepare_tool_arguments(arguments)?;
+    submit_generate_image_grid(&normalized, config)
+}
+
+fn submit_generate_image_grid(
     arguments: &NormalizedArguments,
     config: &BridgeConfig,
 ) -> Result<Value, String> {
@@ -352,12 +382,20 @@ fn call_generate_image_grid_with_config(
             Value::String(reference_premise.clone()),
         );
     }
-    if let Some(reference_image_path) = &arguments.reference_image_path {
-        body.insert(
-            "referenceImagePath".to_owned(),
-            Value::String(reference_image_path.clone()),
-        );
-    }
+    body.insert(
+        "referenceImage".to_owned(),
+        arguments
+            .reference_image
+            .as_ref()
+            .map(|reference| {
+                json!({
+                    "dataUrl": reference.data_url,
+                    "mimeType": reference.mime_type,
+                    "name": reference.name,
+                })
+            })
+            .unwrap_or(Value::Null),
+    );
 
     let request_timeout = config.run_timeout.max(Duration::from_millis(
         arguments.wait_ms.saturating_add(1_000),
@@ -388,7 +426,17 @@ fn call_generate_image_grid_with_config(
     ))
 }
 
-fn normalize_tool_arguments(arguments: &Value) -> NormalizedArguments {
+fn prepare_tool_arguments(arguments: &Value) -> Result<NormalizedArguments, String> {
+    validate_tool_arguments(arguments)?;
+    let reference_image =
+        read_reference_image(arguments.get("referenceImagePath").and_then(Value::as_str))?;
+    Ok(normalize_tool_arguments(arguments, reference_image))
+}
+
+fn normalize_tool_arguments(
+    arguments: &Value,
+    reference_image: Option<InlineReferenceImage>,
+) -> NormalizedArguments {
     NormalizedArguments {
         prompts: arguments["prompts"]
             .as_array()
@@ -416,13 +464,99 @@ fn normalize_tool_arguments(arguments: &Value) -> NormalizedArguments {
             .get("referencePremise")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        reference_image_path: arguments
-            .get("referenceImagePath")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned),
+        reference_image,
         wait_ms: arguments.get("waitMs").and_then(json_integer).unwrap_or(0) as u64,
     }
+}
+
+fn read_reference_image(
+    reference_image_path: Option<&str>,
+) -> Result<Option<InlineReferenceImage>, String> {
+    let Some(reference_image_path) = reference_image_path.filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    let path = Path::new(reference_image_path);
+    if !path.is_absolute() {
+        return Err("referenceImagePath must be an absolute local file path".to_owned());
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime_type = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => {
+            return Err("referenceImagePath must point to a PNG, JPEG, or WebP file".to_owned());
+        }
+    };
+
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "referenceImagePath is unavailable: {} ({error})",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "referenceImagePath must point to a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_REFERENCE_IMAGE_BYTES {
+        return Err(format!(
+            "reference image is too large; keep it at or below {MAX_REFERENCE_IMAGE_BYTES} bytes"
+        ));
+    }
+
+    let data = fs::read(path).map_err(|error| {
+        format!(
+            "referenceImagePath is unavailable: {} ({error})",
+            path.display()
+        )
+    })?;
+    if data.len() as u64 > MAX_REFERENCE_IMAGE_BYTES {
+        return Err(format!(
+            "reference image is too large; keep it at or below {MAX_REFERENCE_IMAGE_BYTES} bytes"
+        ));
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    Ok(Some(InlineReferenceImage {
+        data_url: format!("data:{mime_type};base64,{}", encode_base64(&data)),
+        mime_type,
+        name,
+    }))
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(ALPHABET[(((first & 0b11) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(ALPHABET[(((second & 0b1111) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(ALPHABET[(third & 0b11_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
 }
 
 fn start_or_join_native_server(config: &BridgeConfig) -> Result<ServerStartup, String> {
@@ -442,17 +576,30 @@ fn start_or_join_native_server(config: &BridgeConfig) -> Result<ServerStartup, S
         "Image Grid Native is not running, and no native auto-launch target is configured. Set IMAGE_GRID_APP_DIR with IMAGE_GRID_START_COMMAND, or set IMAGE_GRID_NATIVE_SERVER_BIN."
             .to_owned()
     })?;
-    let lock_path = startup_lock_path(&config.endpoint);
-    let lock = StartupLock::acquire(&lock_path)?;
-    if lock.is_none() {
-        let health = wait_for_joined_health(config, deadline)?;
-        return Ok(ServerStartup {
-            started: false,
-            launch_plan: None,
-            health,
-        });
-    }
-    let _lock = lock;
+    let lock_path = startup_lock_path(config);
+    let stale_after = config
+        .launch_timeout
+        .saturating_add(config.health_timeout)
+        .saturating_add(Duration::from_secs(5));
+    let _lock = loop {
+        if let Some(lock) = StartupLock::acquire(&lock_path, stale_after, &config.image_grid_url)? {
+            break lock;
+        }
+        if let Some(health) = check_health(config, deadline)? {
+            return Ok(ServerStartup {
+                started: false,
+                launch_plan: None,
+                health,
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Timed out waiting for the Image Grid startup lock at {}",
+                lock_path.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(100).min(remaining_duration(deadline)));
+    };
 
     if let Some(health) = check_health(config, deadline)? {
         return Ok(ServerStartup {
@@ -502,21 +649,6 @@ fn start_or_join_native_server(config: &BridgeConfig) -> Result<ServerStartup, S
                 "Image Grid Native auto-launch did not become healthy at {} within {} ms",
                 config.image_grid_url,
                 config.launch_timeout.as_millis()
-            ));
-        }
-        thread::sleep(Duration::from_millis(100).min(remaining_duration(deadline)));
-    }
-}
-
-fn wait_for_joined_health(config: &BridgeConfig, deadline: Instant) -> Result<Value, String> {
-    loop {
-        if let Some(health) = check_health(config, deadline)? {
-            return Ok(health);
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "Timed out waiting for the shared Image Grid Native startup at {}",
-                config.image_grid_url
             ));
         }
         thread::sleep(Duration::from_millis(100).min(remaining_duration(deadline)));
@@ -653,11 +785,19 @@ fn check_health(config: &BridgeConfig, deadline: Instant) -> Result<Option<Value
             response.status
         ));
     }
-    validate_health_payload(&response.data, config.app_dir.as_deref())?;
+    validate_health_payload(
+        &response.data,
+        config.app_dir.as_deref(),
+        config.strict_app_dir,
+    )?;
     Ok(Some(response.data))
 }
 
-fn validate_health_payload(health: &Value, expected_root: Option<&Path>) -> Result<(), String> {
+fn validate_health_payload(
+    health: &Value,
+    expected_root: Option<&Path>,
+    strict_app_dir: bool,
+) -> Result<(), String> {
     let object = health
         .as_object()
         .ok_or_else(|| "health response was not a JSON object".to_owned())?;
@@ -701,14 +841,86 @@ fn validate_health_payload(health: &Value, expected_root: Option<&Path>) -> Resu
             format!("health serverRoot is unavailable: {reported_root} ({error})")
         })?;
         if actual_root != expected_root {
-            return Err(format!(
-                "Image Grid Native serverRoot mismatch: reported {}; expected IMAGE_GRID_APP_DIR={}",
-                actual_root.display(),
-                expected_root.display()
-            ));
+            return if strict_app_dir {
+                Err(format!(
+                    "IMAGE_GRID_STRICT_APP_DIR=1 rejected Image Grid server: serverRoot={}; expected IMAGE_GRID_APP_DIR={}",
+                    actual_root.display(),
+                    expected_root.display()
+                ))
+            } else {
+                Err(format!(
+                    "Image Grid Native serverRoot mismatch: reported {}; expected IMAGE_GRID_APP_DIR={}",
+                    actual_root.display(),
+                    expected_root.display()
+                ))
+            };
+        }
+
+        if strict_app_dir {
+            validate_strict_runtime_identity(object, expected_root)?;
         }
     }
     Ok(())
+}
+
+fn validate_strict_runtime_identity(
+    health: &serde_json::Map<String, Value>,
+    expected_root: &Path,
+) -> Result<(), String> {
+    let identity = health.get("identity").and_then(Value::as_object);
+    let reported = |name: &str| {
+        health
+            .get(name)
+            .and_then(Value::as_str)
+            .or_else(|| {
+                identity
+                    .and_then(|identity| identity.get(name))
+                    .and_then(Value::as_str)
+            })
+            .filter(|value| !value.is_empty())
+    };
+
+    if let Some(package_name) = reported("packageName")
+        && package_name != EXPECTED_APP_IDENTITY
+    {
+        return Err(format!(
+            "IMAGE_GRID_STRICT_APP_DIR=1 rejected server packageName={package_name}; expected {EXPECTED_APP_IDENTITY}."
+        ));
+    }
+
+    let expected_version = env!("CARGO_PKG_VERSION");
+    if let Some(package_version) = reported("packageVersion")
+        && package_version != expected_version
+    {
+        return Err(format!(
+            "IMAGE_GRID_STRICT_APP_DIR=1 rejected server packageVersion={package_version}; expected {expected_version}. Restart the stale runtime."
+        ));
+    }
+
+    let expected_root_kind = package_root_kind_for(expected_root);
+    if expected_root_kind != "unknown"
+        && let Some(package_root_kind) = reported("packageRootKind")
+        && package_root_kind != expected_root_kind
+    {
+        return Err(format!(
+            "IMAGE_GRID_STRICT_APP_DIR=1 rejected server packageRootKind={package_root_kind}; expected {expected_root_kind}."
+        ));
+    }
+
+    Ok(())
+}
+
+fn package_root_kind_for(path: &Path) -> &'static str {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if normalized.contains("/.codex/plugins/cache/") {
+        "cache"
+    } else if normalized.contains(".app/Contents/Resources/") {
+        "packaged"
+    } else if normalized.ends_with("/plugins/codex-image-grid-native") {
+        "source"
+    } else {
+        "unknown"
+    }
 }
 
 #[derive(Debug)]
@@ -900,32 +1112,213 @@ fn decode_chunked(bytes: &[u8]) -> Result<Vec<u8>, HttpRequestError> {
 
 struct StartupLock {
     path: PathBuf,
+    token: String,
+    process_started_at: Option<String>,
 }
 
 impl StartupLock {
-    fn acquire(path: &Path) -> Result<Option<Self>, String> {
-        match OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(mut file) => {
-                writeln!(file, "pid={}", std::process::id())
-                    .map_err(|error| format!("could not write native startup lock: {error}"))?;
-                Ok(Some(Self {
-                    path: path.to_path_buf(),
-                }))
+    fn acquire(
+        path: &Path,
+        stale_after: Duration,
+        image_grid_url: &str,
+    ) -> Result<Option<Self>, String> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Image Grid startup lock root is unavailable".to_owned())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create native startup lock root: {error}"))?;
+
+        loop {
+            match fs::create_dir(path) {
+                Ok(()) => {
+                    let pid = std::process::id();
+                    let process_started_at = running_process_identity(pid).ok().flatten();
+                    let created_at = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    let token = format!("{pid}-{created_at}");
+                    let owner = json!({
+                        "pid": pid,
+                        "processStartedAt": process_started_at,
+                        "token": token,
+                        "createdAtUnixMs": created_at,
+                        "imageGridUrl": image_grid_url,
+                    });
+                    let owner_path = path.join("owner.json");
+                    let owner_bytes = serde_json::to_vec(&owner).map_err(|error| {
+                        format!("could not encode native startup lock: {error}")
+                    })?;
+                    if let Err(error) = fs::write(&owner_path, owner_bytes) {
+                        let _ = fs::remove_dir(path);
+                        return Err(format!("could not write native startup lock: {error}"));
+                    }
+                    return Ok(Some(Self {
+                        path: path.to_path_buf(),
+                        token,
+                        process_started_at,
+                    }));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if reclaim_stale_startup_lock(path, stale_after)? {
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                Err(error) => {
+                    return Err(format!("could not acquire native startup lock: {error}"));
+                }
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
-            Err(error) => Err(format!("could not acquire native startup lock: {error}")),
         }
     }
 }
 
 impl Drop for StartupLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let Some(owner) = read_startup_lock_owner(&self.path) else {
+            return;
+        };
+        if owner.pid != Some(std::process::id()) || owner.token.as_deref() != Some(&self.token) {
+            return;
+        }
+        if let (Some(expected), Ok(Some(actual))) = (
+            self.process_started_at.as_deref(),
+            running_process_identity(std::process::id()),
+        ) && expected != actual
+        {
+            return;
+        }
+        let _ = fs::remove_file(self.path.join("owner.json"));
+        let _ = fs::remove_dir(&self.path);
     }
 }
 
-fn startup_lock_path(endpoint: &HttpEndpoint) -> PathBuf {
-    let host = endpoint
+#[derive(Debug)]
+struct StartupLockOwner {
+    pid: Option<u32>,
+    process_started_at: Option<String>,
+    token: Option<String>,
+}
+
+fn read_startup_lock_owner(path: &Path) -> Option<StartupLockOwner> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let bytes = if metadata.is_dir() {
+        fs::read(path.join("owner.json")).ok()?
+    } else if metadata.file_type().is_file() {
+        fs::read(path).ok()?
+    } else {
+        return None;
+    };
+    if let Ok(owner) = serde_json::from_slice::<Value>(&bytes) {
+        return Some(StartupLockOwner {
+            pid: owner
+                .get("pid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok()),
+            process_started_at: owner
+                .get("processStartedAt")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            token: owner
+                .get("token")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        });
+    }
+
+    let text = std::str::from_utf8(&bytes).ok()?.trim();
+    let pid = text.strip_prefix("pid=")?.parse::<u32>().ok()?;
+    Some(StartupLockOwner {
+        pid: Some(pid),
+        process_started_at: None,
+        token: None,
+    })
+}
+
+fn reclaim_stale_startup_lock(path: &Path, stale_after: Duration) -> Result<bool, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(format!("could not inspect native startup lock: {error}"));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let modified = metadata
+        .modified()
+        .map_err(|error| format!("could not inspect native startup lock age: {error}"))?;
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default();
+    if stale_after != Duration::ZERO && age <= stale_after {
+        return Ok(false);
+    }
+
+    if let Some(owner) = read_startup_lock_owner(path)
+        && let Some(pid) = owner.pid
+    {
+        match running_process_identity(pid) {
+            Ok(Some(current_started_at)) => {
+                if owner.process_started_at.as_deref().is_none()
+                    || owner.process_started_at.as_deref() == Some(current_started_at.as_str())
+                {
+                    return Ok(false);
+                }
+            }
+            Err(()) => return Ok(false),
+            Ok(None) => {}
+        }
+    }
+
+    let mut quarantine = path.as_os_str().to_os_string();
+    quarantine.push(format!(
+        ".stale-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    let quarantine = PathBuf::from(quarantine);
+    match fs::rename(path, &quarantine) {
+        Ok(()) => {
+            if metadata.is_dir() {
+                let _ = fs::remove_dir_all(&quarantine);
+            } else {
+                let _ = fs::remove_file(&quarantine);
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+fn running_process_identity(pid: u32) -> Result<Option<String>, ()> {
+    let output = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .map_err(|_| ())?;
+    let identity = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !identity.is_empty() {
+        Ok(Some(identity))
+    } else if output.status.code() == Some(1) {
+        Ok(None)
+    } else {
+        Err(())
+    }
+}
+
+fn startup_lock_path(config: &BridgeConfig) -> PathBuf {
+    if let Some(app_dir) = &config.app_dir {
+        return app_dir
+            .join(".run")
+            .join(format!("mcp-start-{}.lock", config.endpoint.port));
+    }
+    let host = config
+        .endpoint
         .host
         .chars()
         .map(|character| {
@@ -938,7 +1331,7 @@ fn startup_lock_path(endpoint: &HttpEndpoint) -> PathBuf {
         .collect::<String>();
     env::temp_dir().join(format!(
         "codex-image-grid-native-mcp-{host}-{}.lock",
-        endpoint.port
+        config.endpoint.port
     ))
 }
 
@@ -1186,6 +1579,15 @@ fn first_nonempty_env(names: &[&str]) -> Option<String> {
         .find(|value| !value.trim().is_empty())
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
 fn bounded_env_duration(name: &str, fallback: u64, minimum: u64, maximum: u64) -> Duration {
     let value = env::var(name)
         .ok()
@@ -1302,15 +1704,11 @@ fn validate_tool_arguments(arguments: &Value) -> Result<(), String> {
     {
         return Err("referencePremise must be a string".to_owned());
     }
-
-    if let Some(reference_path) = arguments.get("referenceImagePath") {
-        let reference_path = reference_path
-            .as_str()
-            .ok_or_else(|| "referenceImagePath must be a string".to_owned())?;
-        if !reference_path.is_empty() {
-            validate_reference_image(Path::new(reference_path))
-                .map_err(|error| error.to_string())?;
-        }
+    if arguments
+        .get("referenceImagePath")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err("referenceImagePath must be a string".to_owned());
     }
 
     Ok(())
@@ -1659,12 +2057,119 @@ mod tests {
             Err("waitMs must be an integer between 0 and 120000".to_owned())
         );
         assert_eq!(
-            validate_tool_arguments(&json!({
+            prepare_tool_arguments(&json!({
                 "prompts": ["valid"],
                 "referenceImagePath": "relative.png"
-            })),
-            Err("referenceImagePath must be an absolute local file path".to_owned())
+            }))
+            .expect_err("relative reference path must fail"),
+            "referenceImagePath must be an absolute local file path"
         );
+    }
+
+    #[test]
+    fn installed_route_strict_app_dir_rejects_stale_or_foreign_health_metadata() {
+        let directory = TestDirectory::new("strict-health");
+        let expected_root = directory
+            .path
+            .join("plugins")
+            .join("codex-image-grid-native");
+        fs::create_dir_all(&expected_root).expect("strict source root");
+        let expected_root = fs::canonicalize(expected_root).expect("canonical strict source root");
+        let mut health = json!({
+            "ok": true,
+            "app": EXPECTED_APP_IDENTITY,
+            "serverRoot": expected_root,
+            "packageName": EXPECTED_APP_IDENTITY,
+            "packageVersion": "0.0.0-stale",
+            "packageRootKind": "source"
+        });
+
+        validate_health_payload(&health, Some(&expected_root), false)
+            .expect("non-strict metadata remains compatible");
+        assert_eq!(
+            validate_health_payload(&health, Some(&expected_root), true),
+            Err(format!(
+                "IMAGE_GRID_STRICT_APP_DIR=1 rejected server packageVersion=0.0.0-stale; expected {}. Restart the stale runtime.",
+                env!("CARGO_PKG_VERSION")
+            ))
+        );
+
+        health["packageVersion"] = Value::String(env!("CARGO_PKG_VERSION").to_owned());
+        health["packageRootKind"] = Value::String("cache".to_owned());
+        assert_eq!(
+            validate_health_payload(&health, Some(&expected_root), true),
+            Err(
+                "IMAGE_GRID_STRICT_APP_DIR=1 rejected server packageRootKind=cache; expected source."
+                    .to_owned()
+            )
+        );
+
+        health["packageRootKind"] = Value::String("source".to_owned());
+        health["packageName"] = Value::String("foreign-image-grid".to_owned());
+        assert_eq!(
+            validate_health_payload(&health, Some(&expected_root), true),
+            Err(format!(
+                "IMAGE_GRID_STRICT_APP_DIR=1 rejected server packageName=foreign-image-grid; expected {EXPECTED_APP_IDENTITY}."
+            ))
+        );
+
+        let foreign_root = directory.path.join("foreign-root");
+        fs::create_dir_all(&foreign_root).expect("foreign root");
+        health["packageName"] = Value::String(EXPECTED_APP_IDENTITY.to_owned());
+        health["serverRoot"] = Value::String(foreign_root.to_string_lossy().into_owned());
+        assert!(
+            validate_health_payload(&health, Some(&expected_root), true)
+                .expect_err("strict root mismatch")
+                .starts_with("IMAGE_GRID_STRICT_APP_DIR=1 rejected Image Grid server:")
+        );
+    }
+
+    #[test]
+    fn installed_route_stale_startup_lock_is_reclaimed_but_live_owner_is_preserved() {
+        let directory = TestDirectory::new("startup-lock");
+        let lock_path = directory.path.join(".run").join("mcp-start-4322.lock");
+
+        fs::create_dir_all(&lock_path).expect("expired ownerless lock");
+        let ownerless = StartupLock::acquire(&lock_path, Duration::ZERO, "http://127.0.0.1:4322")
+            .expect("reclaim expired ownerless lock")
+            .expect("own reclaimed ownerless lock");
+        drop(ownerless);
+        assert!(!lock_path.exists());
+
+        fs::create_dir_all(&lock_path).expect("dead-owner lock");
+        fs::write(
+            lock_path.join("owner.json"),
+            serde_json::to_vec(&json!({
+                "pid": i32::MAX as u32,
+                "processStartedAt": "dead process",
+                "token": "dead-owner"
+            }))
+            .expect("dead owner JSON"),
+        )
+        .expect("dead owner metadata");
+        let dead_owner = StartupLock::acquire(&lock_path, Duration::ZERO, "http://127.0.0.1:4322")
+            .expect("reclaim dead-owner lock")
+            .expect("own reclaimed dead-owner lock");
+        drop(dead_owner);
+        assert!(!lock_path.exists());
+
+        fs::create_dir_all(&lock_path).expect("live-owner lock");
+        fs::write(
+            lock_path.join("owner.json"),
+            serde_json::to_vec(&json!({
+                "pid": std::process::id(),
+                "processStartedAt": running_process_identity(std::process::id()).ok().flatten(),
+                "token": "live-other-owner"
+            }))
+            .expect("live owner JSON"),
+        )
+        .expect("live owner metadata");
+        assert!(
+            StartupLock::acquire(&lock_path, Duration::ZERO, "http://127.0.0.1:4322")
+                .expect("inspect live-owner lock")
+                .is_none()
+        );
+        assert!(lock_path.exists(), "live other-owner lock must remain");
     }
 
     #[test]
@@ -1714,7 +2219,38 @@ skipped PATH=(none): PATH is unavailable."
     }
 
     #[test]
-    fn valid_call_uses_native_health_preflight_and_path_staging_contract() {
+    fn invalid_reference_is_rejected_before_native_launch() {
+        let directory = TestDirectory::new("invalid-reference");
+        let root = fs::canonicalize(&directory.path).expect("canonical root");
+        let missing_reference = root.join("missing.PNG");
+        let config = test_config(
+            "http://127.0.0.1:9",
+            Some(root.clone()),
+            Some(LaunchPlan {
+                label: "must not launch".to_owned(),
+                program: root.join("missing-native-server"),
+                arguments: Vec::new(),
+                cwd: Some(root),
+                environment: Vec::new(),
+            }),
+        );
+        let input = json!({
+            "prompts": ["project visual"],
+            "referenceImagePath": missing_reference
+        });
+
+        let error = call_generate_image_grid_with_config(&input, &config)
+            .expect_err("missing reference must fail before startup");
+
+        assert!(error.starts_with(&format!(
+            "referenceImagePath is unavailable: {} (",
+            missing_reference.display()
+        )));
+        assert!(!error.contains("must not launch"));
+    }
+
+    #[test]
+    fn valid_call_sends_frozen_inline_reference_payload() {
         let directory = TestDirectory::new("running");
         let root = fs::canonicalize(&directory.path).expect("canonical root");
         let reference_path = root.join("reference.png");
@@ -1731,11 +2267,9 @@ skipped PATH=(none): PATH is unavailable."
             "referenceImagePath": reference_path,
             "waitMs": 250
         });
-        validate_tool_arguments(&input).expect("valid input");
 
-        let result =
-            call_generate_image_grid_with_config(&normalize_tool_arguments(&input), &config)
-                .expect("native generation response");
+        let result = call_generate_image_grid_with_config(&input, &config)
+            .expect("native generation response");
         let requests = fake.finish();
 
         assert_eq!(
@@ -1751,10 +2285,14 @@ skipped PATH=(none): PATH is unavailable."
         );
         let run_body = &requests[2].body;
         assert_eq!(
-            run_body["referenceImagePath"],
-            reference_path.to_string_lossy().as_ref()
+            run_body["referenceImage"],
+            json!({
+                "dataUrl": "data:image/png;base64,cHJvdmlkZXItZnJlZS1yZWZlcmVuY2U=",
+                "mimeType": "image/png",
+                "name": "reference.png"
+            })
         );
-        assert!(run_body.get("referenceImage").is_none());
+        assert!(run_body.get("referenceImagePath").is_none());
         assert_eq!(run_body["count"], 1);
         assert_eq!(run_body["waitMs"], 250);
 
@@ -1829,11 +2367,8 @@ skipped PATH=(none): PATH is unavailable."
             "engine": "codex-svg",
             "waitMs": 0
         });
-        validate_tool_arguments(&input).expect("valid launch input");
-
-        let result =
-            call_generate_image_grid_with_config(&normalize_tool_arguments(&input), &config)
-                .expect("auto-launched generation response");
+        let result = call_generate_image_grid_with_config(&input, &config)
+            .expect("auto-launched generation response");
 
         assert_eq!(result["isError"], false);
         assert_eq!(result["structuredContent"]["serverStarted"], true);
@@ -1871,6 +2406,7 @@ skipped PATH=(none): PATH is unavailable."
             endpoint: HttpEndpoint::parse(url).expect("test endpoint"),
             image_grid_url: url.to_owned(),
             app_dir,
+            strict_app_dir: false,
             launch_plan,
             launch_timeout: Duration::from_secs(2),
             health_timeout: Duration::from_millis(500),
