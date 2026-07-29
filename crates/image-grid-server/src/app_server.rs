@@ -1114,7 +1114,7 @@ mod tests {
              marker=\"{}\"\n\
              trap 'printf TERM > \"$marker\"; exit 0' TERM\n\
              printf READY > \"$marker\"\n\
-             while :; do :; done",
+             while IFS= read -r _line; do :; done",
             display_path(&marker)
         )
         .expect("fake source");
