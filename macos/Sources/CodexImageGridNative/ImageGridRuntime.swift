@@ -762,7 +762,6 @@ final class ImageGridStore: ObservableObject {
     private let activeRunReconciliationInterval: Duration
     private var activeRunReconciliationTask: Task<Void, Never>?
     private var activeRunReconciliationToken: UUID?
-    private var clearedBefore: Int64 = 0
     private var clearedJobIDs: Set<String> = []
     private var retainedCompletedLimit: Int? = ImageGridJobSelection.maximumCompletedJobs
     private var deletionWorkspaceActive = false
@@ -948,25 +947,6 @@ final class ImageGridStore: ObservableObject {
         )
     }
 
-    var hasTerminalJobs: Bool {
-        jobs.values.contains { !$0.isActive }
-    }
-
-    func clearTerminalJobs() {
-        clearedBefore = Int64(Date().timeIntervalSince1970 * 1_000)
-        let terminal = jobs.values.filter { !$0.isActive }
-        let terminalIDs = Set(terminal.map(\.id))
-        for job in terminal {
-            clearedJobIDs.insert(job.id)
-            jobs.removeValue(forKey: job.id)
-        }
-        failureNoticeTracker.removeJobs(withIDs: terminalIDs)
-        synchronizeFailureNoticeCount()
-        if clearedJobIDs.count > 512 {
-            clearedJobIDs = Set(clearedJobIDs.suffix(512))
-        }
-    }
-
     func acknowledgeFailureNotice() {
         failureNoticeTracker.acknowledgeFailures()
         synchronizeFailureNoticeCount()
@@ -1091,9 +1071,6 @@ final class ImageGridStore: ObservableObject {
             let existing = mergedJobs[job.id]
             if !job.isActive, existing?.isActive != true {
                 if clearedJobIDs.contains(job.id) {
-                    continue
-                }
-                if clearedBefore > 0, job.eventTime > 0, job.eventTime <= clearedBefore {
                     continue
                 }
             }
