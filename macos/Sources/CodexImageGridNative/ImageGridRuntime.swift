@@ -606,17 +606,32 @@ final class ImageGridStore: ObservableObject {
     private var clearedBefore: Int64 = 0
     private var clearedJobIDs: Set<String> = []
     private var retainedCompletedLimit: Int? = ImageGridJobSelection.maximumCompletedJobs
+    private var connectivityMessage: String?
 
     init(client: ImageGridAPIClient = ImageGridAPIClient()) {
         self.client = client
+    }
+
+    func synchronize(with nativeState: NativeRuntimeLifecycleState) {
+        switch nativeState {
+        case .idle:
+            stop()
+            runtimeState = .disconnected
+        case .checking, .launching:
+            runtimeState = .starting
+        case .ready:
+            start()
+        case let .failed(message):
+            stop()
+            runtimeState = .disconnected
+            recordConnectivityFailure(message)
+        }
     }
 
     func start() {
         guard lifecycleTask == nil else { return }
         lifecycleTask = Task { [weak self] in
             guard let self else { return }
-            await refreshHealth()
-            await hydrateRuns()
             await consumeEventsWithBoundedRecovery()
             lifecycleTask = nil
         }
@@ -633,9 +648,10 @@ final class ImageGridStore: ObservableObject {
             let health = try await client.health()
             runtimeState = health.state
             generatedDirectory = health.generatedDirectory
+            clearConnectivityFailure()
         } catch {
             runtimeState = .disconnected
-            generationMessage = error.localizedDescription
+            recordConnectivityFailure(error.localizedDescription)
         }
     }
 
@@ -764,6 +780,7 @@ final class ImageGridStore: ObservableObject {
         var failures = 0
         while !Task.isCancelled, failures < 5 {
             do {
+                try await connectAndHydrate()
                 try await client.consumeEvents { [weak self] event in
                     await self?.receive(event)
                 }
@@ -772,6 +789,7 @@ final class ImageGridStore: ObservableObject {
             } catch {
                 failures += 1
                 runtimeState = .disconnected
+                recordConnectivityFailure(error.localizedDescription)
                 if failures < 5 {
                     let delay = Double(min(16, 1 << (failures - 1)))
                     try? await Task.sleep(for: .seconds(delay))
@@ -779,11 +797,30 @@ final class ImageGridStore: ObservableObject {
             }
         }
         if !Task.isCancelled {
-            generationMessage = "Live result updates disconnected. Generate again to retry."
+            recordConnectivityFailure(
+                "Live result updates disconnected. Generate again to retry."
+            )
         }
     }
 
+    private func connectAndHydrate() async throws {
+        let health = try await client.health()
+        let runs = try await client.runs()
+        runtimeState = health.state
+        generatedDirectory = health.generatedDirectory
+        for run in runs {
+            merge(run.hydratedJobs)
+        }
+        clearConnectivityFailure()
+    }
+
     private func receive(_ event: ImageGridSSEEvent) {
+        if case .ready = runtimeState {
+            // Preserve App Server readiness while the live stream is healthy.
+        } else {
+            runtimeState = .idle
+        }
+        clearConnectivityFailure()
         let decoder = JSONDecoder()
         switch event.name {
         case "snapshot":
@@ -801,6 +838,18 @@ final class ImageGridStore: ObservableObject {
         default:
             break
         }
+    }
+
+    private func recordConnectivityFailure(_ message: String) {
+        connectivityMessage = message
+        generationMessage = message
+    }
+
+    private func clearConnectivityFailure() {
+        if generationMessage == connectivityMessage {
+            generationMessage = nil
+        }
+        connectivityMessage = nil
     }
 
     private func merge(_ incoming: [ImageGridJob]) {
