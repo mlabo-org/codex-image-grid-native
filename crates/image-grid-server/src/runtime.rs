@@ -1,4 +1,4 @@
-use crate::app_server::AppServerBridge;
+use crate::app_server::{AppServerBridge, RUNTIME_CLOSED_MESSAGE};
 use crate::{RuntimeConfig, RuntimeIdentity, SchedulerSnapshot};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -12,12 +12,13 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use tokio::fs;
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore, broadcast};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, broadcast, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout_at};
 use uuid::Uuid;
 
@@ -408,6 +409,12 @@ struct RuntimeInner {
     recovery: RecoveryConfig,
     attempts: RwLock<HashMap<String, AttemptState>>,
     rate_limit_cooldown_until: Mutex<Instant>,
+    admission_gate: RwLock<()>,
+    accepting: AtomicBool,
+    shutdown_complete: AtomicBool,
+    shutdown_gate: Mutex<()>,
+    shutdown_signal: watch::Sender<bool>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -427,6 +434,7 @@ impl GenerationRuntime {
     ) -> Self {
         let restored = restore_persisted_runtime(&config);
         let (events, _) = broadcast::channel(1024);
+        let (shutdown_signal, _) = watch::channel(false);
         let runtime = Self {
             inner: Arc::new(RuntimeInner {
                 config,
@@ -441,6 +449,12 @@ impl GenerationRuntime {
                 recovery,
                 attempts: RwLock::new(HashMap::new()),
                 rate_limit_cooldown_until: Mutex::new(Instant::now()),
+                admission_gate: RwLock::new(()),
+                accepting: AtomicBool::new(true),
+                shutdown_complete: AtomicBool::new(false),
+                shutdown_gate: Mutex::new(()),
+                shutdown_signal,
+                tasks: Mutex::new(Vec::new()),
             }),
         };
         runtime.persist_normalized_restorations(restored.normalized_run_ids);
@@ -487,6 +501,14 @@ impl GenerationRuntime {
         self.inner.events.subscribe()
     }
 
+    pub(crate) fn shutdown_receiver(&self) -> watch::Receiver<bool> {
+        self.inner.shutdown_signal.subscribe()
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        !self.inner.accepting.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn snapshot(&self) -> Vec<ImageGridJob> {
         let mut jobs = self
             .inner
@@ -526,6 +548,13 @@ impl GenerationRuntime {
         require_prompts_array: bool,
         query_wait_ms: Option<&str>,
     ) -> Result<(bool, Value), RunApiError> {
+        if self.is_closed() {
+            return Err(runtime_closed_api_error());
+        }
+        let admission = self.inner.admission_gate.read().await;
+        if self.is_closed() {
+            return Err(runtime_closed_api_error());
+        }
         let request = normalize_request(body, require_prompts_array, query_wait_ms)?;
         let run_id = Uuid::new_v4().to_string()[..8].to_owned();
         let run_directory = self.inner.config.generated_dir.join(&run_id);
@@ -683,28 +712,30 @@ impl GenerationRuntime {
             }
             let runtime = self.clone();
             let job_id = job.id.clone();
-            tokio::spawn(async move {
-                let permit = if is_svg {
-                    runtime.inner.svg_slots.clone().acquire_owned().await
-                } else {
-                    runtime.inner.image_slots.clone().acquire_owned().await
+            let mut shutdown = runtime.shutdown_receiver();
+            let handle = tokio::spawn(async move {
+                let permit = tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown) => None,
+                    permit = async {
+                        if is_svg {
+                            runtime.inner.svg_slots.clone().acquire_owned().await
+                        } else {
+                            runtime.inner.image_slots.clone().acquire_owned().await
+                        }
+                    } => permit.ok(),
                 };
                 if !is_svg {
                     runtime.inner.queued_jobs.fetch_sub(1, Ordering::Relaxed);
                 }
-                let Ok(_permit) = permit else {
-                    runtime
-                        .fail_job(
-                            &job_id,
-                            "RuntimeClosed",
-                            "image scheduler closed before the job started",
-                        )
-                        .await;
+                let Some(_permit) = permit else {
                     return;
                 };
                 runtime.run_job(&job_id).await;
             });
+            self.inner.tasks.lock().await.push(handle);
         }
+        drop(admission);
 
         if request.wait_ms > 0 {
             self.wait_for_run(&run_id, request.wait_ms).await;
@@ -930,6 +961,7 @@ impl GenerationRuntime {
     }
 
     async fn run_job(&self, job_id: &str) {
+        let _operation = self.inner.app_server.bind_operation();
         let Some(job) = self.job(job_id).await else {
             return;
         };
@@ -943,7 +975,9 @@ impl GenerationRuntime {
     async fn run_app_server_image_job_with_retries(&self, job_id: &str) {
         let recovery = self.inner.recovery;
         for attempt_index in 0..=recovery.max_retries {
-            self.wait_for_rate_limit_cooldown(job_id).await;
+            if !self.wait_for_rate_limit_cooldown(job_id).await {
+                return;
+            }
             if attempt_index > 0
                 && let Some(job) = self.job(job_id).await
             {
@@ -954,12 +988,19 @@ impl GenerationRuntime {
                 return;
             };
             let deadline = Instant::now() + recovery.job_timeout;
-            let outcome = match timeout_at(
-                deadline,
-                self.run_app_server_image_attempt(job_id, &attempt_id),
-            )
-            .await
-            {
+            let mut shutdown = self.shutdown_receiver();
+            let timed_outcome = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => {
+                    self.retire_attempt(job_id, &attempt_id).await;
+                    return;
+                }
+                outcome = timeout_at(
+                    deadline,
+                    self.run_app_server_image_attempt(job_id, &attempt_id),
+                ) => outcome,
+            };
+            let outcome = match timed_outcome {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     self.interrupt_timed_out_attempt(job_id, &attempt_id).await;
@@ -1138,8 +1179,14 @@ impl GenerationRuntime {
             .await;
         }
 
+        let mut shutdown = self.shutdown_receiver();
         loop {
-            let message = match notifications.recv().await {
+            let received = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => return AttemptOutcome::Failed,
+                received = notifications.recv() => received,
+            };
+            let message = match received {
                 Ok(message) => message,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => {
@@ -1269,6 +1316,25 @@ impl GenerationRuntime {
                     }
                     return AttemptOutcome::Failed;
                 }
+                "server-status"
+                    if matches!(
+                        message["params"]["status"].as_str(),
+                        Some("error" | "stopped")
+                    ) =>
+                {
+                    let status_message = message["params"]["message"]
+                        .as_str()
+                        .unwrap_or("Codex App Server stopped");
+                    self.record_attempt_failure(
+                        job_id,
+                        attempt_id,
+                        "AppServerClosed",
+                        status_message,
+                        None,
+                    )
+                    .await;
+                    return AttemptOutcome::Failed;
+                }
                 _ => {}
             }
         }
@@ -1387,8 +1453,14 @@ impl GenerationRuntime {
         }
 
         let deadline = Instant::now() + APP_SERVER_JOB_TIMEOUT;
+        let mut shutdown = self.shutdown_receiver();
         loop {
-            let message = match timeout_at(deadline, notifications.recv()).await {
+            let received = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => return,
+                received = timeout_at(deadline, notifications.recv()) => received,
+            };
+            let message = match received {
                 Ok(Ok(message)) => message,
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
                 Ok(Err(broadcast::error::RecvError::Closed)) => {
@@ -1480,6 +1552,22 @@ impl GenerationRuntime {
                 "turn/completed" => {
                     self.complete_svg_job(job_id, &message["params"]["turn"])
                         .await;
+                    return;
+                }
+                "server-status"
+                    if matches!(
+                        message["params"]["status"].as_str(),
+                        Some("error" | "stopped")
+                    ) =>
+                {
+                    self.fail_job(
+                        job_id,
+                        "AppServerClosed",
+                        message["params"]["message"]
+                            .as_str()
+                            .unwrap_or("Codex App Server stopped"),
+                    )
+                    .await;
                     return;
                 }
                 _ => {}
@@ -1752,10 +1840,14 @@ impl GenerationRuntime {
             })
     }
 
-    async fn wait_for_rate_limit_cooldown(&self, job_id: &str) {
+    async fn wait_for_rate_limit_cooldown(&self, job_id: &str) -> bool {
         let started = Instant::now();
         let mut waited = false;
+        let mut shutdown = self.shutdown_receiver();
         loop {
+            if *shutdown.borrow() {
+                return false;
+            }
             let deadline = *self.inner.rate_limit_cooldown_until.lock().await;
             let now = Instant::now();
             if deadline <= now {
@@ -1771,7 +1863,11 @@ impl GenerationRuntime {
                 );
             })
             .await;
-            sleep(remaining).await;
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => return false,
+                _ = sleep(remaining) => {}
+            }
         }
         if waited {
             let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
@@ -1780,6 +1876,7 @@ impl GenerationRuntime {
             })
             .await;
         }
+        true
     }
 
     async fn start_rate_limit_cooldown(&self, job_id: &str, attempt: u32) {
@@ -1977,6 +2074,9 @@ impl GenerationRuntime {
     where
         F: FnOnce(&mut ImageGridJob, i64),
     {
+        if self.is_closed() {
+            return;
+        }
         let (updated, run_id, terminal) = {
             let mut jobs = self.inner.jobs.write().await;
             let Some(job) = jobs.get_mut(job_id) else {
@@ -1988,7 +2088,7 @@ impl GenerationRuntime {
             (job.clone(), job.run_id.clone(), job.is_terminal())
         };
         self.emit("job", serde_json::to_value(&updated).unwrap_or(Value::Null));
-        let _ = self.write_artifacts(&run_id).await;
+        self.write_artifacts_or_emit(&run_id).await;
         if terminal && let Some(run) = self.inner.runs.read().await.get(&run_id) {
             run.notify.notify_waiters();
         }
@@ -2057,6 +2157,18 @@ impl GenerationRuntime {
         atomic_write(Path::new(&run.artifacts.handoff_path), handoff.as_bytes()).await
     }
 
+    async fn write_artifacts_or_emit(&self, run_id: &str) {
+        if let Err(error) = self.write_artifacts(run_id).await {
+            self.emit(
+                "server-log",
+                json!({
+                    "stream": "artifact",
+                    "text": error.error
+                }),
+            );
+        }
+    }
+
     async fn server_identity_value(&self) -> Value {
         let diagnostics = self.inner.app_server.diagnostics().await;
         serde_json::to_value(RuntimeIdentity::from_config(
@@ -2072,6 +2184,85 @@ impl GenerationRuntime {
             name: name.to_owned(),
             data,
         });
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.inner.accepting.store(false, Ordering::Release);
+        let _shutdown_guard = self.inner.shutdown_gate.lock().await;
+        if self.inner.shutdown_complete.load(Ordering::Acquire) {
+            return;
+        }
+
+        let _admission_guard = self.inner.admission_gate.write().await;
+        self.inner.image_slots.close();
+        self.inner.svg_slots.close();
+        let _ = self.inner.shutdown_signal.send(true);
+        self.inner.queued_jobs.store(0, Ordering::Release);
+        self.inner.attempts.write().await.clear();
+
+        let (closed_jobs, affected_runs) = {
+            let mut jobs = self.inner.jobs.write().await;
+            let mut closed_jobs = Vec::new();
+            let mut affected_runs = HashSet::new();
+            for job in jobs.values_mut().filter(|job| job.is_active()) {
+                let now = now_millis();
+                job.status = "error".to_owned();
+                job.status_text = "Runtime stopped before generation completed".to_owned();
+                job.error_code
+                    .get_or_insert_with(|| "RuntimeClosed".to_owned());
+                job.error_message
+                    .get_or_insert_with(|| RUNTIME_CLOSED_MESSAGE.to_owned());
+                job.image_url = None;
+                append_job_diagnostic(job, format!("RuntimeClosed: {RUNTIME_CLOSED_MESSAGE}"));
+                job.timing.transition("error", now);
+                job.updated_at = now;
+                affected_runs.insert(job.run_id.clone());
+                closed_jobs.push(job.clone());
+            }
+            (closed_jobs, affected_runs.into_iter().collect::<Vec<_>>())
+        };
+        for job in closed_jobs {
+            self.emit("job", serde_json::to_value(&job).unwrap_or(Value::Null));
+            if let Some(run) = self.inner.runs.read().await.get(&job.run_id) {
+                run.notify.notify_waiters();
+            }
+        }
+        for run_id in &affected_runs {
+            self.write_artifacts_or_emit(run_id).await;
+        }
+
+        self.inner.app_server.shutdown().await;
+        loop {
+            let handles = {
+                let mut tasks = self.inner.tasks.lock().await;
+                std::mem::take(&mut *tasks)
+            };
+            if handles.is_empty() {
+                break;
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+        }
+        for run_id in &affected_runs {
+            self.write_artifacts_or_emit(run_id).await;
+        }
+        self.inner.shutdown_complete.store(true, Ordering::Release);
+    }
+}
+
+fn runtime_closed_api_error() -> RunApiError {
+    RunApiError::new(RUNTIME_CLOSED_MESSAGE, "RuntimeClosed")
+}
+
+async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
+        }
     }
 }
 
@@ -3922,6 +4113,284 @@ done
         );
         assert!(requests.contains("\"method\":\"turn/interrupt\""));
         assert_eq!(runtime.scheduler_snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_contract_closes_active_queued_cooldown_rpc_writes_and_artifacts_once() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let request_log = temporary.path().join("shutdown-requests.jsonl");
+        let script = r#"#!/bin/sh
+test "$1" = "app-server" || exit 2
+request_log="__REQUEST_LOG__"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$request_log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"shutdown-thread"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      ;;
+  esac
+done
+"#
+        .replace("__REQUEST_LOG__", &display_path(&request_log));
+        let (runtime, _) = provider_free_runtime(
+            &temporary,
+            &script,
+            RecoveryConfig {
+                max_retries: 1,
+                retry_base: Duration::from_secs(10),
+                rate_limit_cooldown: Duration::from_secs(10),
+                rate_limit_cooldown_max: Duration::from_secs(10),
+                job_timeout: Duration::from_secs(30),
+            },
+        );
+
+        let (_, first_response) = runtime
+            .create_run(
+                &json!({
+                    "prompts": ["active pending RPC"],
+                    "count": 1,
+                    "waitMs": 0
+                }),
+                true,
+                None,
+            )
+            .await
+            .expect("first run");
+        let first_run_id = first_response["runId"].as_str().expect("first run id");
+        let first_job_id = first_response["outputs"][0]["id"]
+            .as_str()
+            .expect("first job id")
+            .to_owned();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .job(&first_job_id)
+                    .await
+                    .is_some_and(|job| job.status == "running")
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("active pending RPC");
+        let client = runtime
+            .inner
+            .app_server
+            .current_client()
+            .await
+            .expect("owned App Server child");
+        assert!(client.is_running().await);
+
+        *runtime.inner.rate_limit_cooldown_until.lock().await =
+            Instant::now() + Duration::from_secs(10);
+        let (_, queued_response) = runtime
+            .create_run(
+                &json!({
+                    "prompts": ["queued in cooldown"],
+                    "count": 1,
+                    "waitMs": 0
+                }),
+                true,
+                None,
+            )
+            .await
+            .expect("queued run");
+        let queued_run_id = queued_response["runId"]
+            .as_str()
+            .expect("queued run id")
+            .to_owned();
+        let queued_job_id = queued_response["outputs"][0]["id"]
+            .as_str()
+            .expect("queued job id")
+            .to_owned();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime
+                    .job(&queued_job_id)
+                    .await
+                    .is_some_and(|job| job.status_text.contains("rate-limit cooldown"))
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("job entered cooldown");
+
+        let attempt_id = runtime
+            .inner
+            .attempts
+            .read()
+            .await
+            .get(&first_job_id)
+            .expect("active attempt")
+            .id
+            .clone();
+        let artifact_gate = runtime.inner.clone();
+        let (writer_ready, writer_started) = tokio::sync::oneshot::channel();
+        let pending_writer = tokio::spawn(async move {
+            let _guard = artifact_gate.artifact_write.lock().await;
+            let _ = writer_ready.send(());
+            sleep(Duration::from_millis(30)).await;
+        });
+        writer_started.await.expect("pending artifact writer ready");
+
+        let late_runtime = runtime.clone();
+        let late_job_id = first_job_id.clone();
+        let late_write = tokio::spawn(async move {
+            let mut shutdown = late_runtime.shutdown_receiver();
+            wait_for_shutdown(&mut shutdown).await;
+            late_runtime
+                .write_job_image(
+                    &late_job_id,
+                    &attempt_id,
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                )
+                .await
+                .expect("retired late write is ignored");
+        });
+
+        let started = Instant::now();
+        let left = runtime.clone();
+        let right = runtime.clone();
+        tokio::join!(left.shutdown(), right.shutdown());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "shutdown must cancel the ten-second cooldown promptly"
+        );
+        pending_writer.await.expect("pending writer drained");
+        late_write.await.expect("late writer drained");
+
+        for (run_id, job_id) in [
+            (first_run_id.to_owned(), first_job_id),
+            (queued_run_id, queued_job_id),
+        ] {
+            let job = runtime.job(&job_id).await.expect("closed job");
+            assert_eq!(job.status, "error");
+            assert_eq!(
+                job.status_text,
+                "Runtime stopped before generation completed"
+            );
+            assert_eq!(job.error_code.as_deref(), Some("RuntimeClosed"));
+            assert_eq!(job.error_message.as_deref(), Some(RUNTIME_CLOSED_MESSAGE));
+            assert!(!Path::new(&job.output_path).exists());
+
+            let manifest_path = runtime
+                .inner
+                .config
+                .generated_dir
+                .join(run_id)
+                .join("manifest.json");
+            let manifest: Value =
+                serde_json::from_slice(&std_fs::read(&manifest_path).expect("final manifest"))
+                    .expect("manifest JSON");
+            assert_eq!(manifest["outputs"][0]["errorCode"], "RuntimeClosed");
+            assert!(
+                manifest["outputs"][0]["statusText"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Runtime stopped"))
+            );
+            let handoff = std_fs::read_to_string(
+                manifest_path
+                    .parent()
+                    .expect("run directory")
+                    .join("handoff.md"),
+            )
+            .expect("final handoff");
+            assert!(handoff.contains("RuntimeClosed"));
+        }
+        assert!(!client.is_running().await);
+        assert!(runtime.inner.app_server.current_client().await.is_none());
+        assert!(runtime.inner.attempts.read().await.is_empty());
+        assert_eq!(runtime.scheduler_snapshot().active, 0);
+        assert_eq!(runtime.scheduler_snapshot().queued, 0);
+
+        let requests = std_fs::read_to_string(request_log).expect("request log");
+        assert_eq!(requests.matches("\"method\":\"turn/start\"").count(), 1);
+        assert!(!requests.contains("\"method\":\"turn/interrupt\""));
+    }
+
+    #[tokio::test]
+    async fn shutdown_contract_artifact_update_failure_emits_one_exact_public_log() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (runtime, config) =
+            provider_free_runtime(&temporary, "#!/bin/sh\nexit 0\n", RecoveryConfig::default());
+        let run_id = "deadbeef";
+        let run_directory = config.generated_dir.join(run_id);
+        std_fs::create_dir_all(&run_directory).expect("run directory");
+        let now = now_millis();
+        let job = svg_fixture_job(run_id, &run_directory.join("variant-01.svg"), now);
+        let artifacts = run_artifacts(&config.generated_dir, run_id);
+        let request = RunRequestRecord {
+            prompts: vec![PromptRecord {
+                index: 1,
+                prompt: job.prompt.clone(),
+            }],
+            mood: job.mood.clone(),
+            engine: job.engine.clone(),
+            model: job.model.clone(),
+            aspect_ratio: job.aspect_ratio.clone(),
+            variants_per_prompt: job.total,
+            prompt_total: job.prompt_total,
+            reference_premise: job.reference_premise.clone(),
+            reference_image: None,
+        };
+        runtime
+            .inner
+            .jobs
+            .write()
+            .await
+            .insert(job.id.clone(), job.clone());
+        runtime.inner.runs.write().await.insert(
+            run_id.to_owned(),
+            RunRecord {
+                run_id: run_id.to_owned(),
+                job_ids: vec![job.id.clone()],
+                initial_jobs: vec![job.clone()],
+                request,
+                artifacts,
+                created_at: now,
+                notify: Arc::new(Notify::new()),
+            },
+        );
+        runtime
+            .write_artifacts(run_id)
+            .await
+            .expect("initial artifacts");
+
+        let preserved_directory = config.generated_dir.join("preserved-deadbeef");
+        std_fs::rename(&run_directory, &preserved_directory).expect("preserve run directory");
+        std_fs::write(&run_directory, b"blocks artifact directory").expect("blocking regular file");
+        let mut events = runtime.subscribe();
+        runtime
+            .update_job(&job.id, |job, _| {
+                job.status_text = "Terminal update".to_owned();
+            })
+            .await;
+
+        let mut artifact_logs = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event.name == "server-log" {
+                artifact_logs.push(event.data);
+            }
+        }
+        assert_eq!(artifact_logs.len(), 1);
+        assert_eq!(artifact_logs[0]["stream"], "artifact");
+        assert!(
+            artifact_logs[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("artifact directory"))
+        );
     }
 
     #[tokio::test]

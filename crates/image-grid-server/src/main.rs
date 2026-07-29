@@ -1,5 +1,5 @@
 use image_grid_core::DEFAULT_NATIVE_BIND;
-use image_grid_server::{RuntimeConfig, router};
+use image_grid_server::{RuntimeConfig, router_with_shutdown};
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
@@ -28,26 +28,72 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .workspace_dir
         .map(|path| canonical_directory(path, "workspace directory"))
         .transpose()?;
-    let config = RuntimeConfig::new(
-        server_root,
-        data_dir,
-        workspace_dir,
-        options.launch_target,
-    );
+    let config = RuntimeConfig::new(server_root, data_dir, workspace_dir, options.launch_target);
     config.prepare_directories()?;
 
     let listener = tokio::net::TcpListener::bind(options.bind).await?;
     let address = listener.local_addr()?;
     println!("listening: http://{address}");
 
-    axum::serve(listener, router(config))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let (app, shutdown) = router_with_shutdown(config);
+    let signal_shutdown = shutdown.clone();
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_signal().await;
+            signal_shutdown.shutdown().await;
+        })
+        .await;
+    shutdown.shutdown().await;
+    serve_result?;
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownSignal {
+    Sigint,
+    Sigterm,
+}
+
+async fn shutdown_signal() -> ShutdownSignal {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                return select_shutdown_signal(
+                    async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    },
+                    async {
+                        let _ = terminate.recv().await;
+                    },
+                )
+                .await;
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return ShutdownSignal::Sigint;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        ShutdownSignal::Sigint
+    }
+}
+
+async fn select_shutdown_signal<C, T>(ctrl_c: C, terminate: T) -> ShutdownSignal
+where
+    C: std::future::Future<Output = ()>,
+    T: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        _ = ctrl_c => ShutdownSignal::Sigint,
+        _ = terminate => ShutdownSignal::Sigterm,
+    }
 }
 
 struct Options {
@@ -107,10 +153,9 @@ impl Options {
                     )?));
                 }
                 "--launch-target" => {
-                    options.launch_target =
-                        next_value(&mut arguments, "--launch-target")?
-                            .to_string_lossy()
-                            .into_owned();
+                    options.launch_target = next_value(&mut arguments, "--launch-target")?
+                        .to_string_lossy()
+                        .into_owned();
                 }
                 "--help" | "-h" => options.help = true,
                 unknown => return Err(format!("unknown argument: {unknown}")),
@@ -178,4 +223,22 @@ fn print_help() {
            --workspace-root <PATH>     Workspace path reported by health\n\
            --launch-target <NAME>      Launch identity reported by health\n"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::{pending, ready};
+
+    #[tokio::test]
+    async fn shutdown_contract_maps_sigint_and_sigterm_to_the_same_runtime_boundary() {
+        assert_eq!(
+            select_shutdown_signal(ready(()), pending()).await,
+            ShutdownSignal::Sigint
+        );
+        assert_eq!(
+            select_shutdown_signal(pending(), ready(())).await,
+            ShutdownSignal::Sigterm
+        );
+    }
 }
