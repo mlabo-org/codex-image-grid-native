@@ -1,4 +1,5 @@
 import Combine
+import Darwin
 import Foundation
 
 enum NativeRuntimeOwnership: String, Equatable, Sendable {
@@ -409,19 +410,115 @@ enum NativeRuntimeHealthValidation {
     }
 }
 
+protocol NativeRuntimeProcessHandle: AnyObject, Sendable {
+    var processIdentifier: Int32 { get async }
+
+    func isRunning() async -> Bool
+    func terminationStatus() async -> Int32
+    func sendTerminate() async
+    func waitUntilExit() async
+    func forceKill(expectedProcessIdentifier: Int32) async
+}
+
+private actor FoundationNativeRuntimeProcess: NativeRuntimeProcessHandle {
+    private let process: Process
+    private let launchedProcessIdentifier: Int32
+
+    init(plan: NativeRuntimeLaunchPlan) throws {
+        let process = Process()
+        process.executableURL = plan.executableURL
+        process.arguments = plan.arguments
+        process.currentDirectoryURL = plan.currentDirectoryURL
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            throw NativeRuntimeResolutionError.invalidConfiguration(
+                "Could not launch Image Grid Native with \(plan.source.rawValue): "
+                    + error.localizedDescription
+            )
+        }
+        self.process = process
+        launchedProcessIdentifier = process.processIdentifier
+    }
+
+    var processIdentifier: Int32 {
+        launchedProcessIdentifier
+    }
+
+    func isRunning() -> Bool {
+        process.isRunning
+    }
+
+    func terminationStatus() -> Int32 {
+        process.terminationStatus
+    }
+
+    func sendTerminate() {
+        guard
+            process.isRunning,
+            process.processIdentifier == launchedProcessIdentifier
+        else {
+            return
+        }
+        process.terminate()
+    }
+
+    func waitUntilExit() async {
+        while process.isRunning {
+            guard !Task.isCancelled else { return }
+            do {
+                try await Task.sleep(for: .milliseconds(20))
+            } catch {
+                return
+            }
+        }
+    }
+
+    func forceKill(expectedProcessIdentifier: Int32) {
+        guard
+            expectedProcessIdentifier == launchedProcessIdentifier,
+            process.isRunning,
+            process.processIdentifier == launchedProcessIdentifier
+        else {
+            return
+        }
+        _ = Darwin.kill(launchedProcessIdentifier, SIGKILL)
+    }
+}
+
 @MainActor
 final class NativeRuntimeLifecycle: ObservableObject {
     static let healthURL = URL(string: "http://127.0.0.1:4322/api/health")!
     static let healthRequestTimeout: TimeInterval = 1
     static let readinessTimeout: TimeInterval = 15
+    static let shutdownGracePeriod = Duration.seconds(6)
 
     @Published private(set) var state = NativeRuntimeLifecycleState.idle
 
+    private let shutdownGracePeriod: Duration
     private var startupTask: Task<Void, Never>?
-    private var ownedProcess: Process?
+    private var shutdownTask: Task<Void, Never>?
+    private var ownedProcess: (any NativeRuntimeProcessHandle)?
+
+    init(
+        shutdownGracePeriod: Duration = NativeRuntimeLifecycle.shutdownGracePeriod,
+        initialProcess: (any NativeRuntimeProcessHandle)? = nil,
+        initialOwnership: NativeRuntimeOwnership? = nil
+    ) {
+        self.shutdownGracePeriod = shutdownGracePeriod
+        if let initialOwnership {
+            state = .ready(initialOwnership)
+            if initialOwnership == .launched {
+                ownedProcess = initialProcess
+            }
+        }
+    }
 
     func start() {
-        guard startupTask == nil else { return }
+        guard startupTask == nil, shutdownTask == nil else { return }
         state = .checking
         startupTask = Task { [weak self] in
             guard let self else { return }
@@ -430,11 +527,24 @@ final class NativeRuntimeLifecycle: ObservableObject {
         }
     }
 
-    func stop() {
-        startupTask?.cancel()
-        startupTask = nil
-        terminateOwnedProcess()
-        state = .idle
+    func stop() async {
+        let task: Task<Void, Never>
+        if let shutdownTask {
+            task = shutdownTask
+        } else {
+            let startupTask = self.startupTask
+            startupTask?.cancel()
+            let newTask = Task { @MainActor [weak self] in
+                await startupTask?.value
+                guard let self else { return }
+                self.startupTask = nil
+                await self.shutdownOwnedProcessIfPresent()
+                self.state = .idle
+            }
+            shutdownTask = newTask
+            task = newTask
+        }
+        await task.value
     }
 
     private func bootstrap() async {
@@ -459,9 +569,9 @@ final class NativeRuntimeLifecycle: ObservableObject {
             try await waitUntilReady(process: process, plan: plan)
             state = .ready(.launched)
         } catch is CancellationError {
-            terminateOwnedProcess()
+            return
         } catch {
-            terminateOwnedProcess()
+            await shutdownOwnedProcessIfPresent()
             state = .failed(error.localizedDescription)
         }
     }
@@ -511,36 +621,24 @@ final class NativeRuntimeLifecycle: ObservableObject {
         }
     }
 
-    private func launch(plan: NativeRuntimeLaunchPlan) throws -> Process {
-        let process = Process()
-        process.executableURL = plan.executableURL
-        process.arguments = plan.arguments
-        process.currentDirectoryURL = plan.currentDirectoryURL
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            return process
-        } catch {
-            throw NativeRuntimeResolutionError.invalidConfiguration(
-                "Could not launch Image Grid Native with \(plan.source.rawValue): "
-                    + error.localizedDescription
-            )
-        }
+    private func launch(
+        plan: NativeRuntimeLaunchPlan
+    ) throws -> any NativeRuntimeProcessHandle {
+        try FoundationNativeRuntimeProcess(plan: plan)
     }
 
     private func waitUntilReady(
-        process: Process,
+        process: any NativeRuntimeProcessHandle,
         plan: NativeRuntimeLaunchPlan
     ) async throws {
         let deadline = Date().addingTimeInterval(Self.readinessTimeout)
         while Date() < deadline {
             try Task.checkCancellation()
-            if !process.isRunning {
+            if !(await process.isRunning()) {
+                let terminationStatus = await process.terminationStatus()
                 throw NativeRuntimeResolutionError.invalidConfiguration(
                     "The native runtime exited before health became ready "
-                        + "(status \(process.terminationStatus))."
+                        + "(status \(terminationStatus))."
                 )
             }
             switch await probeHealth(
@@ -561,11 +659,61 @@ final class NativeRuntimeLifecycle: ObservableObject {
         )
     }
 
-    private func terminateOwnedProcess() {
+    private func shutdownOwnedProcessIfPresent() async {
         guard let process = ownedProcess else { return }
         ownedProcess = nil
-        if process.isRunning {
-            process.terminate()
+
+        guard await process.isRunning() else {
+            await process.waitUntilExit()
+            return
+        }
+
+        let processIdentifier = await process.processIdentifier
+        await process.sendTerminate()
+        if await processExitedWithinGracePeriod(process) {
+            return
+        }
+        await process.forceKill(expectedProcessIdentifier: processIdentifier)
+        await process.waitUntilExit()
+    }
+
+    private enum ShutdownRaceResult {
+        case exited
+        case timedOut
+        case cancelled
+    }
+
+    private func processExitedWithinGracePeriod(
+        _ process: any NativeRuntimeProcessHandle
+    ) async -> Bool {
+        let gracePeriod = shutdownGracePeriod
+        return await withTaskGroup(of: ShutdownRaceResult.self) { group in
+            group.addTask {
+                await process.waitUntilExit()
+                return Task.isCancelled ? .cancelled : .exited
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: gracePeriod)
+                    return .timedOut
+                } catch {
+                    return .cancelled
+                }
+            }
+
+            while let result = await group.next() {
+                switch result {
+                case .exited:
+                    group.cancelAll()
+                    return true
+                case .timedOut:
+                    group.cancelAll()
+                    return false
+                case .cancelled:
+                    continue
+                }
+            }
+            return false
         }
     }
 }
