@@ -75,6 +75,16 @@ enum ResultLimit: String, CaseIterable, Identifiable {
     }
 }
 
+private enum ReferenceInteractionState: Equatable {
+    case empty
+    case preparing
+    case ready
+    case analyzing
+    case analyzed
+    case preparationError(ImageGridReferencePreparationError)
+    case displayError(String)
+}
+
 struct ImageGridView: View {
     @Environment(\.appShellLanguage) private var language
     @AppStorage(AppShellPreferenceKeys.language) private var selectedLanguage =
@@ -94,6 +104,8 @@ struct ImageGridView: View {
     @State private var count = 1
     @State private var aspectRatio = AspectRatio.widescreen
     @State private var referenceImage: ImageGridReference?
+    @State private var referenceState = ReferenceInteractionState.empty
+    @State private var referenceLoadGeneration = 0
     @State private var formError: String?
 
     private var strings: ImageGridStrings {
@@ -127,6 +139,9 @@ struct ImageGridView: View {
                     await store.hydrateRuns()
                 }
             }
+        }
+        .onPasteCommand(of: [.fileURL, .png, .jpeg, .webP]) { providers in
+            pasteReference(providers: providers)
         }
     }
 
@@ -400,7 +415,17 @@ struct ImageGridView: View {
                 .appFont(.caption)
                 .foregroundStyle(.secondary)
 
-            ReferenceDropZone(url: referenceImage?.url, strings: strings)
+            Text(referenceStatusText)
+                .appFont(.caption, weight: .semibold)
+                .foregroundStyle(referenceStatusIsError ? Color.red : Color.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel(referenceStatusText)
+
+            ReferenceDropZone(
+                url: referenceImage?.url,
+                isProcessing: referenceState == .preparing,
+                strings: strings
+            )
                 .dropDestination(for: URL.self) { urls, _ in
                     guard let url = urls.first else {
                         return false
@@ -421,7 +446,7 @@ struct ImageGridView: View {
                 }
             }
 
-            if let message = formError ?? store.referenceAnalysisMessage ?? store.generationMessage {
+            if let message = formError ?? store.generationMessage {
                 Text(message)
                     .appFont(.caption)
                     .foregroundStyle(.red)
@@ -455,7 +480,7 @@ struct ImageGridView: View {
             Button(strings.analyze) {
                 analyzeReference()
             }
-            .disabled(referenceImage == nil || store.isAnalyzing)
+            .disabled(referenceImage == nil || referenceIsBusy)
 
             Button(strings.choose) {
                 if let url = NativeFilePicker.chooseImageURL() {
@@ -551,48 +576,164 @@ struct ImageGridView: View {
     private func analyzeReference() {
         guard let referenceImage else { return }
         formError = nil
+        referenceState = .analyzing
+        let analyzedURL = referenceImage.url
         Task {
             if let premise = await store.analyze(reference: referenceImage) {
+                guard self.referenceImage?.url == analyzedURL else { return }
                 referencePremise = premise
+                referenceState = .analyzed
+            } else if self.referenceImage?.url == analyzedURL {
+                referenceState = .displayError(
+                    store.referenceAnalysisMessage ?? strings.analysisFailed
+                )
             }
         }
     }
 
     private func pasteReference() {
         do {
-            guard let pasted = try NativeReferencePasteboard.reference() else {
+            guard let pasted = try NativeReferencePasteboard.candidate() else {
                 formError = strings.noPastedImage
                 return
             }
-            replaceReference(with: pasted)
+            beginReferencePreparation(pasted)
+        } catch let error as ImageGridReferencePreparationError {
+            referenceState = .preparationError(error)
         } catch {
-            formError = error.localizedDescription
+            referenceState = .preparationError(.preparationFailed)
+        }
+    }
+
+    private func pasteReference(providers: [NSItemProvider]) {
+        let generation = nextReferenceLoadGeneration()
+        referenceState = .preparing
+        Task {
+            do {
+                guard let candidate = try await NativeReferencePasteboard.candidate(
+                    from: providers
+                ) else {
+                    guard generation == referenceLoadGeneration else { return }
+                    referenceState = .displayError(strings.noPastedImage)
+                    return
+                }
+                prepareReference(candidate, generation: generation)
+            } catch let error as ImageGridReferencePreparationError {
+                guard generation == referenceLoadGeneration else { return }
+                referenceState = .preparationError(error)
+            } catch {
+                guard generation == referenceLoadGeneration else { return }
+                referenceState = .preparationError(.preparationFailed)
+            }
         }
     }
 
     private func selectReference(_ url: URL) -> Bool {
-        do {
-            replaceReference(with: try ImageGridReference.validate(url: url))
-            return true
-        } catch {
-            formError = error.localizedDescription
+        guard url.isFileURL,
+              ImageGridReference.supportedExtensions.contains(
+                  url.pathExtension.lowercased()
+              )
+        else {
+            referenceState = .preparationError(.unsupportedType)
             return false
         }
+        beginReferencePreparation(
+            ImageGridReferenceCandidate(url: url, ownsTemporaryFile: false)
+        )
+        return true
+    }
+
+    private func beginReferencePreparation(_ candidate: ImageGridReferenceCandidate) {
+        let generation = nextReferenceLoadGeneration()
+        referenceState = .preparing
+        prepareReference(candidate, generation: generation)
+    }
+
+    private func prepareReference(
+        _ candidate: ImageGridReferenceCandidate,
+        generation: Int
+    ) {
+        Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                do {
+                    return Result<ImageGridReference, ImageGridReferencePreparationError>.success(
+                        try ImageGridReference.prepare(candidate: candidate)
+                    )
+                } catch let error as ImageGridReferencePreparationError {
+                    return .failure(error)
+                } catch {
+                    return .failure(.preparationFailed)
+                }
+            }.value
+            guard generation == referenceLoadGeneration else {
+                if case let .success(staleReference) = result {
+                    staleReference.removeOwnedTemporaryFile()
+                }
+                return
+            }
+            switch result {
+            case let .success(next):
+                replaceReference(with: next)
+            case let .failure(error):
+                referenceState = .preparationError(error)
+            }
+        }
+    }
+
+    private func nextReferenceLoadGeneration() -> Int {
+        referenceLoadGeneration += 1
+        return referenceLoadGeneration
     }
 
     private func replaceReference(with next: ImageGridReference) {
         referenceImage?.removeOwnedTemporaryFile()
         referenceImage = next
+        referenceState = .ready
         store.referenceAnalysisMessage = nil
         formError = nil
     }
 
     private func clearReference() {
+        referenceLoadGeneration += 1
         referenceImage?.removeOwnedTemporaryFile()
         referenceImage = nil
+        referenceState = .empty
         referencePremise = ""
         store.referenceAnalysisMessage = nil
         formError = nil
+    }
+
+    private var referenceIsBusy: Bool {
+        referenceState == .preparing || referenceState == .analyzing
+    }
+
+    private var referenceStatusIsError: Bool {
+        if case .preparationError = referenceState {
+            return true
+        }
+        if case .displayError = referenceState {
+            return true
+        }
+        return false
+    }
+
+    private var referenceStatusText: String {
+        switch referenceState {
+        case .empty:
+            strings.referenceEmpty
+        case .preparing:
+            strings.referencePreparing
+        case .ready:
+            strings.referenceReady
+        case .analyzing:
+            strings.referenceAnalyzing
+        case .analyzed:
+            strings.referenceAnalyzed
+        case let .preparationError(error):
+            strings.referencePreparationError(error)
+        case let .displayError(message):
+            message
+        }
     }
 
     private var resultsPanel: some View {
@@ -778,11 +919,55 @@ struct ImageGridStrings {
             "The clipboard does not contain a PNG, JPEG, WebP image, or image file."
         )
     }
-    var analysisUnavailable: String {
+    var referenceEmpty: String {
         localized(
-            "参照画像の解析経路はまだ接続されていません。",
-            "Reference analysis is not connected yet."
+            "参照画像は選択されていません。",
+            "No reference image is selected."
         )
+    }
+    var referencePreparing: String {
+        localized("参照画像を準備しています...", "Preparing reference image...")
+    }
+    var referenceAnalyzing: String {
+        localized("参照画像を解析中...", "Analyzing reference image...")
+    }
+    var referenceAnalyzed: String {
+        localized("参照画像を解析しました。", "Reference image analyzed.")
+    }
+    var analysisFailed: String {
+        localized("参照画像を解析できませんでした。", "Reference analysis failed.")
+    }
+    var referenceReady: String {
+        localized("参照画像を追加しました。", "Reference image added.")
+    }
+    func referencePreparationError(_ error: ImageGridReferencePreparationError) -> String {
+        switch error {
+        case .unsupportedType:
+            localized(
+                "PNG、JPEG、WebP画像を選択してください。",
+                "Choose a PNG, JPEG, or WebP image."
+            )
+        case .tooLarge:
+            localized(
+                "参照画像は100MB以下にしてください。",
+                "The reference image must be 100 MB or smaller."
+            )
+        case .unsafeDimensions:
+            localized(
+                "参照画像の寸法が大きすぎるため、安全に処理できません。",
+                "The reference image dimensions are too large to process safely."
+            )
+        case .decodeFailed:
+            localized(
+                "参照画像を読み取れませんでした。",
+                "The reference image could not be decoded."
+            )
+        case .preparationFailed:
+            localized(
+                "参照画像を準備できませんでした。",
+                "The reference image could not be prepared."
+            )
+        }
     }
     var generationUnavailable: String {
         localized(
@@ -1001,6 +1186,7 @@ private struct PlaceholderTextEditor: View {
 
 private struct ReferenceDropZone: View {
     let url: URL?
+    let isProcessing: Bool
     let strings: ImageGridStrings
 
     var body: some View {
@@ -1034,6 +1220,17 @@ private struct ReferenceDropZone: View {
         }
         .aspectRatio(16 / 9, contentMode: .fit)
         .frame(minHeight: 210)
+        .overlay {
+            if isProcessing {
+                ZStack {
+                    Color(nsColor: .windowBackgroundColor).opacity(0.72)
+                    ProgressView()
+                        .controlSize(.large)
+                        .accessibilityLabel(strings.referencePreparing)
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+        }
     }
 }
 

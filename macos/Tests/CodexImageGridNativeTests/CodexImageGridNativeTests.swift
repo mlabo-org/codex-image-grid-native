@@ -101,3 +101,107 @@ import Foundation
     #expect(ImageGridReference.maximumBytes == 100 * 1_024 * 1_024)
     #expect(ImageGridReference.supportedExtensions == ["png", "jpg", "jpeg", "webp"])
 }
+
+@Test func referenceDimensionPolicyRejectsUnsafeImagesAndDownscales() throws {
+    #expect(throws: ImageGridReferencePreparationError.unsafeDimensions) {
+        try ImageGridReferencePolicy.preparedDimensions(width: 32_769, height: 1)
+    }
+    #expect(throws: ImageGridReferencePreparationError.unsafeDimensions) {
+        try ImageGridReferencePolicy.preparedDimensions(width: 6_000, height: 6_000)
+    }
+
+    let landscape = try ImageGridReferencePolicy.preparedDimensions(
+        width: 8_000,
+        height: 4_000
+    )
+    #expect(landscape == ImageGridReferenceDimensions(width: 4_096, height: 2_048))
+
+    let portrait = try ImageGridReferencePolicy.preparedDimensions(
+        width: 2_000,
+        height: 8_000
+    )
+    #expect(portrait == ImageGridReferenceDimensions(width: 1_024, height: 4_096))
+}
+
+@Test func malformedReferenceHeaderIsRejectedBeforePreparation() throws {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("invalid-reference-\(UUID().uuidString).png")
+    try Data([0x89, 0x50, 0x4e, 0x47]).write(to: url)
+    defer {
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    #expect(throws: ImageGridReferencePreparationError.decodeFailed) {
+        try ImageGridReference.prepare(url: url)
+    }
+}
+
+@Test func referencePreparationStatusesAndErrorsMatchFrozenCopy() {
+    let japanese = ImageGridStrings(language: .japanese)
+    let english = ImageGridStrings(language: .english)
+
+    #expect(japanese.referenceReady == "参照画像を追加しました。")
+    #expect(english.referenceReady == "Reference image added.")
+    #expect(japanese.referencePreparing == "参照画像を準備しています...")
+    #expect(english.referencePreparing == "Preparing reference image...")
+    #expect(japanese.referenceAnalyzing == "参照画像を解析中...")
+    #expect(english.referenceAnalyzing == "Analyzing reference image...")
+
+    #expect(
+        japanese.referencePreparationError(.unsupportedType)
+            == "PNG、JPEG、WebP画像を選択してください。"
+    )
+    #expect(
+        english.referencePreparationError(.unsupportedType)
+            == "Choose a PNG, JPEG, or WebP image."
+    )
+    #expect(
+        japanese.referencePreparationError(.tooLarge)
+            == "参照画像は100MB以下にしてください。"
+    )
+    #expect(
+        english.referencePreparationError(.tooLarge)
+            == "The reference image must be 100 MB or smaller."
+    )
+    #expect(
+        japanese.referencePreparationError(.unsafeDimensions)
+            == "参照画像の寸法が大きすぎるため、安全に処理できません。"
+    )
+    #expect(
+        english.referencePreparationError(.unsafeDimensions)
+            == "The reference image dimensions are too large to process safely."
+    )
+    #expect(
+        japanese.referencePreparationError(.decodeFailed)
+            == "参照画像を読み取れませんでした。"
+    )
+    #expect(
+        english.referencePreparationError(.decodeFailed)
+            == "The reference image could not be decoded."
+    )
+    #expect(
+        japanese.referencePreparationError(.preparationFailed)
+            == "参照画像を準備できませんでした。"
+    )
+    #expect(
+        english.referencePreparationError(.preparationFailed)
+            == "The reference image could not be prepared."
+    )
+}
+
+@Test func analysisRequestUsesNativePathAndCoversServerTimeout() throws {
+    let client = ImageGridAPIClient(
+        baseURL: URL(string: "http://127.0.0.1:4322")!
+    )
+    let request = try client.analysisRequest(referenceImagePath: "/tmp/reference.webp")
+    let body = try #require(request.httpBody)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+
+    #expect(request.httpMethod == "POST")
+    #expect(request.url?.path == "/api/analyze-reference")
+    #expect(request.timeoutInterval >= 180)
+    #expect(object["referenceImagePath"] as? String == "/tmp/reference.webp")
+    #expect(object["referenceImage"] == nil)
+}
