@@ -17,11 +17,15 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::fs;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore, broadcast};
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep, timeout_at};
 use uuid::Uuid;
 
 const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const APP_SERVER_JOB_TIMEOUT: Duration = Duration::from_secs(900);
+const APP_SERVER_IMAGE_MAX_RETRIES: u32 = 1;
+const APP_SERVER_IMAGE_RETRY_BASE: Duration = Duration::from_secs(4);
+const APP_SERVER_IMAGE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(45);
+const APP_SERVER_IMAGE_RATE_LIMIT_COOLDOWN_MAX: Duration = Duration::from_secs(180);
 const CODEX_SVG_CONCURRENCY: usize = 1;
 
 const MOODS: [&str; 5] = [
@@ -264,6 +268,48 @@ struct RunRecord {
     notify: Arc<Notify>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RecoveryConfig {
+    max_retries: u32,
+    retry_base: Duration,
+    rate_limit_cooldown: Duration,
+    rate_limit_cooldown_max: Duration,
+    job_timeout: Duration,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: APP_SERVER_IMAGE_MAX_RETRIES,
+            retry_base: APP_SERVER_IMAGE_RETRY_BASE,
+            rate_limit_cooldown: APP_SERVER_IMAGE_RATE_LIMIT_COOLDOWN,
+            rate_limit_cooldown_max: APP_SERVER_IMAGE_RATE_LIMIT_COOLDOWN_MAX,
+            job_timeout: APP_SERVER_JOB_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AttemptState {
+    id: String,
+    index: u32,
+    rate_limited: bool,
+    explicit_failure: bool,
+    missing_output_retryable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryReason {
+    RateLimit,
+    MissingOutput,
+}
+
+#[derive(Debug)]
+enum AttemptOutcome {
+    Success { upstream_status: String },
+    Failed,
+}
+
 struct RuntimeInner {
     config: Arc<RuntimeConfig>,
     app_server: AppServerBridge,
@@ -274,6 +320,9 @@ struct RuntimeInner {
     svg_slots: Arc<Semaphore>,
     queued_jobs: AtomicUsize,
     artifact_write: Mutex<()>,
+    recovery: RecoveryConfig,
+    attempts: RwLock<HashMap<String, AttemptState>>,
+    rate_limit_cooldown_until: Mutex<Instant>,
 }
 
 #[derive(Clone)]
@@ -283,6 +332,14 @@ pub(crate) struct GenerationRuntime {
 
 impl GenerationRuntime {
     pub(crate) fn new(config: Arc<RuntimeConfig>, app_server: AppServerBridge) -> Self {
+        Self::new_with_recovery_config(config, app_server, RecoveryConfig::default())
+    }
+
+    fn new_with_recovery_config(
+        config: Arc<RuntimeConfig>,
+        app_server: AppServerBridge,
+        recovery: RecoveryConfig,
+    ) -> Self {
         let (events, _) = broadcast::channel(1024);
         Self {
             inner: Arc::new(RuntimeInner {
@@ -295,6 +352,9 @@ impl GenerationRuntime {
                 svg_slots: Arc::new(Semaphore::new(CODEX_SVG_CONCURRENCY)),
                 queued_jobs: AtomicUsize::new(0),
                 artifact_write: Mutex::new(()),
+                recovery,
+                attempts: RwLock::new(HashMap::new()),
+                rate_limit_cooldown_until: Mutex::new(Instant::now()),
             }),
         }
     }
@@ -682,22 +742,92 @@ impl GenerationRuntime {
             self.run_codex_svg_job(job_id).await;
             return;
         }
-        self.update_job(job_id, |job, now| {
-            job.status = "starting".to_owned();
-            job.status_text = "Starting App Server image thread...".to_owned();
-            job.log = format!(
-                "image tool via codex app-server\naspect={}\nreference={}",
-                job.aspect_ratio,
-                if job.reference_image_path.is_some() {
-                    "attached"
-                } else {
-                    "none"
-                }
-            );
-            job.timing.transition("starting", now);
-        })
-        .await;
+        self.run_app_server_image_job_with_retries(job_id).await;
+    }
 
+    async fn run_app_server_image_job_with_retries(&self, job_id: &str) {
+        let recovery = self.inner.recovery;
+        for attempt_index in 0..=recovery.max_retries {
+            self.wait_for_rate_limit_cooldown(job_id).await;
+            if attempt_index > 0
+                && let Some(job) = self.job(job_id).await
+            {
+                let _ = fs::remove_file(&job.output_path).await;
+            }
+
+            let Some(attempt_id) = self.begin_attempt(job_id, attempt_index).await else {
+                return;
+            };
+            let deadline = Instant::now() + recovery.job_timeout;
+            let outcome = match timeout_at(
+                deadline,
+                self.run_app_server_image_attempt(job_id, &attempt_id),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    self.interrupt_timed_out_attempt(job_id, &attempt_id).await;
+                    self.record_attempt_failure(
+                        job_id,
+                        &attempt_id,
+                        "ImageGenerationTimeout",
+                        &format!(
+                            "Timed out waiting for app-server-image job completion after {}ms",
+                            recovery.job_timeout.as_millis()
+                        ),
+                        None,
+                    )
+                    .await;
+                    AttemptOutcome::Failed
+                }
+            };
+
+            if let AttemptOutcome::Success { upstream_status } = outcome {
+                self.finalize_attempt_success(job_id, &attempt_id, &upstream_status)
+                    .await;
+                self.retire_attempt(job_id, &attempt_id).await;
+                return;
+            }
+
+            let retry_reason = self.retry_reason(job_id, &attempt_id).await;
+            if retry_reason == Some(RetryReason::RateLimit) {
+                self.start_rate_limit_cooldown(job_id, attempt_index + 1)
+                    .await;
+            }
+            if let Some(reason) = retry_reason
+                && attempt_index < recovery.max_retries
+            {
+                self.finish_attempt_for_retry(job_id, &attempt_id).await;
+                self.retire_attempt(job_id, &attempt_id).await;
+                let reason_text = match reason {
+                    RetryReason::RateLimit => "rate-limit",
+                    RetryReason::MissingOutput => "missing-output",
+                };
+                self.update_job(job_id, |job, _| {
+                    job.status = "queued".to_owned();
+                    job.status_text = if reason == RetryReason::MissingOutput {
+                        "Queued for a bounded retry after missing image output...".to_owned()
+                    } else {
+                        "Queued for retry after upstream rate limit cooldown...".to_owned()
+                    };
+                    job.retry_count = attempt_index + 1;
+                    append_job_diagnostic(
+                        job,
+                        format!("[retry] attempt={} reason={reason_text}", attempt_index + 1),
+                    );
+                })
+                .await;
+                continue;
+            }
+
+            self.finalize_attempt_failure(job_id, &attempt_id).await;
+            self.retire_attempt(job_id, &attempt_id).await;
+            return;
+        }
+    }
+
+    async fn run_app_server_image_attempt(&self, job_id: &str, attempt_id: &str) -> AttemptOutcome {
         let client = match self.inner.app_server.ready_client().await {
             Ok(client) => client,
             Err(diagnostics) => {
@@ -707,8 +837,9 @@ impl GenerationRuntime {
                         code: "AppServerUnavailable".to_owned(),
                         message: "Codex App Server is not ready".to_owned(),
                     });
-                self.fail_job(job_id, &error.code, &error.message).await;
-                return;
+                self.record_attempt_failure(job_id, attempt_id, &error.code, &error.message, None)
+                    .await;
+                return AttemptOutcome::Failed;
             }
         };
         let mut notifications = client.subscribe();
@@ -728,8 +859,9 @@ impl GenerationRuntime {
         let thread_result = match thread_result {
             Ok(result) => result,
             Err(error) => {
-                self.fail_job(job_id, &error.code, &error.message).await;
-                return;
+                self.record_attempt_failure(job_id, attempt_id, &error.code, &error.message, None)
+                    .await;
+                return AttemptOutcome::Failed;
             }
         };
         let Some(thread_id) = thread_result
@@ -738,24 +870,30 @@ impl GenerationRuntime {
             .and_then(Value::as_str)
             .map(str::to_owned)
         else {
-            self.fail_job(
+            self.record_attempt_failure(
                 job_id,
+                attempt_id,
                 "AppServerThreadStartFailed",
                 "thread/start response did not include thread.id",
+                None,
             )
             .await;
-            return;
+            return AttemptOutcome::Failed;
         };
-        self.update_job(job_id, |job, now| {
-            job.thread_id = Some(thread_id.clone());
-            job.status = "running".to_owned();
-            job.status_text = "Waiting for image_generation_call...".to_owned();
-            job.timing.transition("running", now);
-        })
-        .await;
+        if !self
+            .update_job_for_attempt(job_id, attempt_id, |job, now| {
+                job.thread_id = Some(thread_id.clone());
+                job.status = "running".to_owned();
+                job.status_text = "Waiting for image_generation_call...".to_owned();
+                job.timing.transition("running", now);
+            })
+            .await
+        {
+            return AttemptOutcome::Failed;
+        }
 
         let Some(current_job) = self.job(job_id).await else {
-            return;
+            return AttemptOutcome::Failed;
         };
         let mut input = vec![json!({
             "type": "text",
@@ -788,59 +926,37 @@ impl GenerationRuntime {
         let turn_result = match turn_result {
             Ok(result) => result,
             Err(error) => {
-                self.fail_job(job_id, &error.code, &error.message).await;
-                return;
+                self.record_attempt_failure(job_id, attempt_id, &error.code, &error.message, None)
+                    .await;
+                return AttemptOutcome::Failed;
             }
         };
-        let turn_id = turn_result
+        if let Some(turn_id) = turn_result
             .get("turn")
             .and_then(|turn| turn.get("id"))
-            .or_else(|| turn_result.get("id"))
-            .or_else(|| turn_result.get("turnId"))
             .and_then(Value::as_str)
-            .map(str::to_owned);
-        if let Some(turn_id) = &turn_id {
-            self.update_job(job_id, |job, _| {
-                job.turn_id = Some(turn_id.clone());
+        {
+            let turn_id = turn_id.to_owned();
+            self.update_job_for_attempt(job_id, attempt_id, |job, _| {
+                job.turn_id = Some(turn_id);
             })
             .await;
         }
 
-        let deadline = Instant::now() + APP_SERVER_JOB_TIMEOUT;
-        let mut image_written = false;
         loop {
-            let message = match timeout_at(deadline, notifications.recv()).await {
-                Ok(Ok(message)) => message,
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    self.fail_job(
+            let message = match notifications.recv().await {
+                Ok(message) => message,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    self.record_attempt_failure(
                         job_id,
+                        attempt_id,
                         "AppServerClosed",
                         "Codex App Server notification stream closed",
+                        None,
                     )
                     .await;
-                    return;
-                }
-                Err(_) => {
-                    if let Some(turn_id) = &turn_id {
-                        let _ = client
-                            .request(
-                                "turn/interrupt",
-                                json!({
-                                    "threadId": thread_id,
-                                    "turnId": turn_id
-                                }),
-                                Duration::from_secs(5),
-                            )
-                            .await;
-                    }
-                    self.fail_job(
-                        job_id,
-                        "ImageGenerationTimeout",
-                        "App Server image generation timed out",
-                    )
-                    .await;
-                    return;
+                    return AttemptOutcome::Failed;
                 }
             };
             if notification_thread_id(&message).as_deref() != Some(thread_id.as_str()) {
@@ -851,57 +967,112 @@ impl GenerationRuntime {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             match method {
-                "item/completed" | "rawResponseItem/completed" => {
+                "item/completed" => {
                     let item = &message["params"]["item"];
-                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-                    if !matches!(item_type, "imageGeneration" | "image_generation_call") {
+                    if item.get("type").and_then(Value::as_str) != Some("imageGeneration") {
                         continue;
                     }
-                    let Some(result) = item.get("result").and_then(Value::as_str) else {
+                    if let Some(result) = item.get("result").and_then(Value::as_str)
+                        && let Err(error) = self.write_job_image(job_id, attempt_id, result).await
+                    {
+                        self.record_attempt_failure(
+                            job_id,
+                            attempt_id,
+                            "ImageWriteFailed",
+                            &error.error,
+                            item.get("status").and_then(Value::as_str),
+                        )
+                        .await;
+                        return AttemptOutcome::Failed;
+                    }
+                }
+                // Compatibility only. Stable imageGeneration completion is the primary route.
+                "rawResponseItem/completed" => {
+                    let item = &message["params"]["item"];
+                    if item.get("type").and_then(Value::as_str) != Some("image_generation_call") {
                         continue;
-                    };
-                    if let Err(error) = self.write_job_image(job_id, result).await {
-                        self.fail_job(job_id, "ImageWriteFailed", &error.error)
+                    }
+                    if let Some(result) = item.get("result").and_then(Value::as_str) {
+                        if let Err(error) = self.write_job_image(job_id, attempt_id, result).await {
+                            self.record_attempt_failure(
+                                job_id,
+                                attempt_id,
+                                "ImageWriteFailed",
+                                &error.error,
+                                item.get("status").and_then(Value::as_str),
+                            )
                             .await;
-                        return;
+                            return AttemptOutcome::Failed;
+                        }
+                    } else if item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_failure_status)
+                    {
+                        let (code, message) = item_error(item);
+                        self.record_attempt_failure(
+                            job_id,
+                            attempt_id,
+                            &code,
+                            &message,
+                            item.get("status").and_then(Value::as_str),
+                        )
+                        .await;
                     }
-                    image_written = true;
                 }
                 "turn/started" => {
                     if let Some(started_turn_id) = message["params"]["turn"]["id"].as_str() {
-                        self.update_job(job_id, |job, _| {
-                            job.turn_id = Some(started_turn_id.to_owned());
+                        let started_turn_id = started_turn_id.to_owned();
+                        self.update_job_for_attempt(job_id, attempt_id, |job, _| {
+                            job.turn_id = Some(started_turn_id);
                         })
                         .await;
                     }
                 }
                 "error" => {
-                    let message = message["params"]["error"]["message"]
+                    let error = &message["params"]["error"];
+                    let error_message = error["message"]
                         .as_str()
                         .unwrap_or("Codex App Server reported an error");
-                    self.fail_job(job_id, "AppServerImageFailed", message).await;
-                    return;
+                    let error_code = codex_error_info_code(&error["codexErrorInfo"])
+                        .unwrap_or_else(|| "AppServerImageFailed".to_owned());
+                    self.record_attempt_failure(
+                        job_id,
+                        attempt_id,
+                        &error_code,
+                        error_message,
+                        None,
+                    )
+                    .await;
+                    if !message["params"]["willRetry"].as_bool().unwrap_or(false) {
+                        return AttemptOutcome::Failed;
+                    }
                 }
                 "turn/completed" => {
-                    let turn_status = message["params"]["turn"]["status"]
-                        .as_str()
-                        .unwrap_or("completed");
-                    if image_written || self.job_output_exists(job_id).await {
-                        self.update_job(job_id, |job, now| {
-                            job.status = "done".to_owned();
-                            job.status_text = "Generated".to_owned();
-                            job.upstream_status = Some(turn_status.to_owned());
-                            job.timing.transition("done", now);
-                        })
-                        .await;
-                    } else {
-                        let error_message = message["params"]["turn"]["error"]["message"]
-                            .as_str()
-                            .unwrap_or("App Server turn completed without image generation output");
-                        self.fail_job(job_id, "ImageOutputMissing", error_message)
-                            .await;
+                    let turn = &message["params"]["turn"];
+                    let turn_status = turn["status"].as_str().unwrap_or("completed");
+                    if self.job_output_exists_for_attempt(job_id, attempt_id).await {
+                        return AttemptOutcome::Success {
+                            upstream_status: turn_status.to_owned(),
+                        };
                     }
-                    return;
+                    if is_failure_status(turn_status) {
+                        let (code, error_message) = turn_error(turn);
+                        self.record_attempt_failure(
+                            job_id,
+                            attempt_id,
+                            &code,
+                            &error_message,
+                            Some(turn_status),
+                        )
+                        .await;
+                    } else if self
+                        .attempt_allows_missing_output_retry(job_id, attempt_id)
+                        .await
+                    {
+                        self.record_missing_output(job_id, attempt_id).await;
+                    }
+                    return AttemptOutcome::Failed;
                 }
                 _ => {}
             }
@@ -1211,7 +1382,336 @@ impl GenerationRuntime {
         .await;
     }
 
-    async fn write_job_image(&self, job_id: &str, encoded: &str) -> Result<(), RunApiError> {
+    async fn begin_attempt(&self, job_id: &str, attempt_index: u32) -> Option<String> {
+        if self.job(job_id).await.is_none() {
+            return None;
+        }
+        let attempt_id = format!("{job_id}:{attempt_index}:{}", Uuid::new_v4());
+        self.inner.attempts.write().await.insert(
+            job_id.to_owned(),
+            AttemptState {
+                id: attempt_id.clone(),
+                index: attempt_index,
+                rate_limited: false,
+                explicit_failure: false,
+                missing_output_retryable: false,
+            },
+        );
+        self.update_job(job_id, |job, now| {
+            job.status = "starting".to_owned();
+            job.status_text = "Starting App Server image thread...".to_owned();
+            job.log = format!(
+                "image tool via codex app-server\naspect={}\nreference={}",
+                job.aspect_ratio,
+                if job.reference_image_path.is_some() {
+                    "attached"
+                } else {
+                    "none"
+                }
+            );
+            job.thread_id = None;
+            job.turn_id = None;
+            job.image_url = None;
+            job.timing.completed_at = None;
+            job.timing.execution_ms = None;
+            job.timing.total_ms = None;
+            job.timing.last_attempt_completed_at = None;
+            job.timing.last_attempt_ms = None;
+            job.timing.transition("starting", now);
+        })
+        .await;
+        Some(attempt_id)
+    }
+
+    async fn is_current_attempt(&self, job_id: &str, attempt_id: &str) -> bool {
+        self.inner
+            .attempts
+            .read()
+            .await
+            .get(job_id)
+            .is_some_and(|attempt| attempt.id == attempt_id)
+    }
+
+    async fn update_job_for_attempt<F>(&self, job_id: &str, attempt_id: &str, update: F) -> bool
+    where
+        F: FnOnce(&mut ImageGridJob, i64),
+    {
+        if !self.is_current_attempt(job_id, attempt_id).await {
+            return false;
+        }
+        self.update_job(job_id, update).await;
+        true
+    }
+
+    async fn record_attempt_failure(
+        &self,
+        job_id: &str,
+        attempt_id: &str,
+        code: &str,
+        message: &str,
+        upstream_status: Option<&str>,
+    ) {
+        if !self.is_current_attempt(job_id, attempt_id).await {
+            return;
+        }
+        let rate_limit_code = rate_limit_code(code, message);
+        {
+            let mut attempts = self.inner.attempts.write().await;
+            let Some(attempt) = attempts
+                .get_mut(job_id)
+                .filter(|attempt| attempt.id == attempt_id)
+            else {
+                return;
+            };
+            attempt.explicit_failure = true;
+            if rate_limit_code.is_some() {
+                attempt.rate_limited = true;
+            }
+        }
+        let recorded_code = rate_limit_code.unwrap_or_else(|| code.to_owned());
+        let recorded_message = message.to_owned();
+        let upstream_status = upstream_status.map(str::to_owned);
+        self.update_job_for_attempt(job_id, attempt_id, move |job, _| {
+            let preserve_existing = job.error_code.as_deref().is_some_and(|existing| {
+                !is_generic_error_code(existing) && is_generic_error_code(&recorded_code)
+            });
+            if !preserve_existing {
+                job.error_code = Some(recorded_code.clone());
+                job.error_message = Some(recorded_message.clone());
+            }
+            if let Some(status) = upstream_status {
+                job.upstream_status = Some(status);
+            }
+            let display_code = job.error_code.as_deref().unwrap_or(&recorded_code);
+            let display_message = job.error_message.as_deref().unwrap_or(&recorded_message);
+            job.status_text = format!("{display_code}: {display_message}");
+            append_job_diagnostic(
+                job,
+                format!(
+                    "[upstream] code={recorded_code} message={recorded_message}{}",
+                    job.upstream_status
+                        .as_deref()
+                        .map(|status| format!(" status={status}"))
+                        .unwrap_or_default()
+                ),
+            );
+        })
+        .await;
+    }
+
+    async fn attempt_allows_missing_output_retry(&self, job_id: &str, attempt_id: &str) -> bool {
+        self.inner
+            .attempts
+            .read()
+            .await
+            .get(job_id)
+            .filter(|attempt| attempt.id == attempt_id)
+            .is_some_and(|attempt| !attempt.rate_limited && !attempt.explicit_failure)
+    }
+
+    async fn record_missing_output(&self, job_id: &str, attempt_id: &str) {
+        let attempt_index = {
+            let mut attempts = self.inner.attempts.write().await;
+            let Some(attempt) = attempts
+                .get_mut(job_id)
+                .filter(|attempt| attempt.id == attempt_id)
+            else {
+                return;
+            };
+            attempt.missing_output_retryable = true;
+            attempt.index
+        };
+        self.update_job_for_attempt(job_id, attempt_id, move |job, _| {
+            if job.error_code.is_none() || job.error_code.as_deref().is_some_and(is_generic_error_code)
+            {
+                job.error_code = Some("ImageOutputMissing".to_owned());
+                job.error_message = Some(
+                    "App Server turn completed without writing the requested image file".to_owned(),
+                );
+            }
+            append_job_diagnostic(
+                job,
+                format!(
+                    "[missing-output] code=ImageOutputMissing retryable=true attempt={attempt_index}"
+                ),
+            );
+        })
+        .await;
+    }
+
+    async fn retry_reason(&self, job_id: &str, attempt_id: &str) -> Option<RetryReason> {
+        self.inner
+            .attempts
+            .read()
+            .await
+            .get(job_id)
+            .filter(|attempt| attempt.id == attempt_id)
+            .and_then(|attempt| {
+                if attempt.rate_limited {
+                    Some(RetryReason::RateLimit)
+                } else if attempt.missing_output_retryable {
+                    Some(RetryReason::MissingOutput)
+                } else {
+                    None
+                }
+            })
+    }
+
+    async fn wait_for_rate_limit_cooldown(&self, job_id: &str) {
+        let started = Instant::now();
+        let mut waited = false;
+        loop {
+            let deadline = *self.inner.rate_limit_cooldown_until.lock().await;
+            let now = Instant::now();
+            if deadline <= now {
+                break;
+            }
+            waited = true;
+            let remaining = deadline.saturating_duration_since(now);
+            self.update_job(job_id, |job, _| {
+                job.status = "queued".to_owned();
+                job.status_text = format!(
+                    "Waiting {}s for app-server-image rate-limit cooldown...",
+                    remaining.as_secs_f64().ceil() as u64
+                );
+            })
+            .await;
+            sleep(remaining).await;
+        }
+        if waited {
+            let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            self.update_job(job_id, |job, _| {
+                job.timing.cooldown_ms = job.timing.cooldown_ms.saturating_add(elapsed);
+            })
+            .await;
+        }
+    }
+
+    async fn start_rate_limit_cooldown(&self, job_id: &str, attempt: u32) {
+        let recovery = self.inner.recovery;
+        let base = recovery.retry_base.max(recovery.rate_limit_cooldown);
+        if base.is_zero() {
+            return;
+        }
+        let maximum = base.max(recovery.rate_limit_cooldown_max);
+        let multiplier = 2_u32.saturating_pow(attempt.saturating_sub(1));
+        let delay = base.saturating_mul(multiplier).min(maximum);
+        {
+            let mut current = self.inner.rate_limit_cooldown_until.lock().await;
+            *current = (*current).max(Instant::now() + delay);
+        }
+        self.update_job(job_id, |job, _| {
+            append_job_diagnostic(
+                job,
+                format!(
+                    "[rate-limit-cooldown] attempt={attempt} delayMs={}",
+                    delay.as_millis()
+                ),
+            );
+        })
+        .await;
+    }
+
+    async fn finish_attempt_for_retry(&self, job_id: &str, attempt_id: &str) {
+        self.update_job_for_attempt(job_id, attempt_id, |job, now| {
+            let started = job.timing.current_attempt_started_at.unwrap_or(now);
+            job.timing.last_attempt_completed_at = Some(now);
+            job.timing.last_attempt_ms = Some(now.saturating_sub(started));
+            job.timing.current_attempt_started_at = None;
+        })
+        .await;
+    }
+
+    async fn finalize_attempt_success(
+        &self,
+        job_id: &str,
+        attempt_id: &str,
+        upstream_status: &str,
+    ) {
+        let upstream_status = upstream_status.to_owned();
+        self.update_job_for_attempt(job_id, attempt_id, move |job, now| {
+            job.status = "done".to_owned();
+            job.status_text = "Generated".to_owned();
+            job.error_code = None;
+            job.error_message = None;
+            job.upstream_status = is_failure_status(&upstream_status).then_some(upstream_status);
+            job.timing.transition("done", now);
+        })
+        .await;
+    }
+
+    async fn finalize_attempt_failure(&self, job_id: &str, attempt_id: &str) {
+        self.update_job_for_attempt(job_id, attempt_id, |job, now| {
+            job.status = "error".to_owned();
+            let message = job
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "Upstream image generation failed".to_owned());
+            job.status_text = append_missing_output_evidence(&format!(
+                "{}: {message}",
+                job.error_code
+                    .as_deref()
+                    .unwrap_or("UpstreamImageGenerationFailed")
+            ));
+            job.image_url = None;
+            job.timing.transition("error", now);
+        })
+        .await;
+    }
+
+    async fn interrupt_timed_out_attempt(&self, job_id: &str, attempt_id: &str) {
+        if !self.is_current_attempt(job_id, attempt_id).await {
+            return;
+        }
+        let Some(job) = self.job(job_id).await else {
+            return;
+        };
+        let (Some(thread_id), Some(turn_id), Some(client)) = (
+            job.thread_id,
+            job.turn_id,
+            self.inner.app_server.current_client().await,
+        ) else {
+            return;
+        };
+        let result = client
+            .request(
+                "turn/interrupt",
+                json!({ "threadId": thread_id, "turnId": turn_id }),
+                Duration::from_secs(5),
+            )
+            .await;
+        self.update_job_for_attempt(job_id, attempt_id, move |job, _| match result {
+            Ok(_) => append_job_diagnostic(job, "[turn/interrupt] app-server-image timeout"),
+            Err(error) => append_job_diagnostic(
+                job,
+                format!(
+                    "[turn/interrupt-failed] app-server-image timeout: {}",
+                    error.message
+                ),
+            ),
+        })
+        .await;
+    }
+
+    async fn retire_attempt(&self, job_id: &str, attempt_id: &str) {
+        let mut attempts = self.inner.attempts.write().await;
+        if attempts
+            .get(job_id)
+            .is_some_and(|attempt| attempt.id == attempt_id)
+        {
+            attempts.remove(job_id);
+        }
+    }
+
+    async fn write_job_image(
+        &self,
+        job_id: &str,
+        attempt_id: &str,
+        encoded: &str,
+    ) -> Result<(), RunApiError> {
+        if !self.is_current_attempt(job_id, attempt_id).await {
+            return Ok(());
+        }
         let job = self
             .job(job_id)
             .await
@@ -1225,11 +1725,15 @@ impl GenerationRuntime {
         fs::write(&temporary_path, bytes)
             .await
             .map_err(|error| RunApiError::message(format!("could not write image: {error}")))?;
+        if !self.is_current_attempt(job_id, attempt_id).await {
+            let _ = fs::remove_file(&temporary_path).await;
+            return Ok(());
+        }
         fs::rename(&temporary_path, &output_path)
             .await
             .map_err(|error| RunApiError::message(format!("could not install image: {error}")))?;
         let image_url = format!("/generated/{}/{}", job.run_id, job.filename);
-        self.update_job(job_id, |job, _| {
+        self.update_job_for_attempt(job_id, attempt_id, |job, _| {
             job.image_url = Some(image_url);
             job.status_text = "Image generated; waiting for turn completion...".to_owned();
         })
@@ -1237,11 +1741,23 @@ impl GenerationRuntime {
         Ok(())
     }
 
-    async fn job_output_exists(&self, job_id: &str) -> bool {
+    async fn job_output_exists_for_attempt(&self, job_id: &str, attempt_id: &str) -> bool {
+        if !self.is_current_attempt(job_id, attempt_id).await {
+            return false;
+        }
         let Some(job) = self.job(job_id).await else {
             return false;
         };
         fs::symlink_metadata(&job.output_path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+    }
+
+    async fn job_output_exists(&self, job_id: &str) -> bool {
+        let Some(job) = self.job(job_id).await else {
+            return false;
+        };
+        fs::metadata(&job.output_path)
             .await
             .is_ok_and(|metadata| metadata.is_file())
     }
@@ -1864,6 +2380,106 @@ fn notification_thread_id(message: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn append_job_diagnostic(job: &mut ImageGridJob, entry: impl Into<String>) {
+    let entry = entry.into();
+    let combined = if job.diagnostic_log.is_empty() {
+        entry
+    } else {
+        format!("{}\n{entry}", job.diagnostic_log)
+    };
+    let reversed = combined.chars().rev().take(2400).collect::<String>();
+    job.diagnostic_log = reversed.chars().rev().collect();
+}
+
+fn rate_limit_code(code: &str, message: &str) -> Option<String> {
+    let combined = format!("{code} {message}").to_ascii_lowercase();
+    if combined.contains("toomanyrequests")
+        || combined.contains("too many requests")
+        || combined
+            .split(|character: char| !character.is_ascii_digit())
+            .any(|part| part == "429")
+    {
+        return Some("TooManyRequests".to_owned());
+    }
+    if combined.contains("rate_limit")
+        || combined.contains("rate-limit")
+        || combined.contains("rate limit")
+        || combined.contains("ratelimit")
+        || combined.contains("usagelimitexceeded")
+    {
+        return Some("RateLimit".to_owned());
+    }
+    None
+}
+
+fn is_generic_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "UpstreamImageGenerationFailed"
+            | "AppServerImageFailed"
+            | "AppServerImageRunnerError"
+            | "AppServerClosed"
+            | "ImageGenerationTimeout"
+            | "ImageWriteFailed"
+            | "ImageOutputMissing"
+    )
+}
+
+fn codex_error_info_code(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_owned).or_else(|| {
+        value
+            .as_object()
+            .and_then(|object| object.keys().next().cloned())
+    })
+}
+
+fn item_error(item: &Value) -> (String, String) {
+    let error = item
+        .get("error")
+        .or_else(|| {
+            item.get("status_details")
+                .and_then(|value| value.get("error"))
+        })
+        .or_else(|| {
+            item.get("statusDetails")
+                .and_then(|value| value.get("error"))
+        });
+    let code = error
+        .and_then(|value| value.get("code").or_else(|| value.get("type")))
+        .and_then(Value::as_str)
+        .unwrap_or("UpstreamImageGenerationFailed")
+        .to_owned();
+    let message = error
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| item.get("message").and_then(Value::as_str))
+        .unwrap_or("Upstream image generation failed")
+        .to_owned();
+    (code, message)
+}
+
+fn turn_error(turn: &Value) -> (String, String) {
+    let error = &turn["error"];
+    let code = codex_error_info_code(&error["codexErrorInfo"])
+        .or_else(|| error["code"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "UpstreamImageGenerationFailed".to_owned());
+    let message = error["message"]
+        .as_str()
+        .unwrap_or("Upstream image generation failed")
+        .to_owned();
+    (code, message)
+}
+
+fn append_missing_output_evidence(status_text: &str) -> String {
+    if status_text.contains("No output file was written") {
+        status_text.to_owned()
+    } else if status_text.is_empty() {
+        "No output file was written".to_owned()
+    } else {
+        format!("{status_text}; No output file was written")
+    }
+}
+
 fn is_failure_status(status: &str) -> bool {
     matches!(
         status.to_ascii_lowercase().as_str(),
@@ -1974,6 +2590,42 @@ mod tests {
     use crate::app_server::AppServerLaunchConfig;
     use std::fs as std_fs;
     use std::io::Write;
+
+    fn provider_free_runtime(
+        temporary: &tempfile::TempDir,
+        script: &str,
+        recovery: RecoveryConfig,
+    ) -> (GenerationRuntime, Arc<RuntimeConfig>) {
+        let server_root = temporary.path().join("server");
+        let data_dir = temporary.path().join("data");
+        let workspace = temporary.path().join("workspace");
+        std_fs::create_dir_all(&server_root).expect("server root");
+        std_fs::create_dir_all(&workspace).expect("workspace");
+        let fake = temporary.path().join("fake-codex");
+        let mut fake_file = std_fs::File::create(&fake).expect("fake executable");
+        fake_file.write_all(script.as_bytes()).expect("fake source");
+        fake_file.flush().expect("fake source flushed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fake_file.metadata().expect("fake metadata").permissions();
+            permissions.set_mode(0o755);
+            std_fs::set_permissions(&fake, permissions).expect("fake executable permissions");
+        }
+        let config = Arc::new(RuntimeConfig::new(
+            server_root,
+            data_dir,
+            Some(workspace.clone()),
+            "server".to_owned(),
+        ));
+        config.prepare_directories().expect("runtime directories");
+        let app_server =
+            AppServerBridge::new(workspace, AppServerLaunchConfig::single("fixture", fake));
+        (
+            GenerationRuntime::new_with_recovery_config(config.clone(), app_server, recovery),
+            config,
+        )
+    }
 
     fn svg_fixture_job(run_id: &str, output_path: &Path, now: i64) -> ImageGridJob {
         let run_directory = output_path.parent().expect("SVG run directory");
@@ -2346,5 +2998,215 @@ done
         assert_eq!(status, "error");
         assert!(completed);
         assert_eq!(counts["failed"], 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_contract_missing_output_retries_once_and_succeeds_without_cooldown() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let script = r#"#!/bin/sh
+test "$1" = "app-server" || exit 2
+attempt=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      attempt=$((attempt + 1))
+      if [ "$attempt" -eq 1 ]; then
+        printf '%s\n' '{"id":2,"result":{"thread":{"id":"missing-thread-1"}}}'
+      else
+        printf '%s\n' '{"id":4,"result":{"thread":{"id":"missing-thread-2"}}}'
+      fi
+      ;;
+    *'"method":"turn/start"'*)
+      if [ "$attempt" -eq 1 ]; then
+        printf '%s\n' '{"id":3,"result":{"turn":{"id":"missing-turn-1"}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"missing-thread-1","turn":{"id":"missing-turn-1","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'
+      else
+        printf '%s\n' '{"id":5,"result":{"turn":{"id":"missing-turn-2"}}}'
+        printf '%s\n' '{"method":"item/completed","params":{"threadId":"missing-thread-2","turnId":"missing-turn-2","completedAtMs":1,"item":{"type":"imageGeneration","id":"image-2","status":"completed","revisedPrompt":null,"result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"missing-thread-2","turn":{"id":"missing-turn-2","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'
+      fi
+      ;;
+  esac
+done
+"#;
+        let (runtime, _) = provider_free_runtime(
+            &temporary,
+            script,
+            RecoveryConfig {
+                max_retries: 1,
+                retry_base: Duration::ZERO,
+                rate_limit_cooldown: Duration::ZERO,
+                rate_limit_cooldown_max: Duration::ZERO,
+                job_timeout: Duration::from_secs(1),
+            },
+        );
+        let (_, response) = runtime
+            .create_run(
+                &json!({
+                    "prompts": ["recover missing output"],
+                    "count": 1,
+                    "waitMs": 2000
+                }),
+                true,
+                None,
+            )
+            .await
+            .expect("provider-free run");
+        let output = &response["outputs"][0];
+        assert_eq!(output["status"], "done");
+        assert_eq!(output["retryCount"], 1);
+        assert_eq!(output["timing"]["attemptCount"], 2);
+        assert_eq!(output["timing"]["cooldownMs"], 0);
+        assert_eq!(output["errorCode"], Value::Null);
+        assert!(
+            output["diagnosticLog"]
+                .as_str()
+                .is_some_and(|log| log.contains("reason=missing-output"))
+        );
+        assert!(
+            output["outputPath"]
+                .as_str()
+                .is_some_and(|path| Path::new(path).is_file())
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_contract_stable_error_maps_rate_limit_and_waits_for_global_cooldown() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let script = r#"#!/bin/sh
+test "$1" = "app-server" || exit 2
+attempt=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      attempt=$((attempt + 1))
+      if [ "$attempt" -eq 1 ]; then
+        printf '%s\n' '{"id":2,"result":{"thread":{"id":"rate-thread-1"}}}'
+      else
+        printf '%s\n' '{"id":4,"result":{"thread":{"id":"rate-thread-2"}}}'
+      fi
+      ;;
+    *'"method":"turn/start"'*)
+      if [ "$attempt" -eq 1 ]; then
+        printf '%s\n' '{"id":3,"result":{"turn":{"id":"rate-turn-1"}}}'
+        printf '%s\n' '{"method":"error","params":{"error":{"message":"Too many requests for image generation (429)","codexErrorInfo":{"responseTooManyFailedAttempts":{"httpStatusCode":429}},"additionalDetails":null},"willRetry":false,"threadId":"rate-thread-1","turnId":"rate-turn-1"}}'
+      else
+        printf '%s\n' '{"id":5,"result":{"turn":{"id":"rate-turn-2"}}}'
+        printf '%s\n' '{"method":"item/completed","params":{"threadId":"rate-thread-2","turnId":"rate-turn-2","completedAtMs":1,"item":{"type":"imageGeneration","id":"image-2","status":"completed","revisedPrompt":null,"result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}}'
+        printf '%s\n' '{"method":"turn/completed","params":{"threadId":"rate-thread-2","turn":{"id":"rate-turn-2","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'
+      fi
+      ;;
+  esac
+done
+"#;
+        let (runtime, _) = provider_free_runtime(
+            &temporary,
+            script,
+            RecoveryConfig {
+                max_retries: 1,
+                retry_base: Duration::ZERO,
+                rate_limit_cooldown: Duration::from_millis(15),
+                rate_limit_cooldown_max: Duration::from_millis(15),
+                job_timeout: Duration::from_secs(1),
+            },
+        );
+        let (_, response) = runtime
+            .create_run(
+                &json!({
+                    "prompts": ["recover rate limit"],
+                    "count": 1,
+                    "waitMs": 2000
+                }),
+                true,
+                None,
+            )
+            .await
+            .expect("provider-free run");
+        let output = &response["outputs"][0];
+        assert_eq!(output["status"], "done");
+        assert_eq!(output["retryCount"], 1);
+        assert!(
+            output["timing"]["cooldownMs"]
+                .as_i64()
+                .is_some_and(|milliseconds| milliseconds >= 10)
+        );
+        let diagnostic = output["diagnosticLog"].as_str().expect("diagnostic log");
+        assert!(diagnostic.contains("code=TooManyRequests"));
+        assert!(diagnostic.contains("rate-limit-cooldown"));
+        assert!(diagnostic.contains("reason=rate-limit"));
+    }
+
+    #[tokio::test]
+    async fn recovery_contract_whole_attempt_timeout_interrupts_owned_turn_and_releases_job() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let request_log = temporary.path().join("requests.jsonl");
+        let script = r#"#!/bin/sh
+test "$1" = "app-server" || exit 2
+request_log="__REQUEST_LOG__"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$request_log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"timeout-thread"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"timeout-turn"}}}'
+      ;;
+    *'"method":"turn/interrupt"'*)
+      printf '%s\n' '{"id":4,"result":{}}'
+      ;;
+  esac
+done
+"#
+        .replace("__REQUEST_LOG__", &display_path(&request_log));
+        let (runtime, _) = provider_free_runtime(
+            &temporary,
+            &script,
+            RecoveryConfig {
+                max_retries: 0,
+                retry_base: Duration::ZERO,
+                rate_limit_cooldown: Duration::ZERO,
+                rate_limit_cooldown_max: Duration::ZERO,
+                job_timeout: Duration::from_secs(1),
+            },
+        );
+        let (_, response) = runtime
+            .create_run(
+                &json!({
+                    "prompts": ["timeout"],
+                    "count": 1,
+                    "waitMs": 3000
+                }),
+                true,
+                None,
+            )
+            .await
+            .expect("provider-free run");
+        let output = &response["outputs"][0];
+        assert_eq!(output["status"], "error");
+        assert_eq!(output["errorCode"], "ImageGenerationTimeout");
+        let diagnostic = output["diagnosticLog"].as_str().unwrap_or_default();
+        let requests = std_fs::read_to_string(request_log).expect("request log");
+        assert!(
+            diagnostic.contains("[turn/interrupt]"),
+            "diagnostic={diagnostic:?}; requests={requests:?}"
+        );
+        assert!(requests.contains("\"method\":\"turn/interrupt\""));
+        assert_eq!(runtime.scheduler_snapshot().active, 0);
     }
 }
