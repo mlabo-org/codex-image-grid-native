@@ -184,6 +184,9 @@ struct ImageGridRuntimeIdentity: Decodable, Equatable, Sendable {
     let app: String?
     let serverRoot: String?
     let packageName: String?
+    let packageVersion: String?
+    let packageRootKind: String?
+    let launchTarget: String?
 }
 
 struct ImageGridHealthResponse: Decodable {
@@ -191,6 +194,9 @@ struct ImageGridHealthResponse: Decodable {
     let app: String?
     let serverRoot: String?
     let packageName: String?
+    let packageVersion: String?
+    let packageRootKind: String?
+    let launchTarget: String?
     let generatedDir: String?
     let appServerImageReady: Bool?
     let appServerImageDiagnostics: ImageGridDiagnostics?
@@ -200,7 +206,10 @@ struct ImageGridHealthResponse: Decodable {
         ImageGridRuntimeIdentity(
             app: app,
             serverRoot: serverRoot,
-            packageName: packageName
+            packageName: packageName,
+            packageVersion: packageVersion,
+            packageRootKind: packageRootKind,
+            launchTarget: launchTarget
         )
     }
 }
@@ -271,7 +280,8 @@ struct ImageGridAPIError: LocalizedError, Equatable, Sendable {
 }
 
 enum ImageGridRuntimeIdentityValidation {
-    static let expectedIdentity = "codex-image-grid-native"
+    static let expectedIdentity = "codex-image-grid"
+    static let expectedPackageVersion = "0.2.0"
 
     static func validate(_ response: ImageGridHealthResponse) throws -> ImageGridRuntimeIdentity {
         guard response.ok else {
@@ -292,7 +302,10 @@ enum ImageGridRuntimeIdentityValidation {
             topLevel: identity ?? ImageGridRuntimeIdentity(
                 app: nil,
                 serverRoot: nil,
-                packageName: nil
+                packageName: nil,
+                packageVersion: nil,
+                packageRootKind: nil,
+                launchTarget: nil
             ),
             nested: nil
         )
@@ -310,6 +323,27 @@ enum ImageGridRuntimeIdentityValidation {
                     + "(expected app and packageName \(expectedIdentity))."
             )
         }
+        let packageVersion = nested?.packageVersion ?? topLevel.packageVersion
+        guard packageVersion == expectedPackageVersion else {
+            throw ImageGridAPIError(
+                message: "Disconnected: Codex Image Grid Native packageVersion does not match "
+                    + "\(expectedPackageVersion)."
+            )
+        }
+        let packageRootKind = nested?.packageRootKind ?? topLevel.packageRootKind
+        guard packageRootKind == "source" || packageRootKind == "packaged" else {
+            throw ImageGridAPIError(
+                message: "Disconnected: Codex Image Grid Native did not report a supported "
+                    + "source or packaged runtime root."
+            )
+        }
+        let launchTarget = nested?.launchTarget ?? topLevel.launchTarget
+        guard launchTarget == "swiftui" else {
+            throw ImageGridAPIError(
+                message: "Disconnected: Codex Image Grid Native did not report "
+                    + "launchTarget=swiftui."
+            )
+        }
 
         let serverRoot = (nested?.serverRoot ?? topLevel.serverRoot)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -325,7 +359,10 @@ enum ImageGridRuntimeIdentityValidation {
         return ImageGridRuntimeIdentity(
             app: app,
             serverRoot: serverRoot,
-            packageName: packageName
+            packageName: packageName,
+            packageVersion: packageVersion,
+            packageRootKind: packageRootKind,
+            launchTarget: launchTarget
         )
     }
 }

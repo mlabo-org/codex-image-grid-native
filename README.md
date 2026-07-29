@@ -1,16 +1,50 @@
-# Codex Image Grid Native
+# Codex Image Grid
 
-Native-first successor project for Codex Image Grid.
+Native Rust + SwiftUI implementation repository for the public
+`codex-image-grid` plugin. The installable public plugin package lives at
+`plugin/codex-image-grid/`; the repository root remains the implementation
+workspace.
 
-This repository is a new Rust + SwiftUI implementation whose externally
-observable behavior will match the frozen Electron baseline at:
+Codex routes English or Japanese image-generation requests, Prompt Batch,
+thumbnails, and project, article, or video visuals through
+`codex_image_grid/generate_image_grid`. The same public route is used when
+CodexVideo, Agentic StructCiv, or RelayPress requests visuals. Calling the tool
+launches or joins the native runtime and automatically opens the SwiftUI app.
+The live tool schema is authoritative for accepted inputs and returned
+artifacts.
 
-`/Users/suzukimakoto/plugins/codex-image-grid`
+The old Electron repository at
+`/Users/suzukimakoto/plugins/codex-image-grid` is frozen and out of scope for
+runtime routing. It remains a read-only behavioral reference and is never an
+implicit fallback.
 
-The old repository remains the baseline and is not edited by this project.
 The Rust server, MCP binary, and SwiftUI primary path have passed the
-provider-free and live App Server acceptance slices. `.mcp.json` now connects
-the validated native release binaries on the separate development port 4322.
+provider-free and live App Server acceptance slices. The public plugin's
+`.mcp.json` launches the MCP binary bundled inside the installed native app.
+
+## Public and internal identity
+
+- Public plugin and skill identity: `codex-image-grid`.
+- Public MCP route: `codex_image_grid/generate_image_grid`.
+- Public plugin source:
+  `/Users/suzukimakoto/plugins/codex-image-grid-native/plugin/codex-image-grid`.
+- Rust and Swift implementation source:
+  `/Users/suzukimakoto/plugins/codex-image-grid-native`.
+- Public runtime, health, manifest, and MCP server identity:
+  `codex-image-grid`.
+- Internal loopback port: `127.0.0.1:4322`.
+- Internal runtime data:
+  `~/Library/Application Support/codex-image-grid-native`.
+- Installed app:
+  `~/Applications/Codex Image Grid Native.app`.
+- Internal bundle identifier and executable:
+  `local.codex.image-grid.native` / `CodexImageGridNative`.
+
+The nested public root lets its folder and manifest both use
+`codex-image-grid` without reusing the frozen repository path. Port, data,
+bundle, executable, and install identities remain isolated so the native
+runtime cannot collide with the frozen Electron app. They do not create a
+second public generation route.
 
 The detailed baseline contract is [docs/frozen-baseline-spec.md](docs/frozen-baseline-spec.md).
 It records the frozen source commit, observable API/MCP/job/artifact behavior,
@@ -38,7 +72,7 @@ The provider-free first runnable slice now includes:
 
 - reference-image validation and copied staging as
   `reference.png`, `reference.jpg`, or `reference.webp`;
-- a native development server on `127.0.0.1:4322` with the baseline-compatible
+- an internal native server on `127.0.0.1:4322` with the baseline-compatible
   `GET /api/health` identity shape;
 - deterministic Codex executable selection, an owned `codex app-server`
   JSONL child, and compatible `GET`/`POST
@@ -75,30 +109,26 @@ The live acceptance slice completed one real MCP-launched App Server image run,
 then restored that run in the SwiftUI app. It also exercised native
 choose/clear reference handling, language/theme and engine switches,
 single/batch prompts, flexible two-column and narrow one-column layouts, and
-owned/joined runtime shutdown. `.mcp.json` is connected only after those checks.
+owned/joined runtime shutdown.
 
 ## Build and checks
 
 ```bash
 scripts/check.sh
-cargo build --release --workspace
-swift build -c release --package-path macos
+scripts/install-native-app.sh
+scripts/install-native-app.sh --execute
 ```
 
 The check script validates the Rust workspace and Swift package scaffold. It
 also runs the provider-free health, fake-App-Server preflight, reference
 analysis, complete one-image run/artifact, and MCP process smoke with an
 isolated temporary native data root. It does not start a provider, launch or
-modify the frozen Electron app, refresh plugin cache, connect `.mcp.json`, or
+modify the frozen Electron app, refresh plugin cache, activate the plugin, or
 write runtime state into this repository.
 
-The release builds materialize the binaries referenced by `.mcp.json` and the
-native app executable. Runtime data remains under
-`~/Library/Application Support/codex-image-grid-native`.
-
-## Runtime identity during migration
-
-The native project must use a separate development identity, port, bundle id,
-and data directory while the Electron baseline remains available. The final
-cutover may take over the public `codex-image-grid` identity only after the
-parity bundle passes and the old runtime is explicitly frozen.
+The installer is dry-run by default. `--execute` builds the Rust and Swift
+release products, assembles and ad-hoc signs the native app, verifies it, and
+atomically installs it at the path above. The public plugin's `.mcp.json`
+executes the MCP binary inside that bundle; a valid tool call opens or
+re-activates the app before joining its SwiftUI-owned runtime. Runtime data
+remains under the isolated native data directory above.

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex Image Grid"
+  short_description: "Codex native Prompt Batch image generation"
+  default_prompt: "Use $codex-image-grid to create the requested image set."
+
+policy:
+  allow_implicit_invocation: true

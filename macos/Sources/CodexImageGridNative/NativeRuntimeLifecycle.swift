@@ -52,7 +52,9 @@ enum NativeRuntimeResolutionError: LocalizedError, Equatable {
 }
 
 enum NativeRuntimeResolver {
-    static let expectedIdentity = "codex-image-grid-native"
+    static let expectedIdentity = "codex-image-grid"
+    static let expectedPackageVersion = "0.2.0"
+    static let dataDirectoryName = "codex-image-grid-native"
     static let bindAddress = "127.0.0.1:4322"
     static let executableName = "image-grid-server"
     static let explicitBinaryEnvironmentKey = "IMAGE_GRID_NATIVE_SERVER_BIN"
@@ -76,13 +78,19 @@ enum NativeRuntimeResolver {
             ?? bundle.resourceURL
                 .map { $0.appendingPathComponent(executableName, isDirectory: false) }
                 .flatMap { fileManager.fileExists(atPath: $0.path) ? $0 : nil }
-        let repositoryRoot = developmentRepositoryRoot(sourceFilePath: #filePath)
+        let isPackagedApplication = bundle.bundleURL.pathExtension == "app"
+        let repositoryRoot = isPackagedApplication
+            ? nil
+            : developmentRepositoryRoot(sourceFilePath: #filePath)
         let homeDirectory = fileManager.homeDirectoryForCurrentUser
         var forbiddenRoots = [
             homeDirectory
                 .appendingPathComponent(".codex", isDirectory: true)
                 .appendingPathComponent("plugins", isDirectory: true)
                 .appendingPathComponent("cache", isDirectory: true),
+            homeDirectory
+                .appendingPathComponent("plugins", isDirectory: true)
+                .appendingPathComponent("codex-image-grid", isDirectory: true),
         ]
         if let repositoryRoot {
             forbiddenRoots.append(
@@ -108,7 +116,21 @@ enum NativeRuntimeResolver {
         let paths = try prepareRuntimePaths(context: context)
         let resolvedExecutable: (NativeRuntimeServerSource, URL)
 
-        if let explicitValue = context.environment[explicitBinaryEnvironmentKey]?
+        if context.repositoryRoot == nil {
+            guard let bundledServerURL = context.bundledServerURL else {
+                throw NativeRuntimeResolutionError.invalidConfiguration(
+                    "The packaged app does not contain its required image-grid-server resource."
+                )
+            }
+            let bundleRoot = try canonicalDirectory(context.bundleRoot, label: "app bundle root")
+            let executable = try validateExecutable(
+                bundledServerURL,
+                label: "bundled image-grid-server resource",
+                requiredRoot: bundleRoot,
+                forbiddenRoots: context.forbiddenRoots
+            )
+            resolvedExecutable = (.bundledResource, executable)
+        } else if let explicitValue = context.environment[explicitBinaryEnvironmentKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !explicitValue.isEmpty
         {
@@ -220,7 +242,7 @@ enum NativeRuntimeResolver {
         context: NativeRuntimeResolutionContext
     ) throws -> RuntimePaths {
         let dataRoot = context.applicationSupportDirectory.appendingPathComponent(
-            expectedIdentity,
+            dataDirectoryName,
             isDirectory: true
         )
         do {
@@ -356,6 +378,8 @@ private struct NativeRuntimeHealthPayload: Decodable {
         let app: String?
         let serverRoot: String?
         let packageName: String?
+        let packageVersion: String?
+        let packageRootKind: String?
         let launchTarget: String?
     }
 
@@ -363,6 +387,8 @@ private struct NativeRuntimeHealthPayload: Decodable {
     let app: String?
     let serverRoot: String?
     let packageName: String?
+    let packageVersion: String?
+    let packageRootKind: String?
     let launchTarget: String?
     let identity: Identity?
 }
@@ -399,6 +425,17 @@ enum NativeRuntimeHealthValidation {
             .standardizedFileURL
         guard reportedURL.path == expectedServerRoot.standardizedFileURL.path else {
             return "The native health serverRoot does not match this app runtime."
+        }
+        let expectedRootKind = expectedServerRoot.pathExtension == "app"
+            ? "packaged"
+            : "source"
+        let packageVersion = payload.identity?.packageVersion ?? payload.packageVersion
+        guard packageVersion == NativeRuntimeResolver.expectedPackageVersion else {
+            return "The native health packageVersion does not match this app runtime."
+        }
+        let packageRootKind = payload.identity?.packageRootKind ?? payload.packageRootKind
+        guard packageRootKind == expectedRootKind else {
+            return "The native health packageRootKind does not match this app runtime."
         }
         if let requiredLaunchTarget {
             let launchTarget = payload.identity?.launchTarget ?? payload.launchTarget
@@ -551,7 +588,10 @@ final class NativeRuntimeLifecycle: ObservableObject {
         do {
             let context = try NativeRuntimeResolver.productionContext()
             let expectedServerRoot = try NativeRuntimeResolver.expectedServerRoot(context: context)
-            switch await probeHealth(expectedServerRoot: expectedServerRoot) {
+            switch await probeHealth(
+                expectedServerRoot: expectedServerRoot,
+                requiredLaunchTarget: "swiftui"
+            ) {
             case .healthy:
                 state = .ready(.joined)
                 return

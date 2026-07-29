@@ -1,0 +1,49 @@
+{
+  "name": "codex-image-grid",
+  "version": "0.2.0",
+  "description": "Public Codex image-generation plugin package for generic image requests, Prompt Batch, thumbnails, and project, article, or video visuals. It calls codex_image_grid/generate_image_grid and automatically opens the native SwiftUI app. CodexVideo, Agentic StructCiv, and RelayPress use this same route; the frozen Electron implementation is out of scope.",
+  "author": {
+    "name": "Local",
+    "email": "local@example.com"
+  },
+  "keywords": [
+    "codex",
+    "image-generation",
+    "prompt-batch",
+    "image-grid",
+    "画像生成",
+    "thumbnail",
+    "サムネイル",
+    "project-visuals",
+    "article-visuals",
+    "video-visuals",
+    "codexvideo",
+    "agentic-structciv",
+    "relaypress",
+    "swiftui-native",
+    "mcp",
+    "reference-image-path",
+    "manifest",
+    "handoff"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Image Grid",
+    "shortDescription": "Native Prompt Batch image generation for Codex workflows",
+    "longDescription": "The public Codex Image Grid route for English or Japanese image-generation requests, Prompt Batch work, thumbnails, and project, article, or video visuals. It exposes codex_image_grid/generate_image_grid through MCP, automatically opens the native SwiftUI app, accepts local reference-image paths, and returns the job status, manifest, handoff, image paths, and Codex Markdown contract used by CodexVideo, Agentic StructCiv, and RelayPress. The old Electron app is frozen and is not a runtime fallback.",
+    "developerName": "Local",
+    "category": "Productivity",
+    "capabilities": [
+      "Image Generation",
+      "Prompt Batch",
+      "Native SwiftUI",
+      "MCP"
+    ],
+    "defaultPrompt": [
+      "Generate the requested images with Codex Image Grid",
+      "Create a Prompt Batch of thumbnails for this project",
+      "Create article or video visuals with Codex Image Grid"
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

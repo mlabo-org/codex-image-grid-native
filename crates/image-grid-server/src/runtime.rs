@@ -24,7 +24,9 @@ use uuid::Uuid;
 
 const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const APP_SERVER_JOB_TIMEOUT: Duration = Duration::from_secs(900);
+const APP_SERVER_IMAGE_MAX_RETRIES_ENV: &str = "IMAGE_GRID_APP_SERVER_IMAGE_MAX_RETRIES";
 const APP_SERVER_IMAGE_MAX_RETRIES: u32 = 1;
+const APP_SERVER_IMAGE_MAX_RETRIES_LIMIT: u32 = 3;
 const APP_SERVER_IMAGE_RETRY_BASE: Duration = Duration::from_secs(4);
 const APP_SERVER_IMAGE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(45);
 const APP_SERVER_IMAGE_RATE_LIMIT_COOLDOWN_MAX: Duration = Duration::from_secs(180);
@@ -375,6 +377,30 @@ impl Default for RecoveryConfig {
     }
 }
 
+fn configured_app_server_image_max_retries() -> u32 {
+    let value = std::env::var(APP_SERVER_IMAGE_MAX_RETRIES_ENV).ok();
+    parse_app_server_image_max_retries(value.as_deref())
+}
+
+fn parse_app_server_image_max_retries(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Some(0.0)
+            } else {
+                value.parse::<f64>().ok()
+            }
+        })
+        .filter(|value| value.is_finite())
+        .map(|value| {
+            value
+                .round()
+                .clamp(0.0, f64::from(APP_SERVER_IMAGE_MAX_RETRIES_LIMIT)) as u32
+        })
+        .unwrap_or(APP_SERVER_IMAGE_MAX_RETRIES)
+}
+
 #[derive(Debug, Clone)]
 struct AttemptState {
     id: String,
@@ -424,7 +450,11 @@ pub(crate) struct GenerationRuntime {
 
 impl GenerationRuntime {
     pub(crate) fn new(config: Arc<RuntimeConfig>, app_server: AppServerBridge) -> Self {
-        Self::new_with_recovery_config(config, app_server, RecoveryConfig::default())
+        let recovery = RecoveryConfig {
+            max_retries: configured_app_server_image_max_retries(),
+            ..RecoveryConfig::default()
+        };
+        Self::new_with_recovery_config(config, app_server, recovery)
     }
 
     fn new_with_recovery_config(
@@ -3496,6 +3526,21 @@ mod tests {
     use std::fs as std_fs;
     use std::io::Write;
 
+    #[test]
+    fn app_server_image_max_retries_matches_frozen_bounded_integer_contract() {
+        assert_eq!(
+            parse_app_server_image_max_retries(None),
+            APP_SERVER_IMAGE_MAX_RETRIES
+        );
+        assert_eq!(
+            parse_app_server_image_max_retries(Some("invalid")),
+            APP_SERVER_IMAGE_MAX_RETRIES
+        );
+        assert_eq!(parse_app_server_image_max_retries(Some("0")), 0);
+        assert_eq!(parse_app_server_image_max_retries(Some("3")), 3);
+        assert_eq!(parse_app_server_image_max_retries(Some("4")), 3);
+    }
+
     fn provider_free_runtime(
         temporary: &tempfile::TempDir,
         script: &str,
@@ -3687,7 +3732,7 @@ Hard requirements:\n\
     }
 
     #[tokio::test]
-    async fn provider_free_codex_svg_uses_workspace_write_and_finishes_artifacts() {
+    async fn provider_free_codex_svg_preserves_public_identity_in_manifest() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let server_root = temporary.path().join("server");
         let data_dir = temporary.path().join("data");
@@ -3842,6 +3887,7 @@ done
             &std_fs::read(&artifacts.manifest_path).expect("manifest artifact"),
         )
         .expect("manifest JSON");
+        assert_eq!(manifest["app"], "codex-image-grid");
         assert_eq!(manifest["request"]["engine"], "codex-svg");
         assert_eq!(manifest["outputs"][0]["status"], "done");
         assert_eq!(manifest["outputs"][0]["outputFormat"], "svg");
@@ -4155,6 +4201,17 @@ done
                 job_timeout: Duration::from_secs(30),
             },
         );
+        let diagnostics = runtime.inner.app_server.ensure_ready().await;
+        assert!(
+            diagnostics.ready,
+            "shutdown fixture App Server must initialize before job scheduling: {diagnostics:?}"
+        );
+        let client = runtime
+            .inner
+            .app_server
+            .current_client()
+            .await
+            .expect("owned App Server child");
 
         let (_, first_response) = runtime
             .create_run(
@@ -4173,13 +4230,16 @@ done
             .as_str()
             .expect("first job id")
             .to_owned();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if runtime
+                let running = runtime
                     .job(&first_job_id)
                     .await
-                    .is_some_and(|job| job.status == "running")
-                {
+                    .is_some_and(|job| job.status == "running");
+                let pending_turn = std_fs::read_to_string(&request_log)
+                    .ok()
+                    .is_some_and(|requests| requests.contains("\"method\":\"turn/start\""));
+                if running && pending_turn {
                     break;
                 }
                 sleep(Duration::from_millis(5)).await;
@@ -4187,12 +4247,6 @@ done
         })
         .await
         .expect("active pending RPC");
-        let client = runtime
-            .inner
-            .app_server
-            .current_client()
-            .await
-            .expect("owned App Server child");
         assert!(client.is_running().await);
 
         *runtime.inner.rate_limit_cooldown_until.lock().await =

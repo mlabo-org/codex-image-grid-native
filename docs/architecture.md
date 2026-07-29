@@ -1,14 +1,43 @@
-# Native Architecture
+# Codex Image Grid Native Architecture
 
 ## Goal
 
-Build a greenfield Rust + SwiftUI application that reproduces the observable
-behavior of the frozen Image Grid baseline without porting its Node/Electron
-internals.
+Provide the Rust + SwiftUI implementation behind the public
+`codex-image-grid` generation route while preserving the observable Image Grid
+contract established by the frozen baseline.
 
 The browser UI is not the primary product surface. The primary surface is the
 SwiftUI macOS app. The local Rust runtime remains a compatibility boundary for
 the Codex plugin and an optional browser client.
+
+## Public and isolation identities
+
+The public plugin and skill identity is `codex-image-grid`, and its MCP route is
+`codex_image_grid/generate_image_grid`. Generic image generation/画像生成,
+Prompt Batch, thumbnail, project, article, and video-visual requests use this
+route, including requests originating in CodexVideo, Agentic StructCiv, and
+RelayPress. The route automatically opens the native SwiftUI app.
+
+The implementation keeps separate internal identities:
+
+- public plugin root:
+  `/Users/suzukimakoto/plugins/codex-image-grid-native/plugin/codex-image-grid`;
+- implementation workspace:
+  `/Users/suzukimakoto/plugins/codex-image-grid-native`;
+- public runtime, health, manifest, and MCP server identity:
+  `codex-image-grid`;
+- loopback endpoint: `127.0.0.1:4322`;
+- data root: `~/Library/Application Support/codex-image-grid-native`;
+- installed app: `~/Applications/Codex Image Grid Native.app`;
+- bundle identifier and Swift executable:
+  `local.codex.image-grid.native` / `CodexImageGridNative`.
+
+The nested public root gives the plugin a folder matching its public manifest
+name without taking over the frozen repository path. The isolated port, data
+root, bundle identifier, executable, and install path prevent process and state
+collisions; they are not alternate public plugin names. The old Electron app
+and repository are frozen, out of scope for runtime dispatch, and never a
+fallback.
 
 ## Ownership
 
@@ -52,9 +81,15 @@ The server owns the local runtime boundary:
 
 The MCP binary owns stdio JSON-RPC and the `generate_image_grid` tool. It must
 validate and snapshot a requested local reference-image path before any server
-startup, convert the snapshot to the frozen inline data-URL HTTP shape, launch
-or verify the native runtime, and return the existing
-handoff/manifest/output contract.
+startup, convert the snapshot to the frozen inline data-URL HTTP shape, open or
+re-activate the exact installed native app, verify its SwiftUI-owned runtime,
+and return the existing handoff/manifest/output contract. The active public
+plugin route may not start the Rust server headlessly or fall back to Electron.
+
+The tool's live description and input schema are authoritative for routing
+fields, accepted inputs, limits, defaults, and artifact validity. Plugin and
+skill prose describe ownership and dispatch only; they do not redefine that
+contract.
 
 ## Reference-image policy
 

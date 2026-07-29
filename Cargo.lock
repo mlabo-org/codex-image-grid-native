@@ -253,14 +253,14 @@ dependencies = [
 
 [[package]]
 name = "image-grid-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "image-grid-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image-grid-core",
  "serde_json",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "image-grid-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",

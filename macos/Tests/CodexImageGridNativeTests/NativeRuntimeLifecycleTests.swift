@@ -59,6 +59,54 @@ import Testing
     #expect(plan.executableURL == bundled.resolvingSymlinksInPath().standardizedFileURL)
 }
 
+@Test func packagedAppUsesBundledServerAndAppBundleAsServerRoot() throws {
+    let fixture = try NativeRuntimeFixture()
+    defer { fixture.remove() }
+    let bundled = try fixture.makeExecutable(
+        at: fixture.bundleRoot
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+            .appendingPathComponent("image-grid-server")
+    )
+    let external = try fixture.makeExecutable(
+        at: fixture.root.appendingPathComponent("external/image-grid-server")
+    )
+
+    let plan = try NativeRuntimeResolver.resolveLaunchPlan(
+        context: fixture.packagedContext(
+            bundledServerURL: bundled,
+            environment: [
+                NativeRuntimeResolver.explicitBinaryEnvironmentKey: external.path,
+            ]
+        )
+    )
+
+    #expect(plan.source == .bundledResource)
+    #expect(plan.executableURL == bundled.resolvingSymlinksInPath().standardizedFileURL)
+    #expect(plan.serverRoot == fixture.bundleRoot.resolvingSymlinksInPath().standardizedFileURL)
+    #expect(plan.dataRoot.lastPathComponent == "codex-image-grid-native")
+    #expect(plan.workspaceRoot == plan.dataRoot)
+    #expect(plan.arguments.contains(plan.serverRoot.path))
+    #expect(plan.arguments.suffix(2) == ["--launch-target", "swiftui"])
+
+    let health = try JSONSerialization.data(withJSONObject: [
+        "ok": true,
+        "app": NativeRuntimeResolver.expectedIdentity,
+        "serverRoot": plan.serverRoot.path,
+        "packageName": NativeRuntimeResolver.expectedIdentity,
+        "packageVersion": NativeRuntimeResolver.expectedPackageVersion,
+        "packageRootKind": "packaged",
+        "launchTarget": "swiftui",
+    ])
+    #expect(
+        NativeRuntimeHealthValidation.rejection(
+            data: health,
+            expectedServerRoot: plan.serverRoot,
+            requiredLaunchTarget: "swiftui"
+        ) == nil
+    )
+}
+
 @Test func developmentServerMustRemainInsideTheNativeRepository() throws {
     let fixture = try NativeRuntimeFixture()
     defer { fixture.remove() }
@@ -116,11 +164,15 @@ import Testing
         "app": NativeRuntimeResolver.expectedIdentity,
         "serverRoot": expectedRoot.path,
         "packageName": NativeRuntimeResolver.expectedIdentity,
+        "packageVersion": NativeRuntimeResolver.expectedPackageVersion,
+        "packageRootKind": "source",
         "launchTarget": "swiftui",
         "identity": [
             "app": NativeRuntimeResolver.expectedIdentity,
             "serverRoot": expectedRoot.path,
             "packageName": NativeRuntimeResolver.expectedIdentity,
+            "packageVersion": NativeRuntimeResolver.expectedPackageVersion,
+            "packageRootKind": "source",
             "launchTarget": "swiftui",
         ],
     ])
@@ -135,9 +187,12 @@ import Testing
 
     let foreign = try JSONSerialization.data(withJSONObject: [
         "ok": true,
-        "app": "codex-image-grid",
+        "app": "codex-image-grid-native",
         "serverRoot": expectedRoot.path,
-        "packageName": "codex-image-grid",
+        "packageName": "codex-image-grid-native",
+        "packageVersion": NativeRuntimeResolver.expectedPackageVersion,
+        "packageRootKind": "source",
+        "launchTarget": "swiftui",
     ])
     #expect(
         NativeRuntimeHealthValidation.rejection(
@@ -151,6 +206,9 @@ import Testing
         "app": NativeRuntimeResolver.expectedIdentity,
         "serverRoot": fixture.bundleRoot.path,
         "packageName": NativeRuntimeResolver.expectedIdentity,
+        "packageVersion": NativeRuntimeResolver.expectedPackageVersion,
+        "packageRootKind": "source",
+        "launchTarget": "swiftui",
     ])
     #expect(
         NativeRuntimeHealthValidation.rejection(
@@ -383,6 +441,23 @@ private struct NativeRuntimeFixture {
             bundledServerURL: bundledServerURL,
             bundleRoot: bundleRoot,
             repositoryRoot: repositoryRoot,
+            applicationSupportDirectory: applicationSupportDirectory,
+            forbiddenRoots: [
+                root.appendingPathComponent("plugin-cache", isDirectory: true),
+                root.appendingPathComponent("codex-image-grid", isDirectory: true),
+            ]
+        )
+    }
+
+    func packagedContext(
+        bundledServerURL: URL,
+        environment: [String: String] = [:]
+    ) -> NativeRuntimeResolutionContext {
+        NativeRuntimeResolutionContext(
+            environment: environment,
+            bundledServerURL: bundledServerURL,
+            bundleRoot: bundleRoot,
+            repositoryRoot: nil,
             applicationSupportDirectory: applicationSupportDirectory,
             forbiddenRoots: [
                 root.appendingPathComponent("plugin-cache", isDirectory: true),
