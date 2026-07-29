@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import Testing
 @testable import CodexImageGridNative
@@ -38,7 +39,7 @@ struct ImageGridActiveRunReconciliationTests {
 
     @Test
     @MainActor
-    func stoppingTheStoreStopsTargetedRunReconciliationRequests() async {
+    func unchangedReconciliationDoesNotRepublishAndStoppingEndsRequests() async {
         let fixture = ActiveRunHTTPFixture(targetedResponse: .queued)
         ActiveRunURLProtocol.install(fixture)
         let session = makeActiveRunTestSession()
@@ -57,9 +58,21 @@ struct ImageGridActiveRunReconciliationTests {
 
         await store.hydrateRuns()
         let reconciliationStarted = await waitForActiveRunCondition {
-            fixture.targetedRunRequestCount >= 1
+            fixture.targetedRunRequestCount >= 2
         }
         #expect(reconciliationStarted)
+
+        var publishedChanges = 0
+        let observation = store.objectWillChange.sink {
+            publishedChanges += 1
+        }
+        let stablePollingContinued = await waitForActiveRunCondition {
+            fixture.targetedRunRequestCount >= 4
+        }
+        observation.cancel()
+
+        #expect(stablePollingContinued)
+        #expect(publishedChanges == 0)
 
         store.stop()
         try? await Task.sleep(for: .milliseconds(10))

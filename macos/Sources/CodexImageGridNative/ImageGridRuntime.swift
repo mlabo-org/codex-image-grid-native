@@ -906,8 +906,9 @@ final class ImageGridStore: ObservableObject {
     }
 
     private func merge(_ incoming: [ImageGridJob]) {
+        var mergedJobs = jobs
         for job in incoming {
-            let existing = jobs[job.id]
+            let existing = mergedJobs[job.id]
             if !job.isActive, existing?.isActive != true {
                 if clearedJobIDs.contains(job.id) {
                     continue
@@ -919,9 +920,20 @@ final class ImageGridStore: ObservableObject {
             if let existing, existing.eventTime > job.eventTime {
                 continue
             }
-            jobs[job.id] = job
+            if existing == job {
+                continue
+            }
+            mergedJobs[job.id] = job
         }
-        pruneRetainedJobs()
+        let retained = ImageGridJobSelection.retained(
+            jobs: mergedJobs.values,
+            completedLimit: retainedCompletedLimit
+        )
+        let retainedIDs = Set(retained.map(\.id))
+        mergedJobs = mergedJobs.filter { retainedIDs.contains($0.key) }
+        guard mergedJobs != jobs else { return }
+
+        jobs = mergedJobs
         updateActiveRunReconciliation()
     }
 
@@ -931,7 +943,10 @@ final class ImageGridStore: ObservableObject {
             completedLimit: retainedCompletedLimit
         )
         let retainedIDs = Set(retained.map(\.id))
-        jobs = jobs.filter { retainedIDs.contains($0.key) }
+        let prunedJobs = jobs.filter { retainedIDs.contains($0.key) }
+        if prunedJobs != jobs {
+            jobs = prunedJobs
+        }
     }
 
     private func updateActiveRunReconciliation() {
