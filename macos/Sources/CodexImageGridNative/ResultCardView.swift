@@ -51,8 +51,84 @@ struct ResultCardImageRequestIdentity: Hashable {
     let imageURL: URL
 }
 
+enum ResultCardSelectionHitTesting {
+    static func shouldToggle(
+        isSelectable: Bool,
+        actionBounds: [CGRect],
+        location: CGPoint
+    ) -> Bool {
+        isSelectable && !actionBounds.contains { $0.contains(location) }
+    }
+}
+
+private enum ResultCardSelectionCoordinateSpace {
+    static let name = "result-card-selection"
+}
+
+private struct ResultCardActionBoundsPreferenceKey: PreferenceKey {
+    static let defaultValue: [CGRect] = []
+
+    static func reduce(value: inout [CGRect], nextValue: () -> [CGRect]) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
+private struct ResultCardSelectionInteraction: ViewModifier {
+    let isSelectable: Bool
+    let accessibilityLabel: String
+    let onSelectionToggle: () -> Void
+
+    @State private var actionBounds: [CGRect] = []
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isSelectable {
+            content
+                .contentShape(Rectangle())
+                .coordinateSpace(name: ResultCardSelectionCoordinateSpace.name)
+                .onPreferenceChange(ResultCardActionBoundsPreferenceKey.self) {
+                    actionBounds = $0
+                }
+                .simultaneousGesture(
+                    SpatialTapGesture()
+                        .onEnded { value in
+                            guard ResultCardSelectionHitTesting.shouldToggle(
+                                isSelectable: isSelectable,
+                                actionBounds: actionBounds,
+                                location: value.location
+                            ) else { return }
+                            onSelectionToggle()
+                        }
+                )
+                .accessibilityAction(named: Text(accessibilityLabel)) {
+                    onSelectionToggle()
+                }
+        } else {
+            content
+        }
+    }
+}
+
+private extension View {
+    func resultCardActionRegion() -> some View {
+        background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: ResultCardActionBoundsPreferenceKey.self,
+                    value: [
+                        geometry.frame(
+                            in: .named(ResultCardSelectionCoordinateSpace.name)
+                        ),
+                    ]
+                )
+            }
+        }
+    }
+}
+
 struct ResultCardView: View {
     @Environment(\.appShellLanguage) private var language
+    @Environment(\.openWindow) private var openWindow
 
     let job: ImageGridJob
     let imageURL: URL?
@@ -63,8 +139,6 @@ struct ResultCardView: View {
     let onReveal: () -> Void
     let onManifest: () -> Void
     let onHandoff: () -> Void
-
-    @State private var showsPreview = false
 
     private var strings: ResultCardStrings {
         ResultCardStrings(language: language)
@@ -87,6 +161,7 @@ struct ResultCardView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.top, 6)
                     }
+                    .resultCardActionRegion()
                 }
             }
             .padding(14)
@@ -104,9 +179,13 @@ struct ResultCardView: View {
                 )
         }
         .clipShape(RoundedRectangle(cornerRadius: 8))
-        .sheet(isPresented: $showsPreview) {
-            preview
-        }
+        .modifier(ResultCardSelectionInteraction(
+            isSelectable: isSelectable,
+            accessibilityLabel: isSelected
+                ? strings.removeFromDeletion
+                : strings.addToDeletion,
+            onSelectionToggle: onSelectionToggle
+        ))
     }
 
     private var image: some View {
@@ -175,6 +254,7 @@ struct ResultCardView: View {
                 }
                 .buttonStyle(.plain)
                 .padding(10)
+                .resultCardActionRegion()
                 .accessibilityLabel(
                     isSelected ? strings.removeFromDeletion : strings.addToDeletion
                 )
@@ -246,9 +326,12 @@ struct ResultCardView: View {
             }
             Spacer(minLength: 8)
             Button(strings.preview) {
-                showsPreview = true
+                if let previewPayload {
+                    openWindow(value: previewPayload)
+                }
             }
-            .disabled(imageURL == nil)
+            .disabled(previewPayload == nil)
+            .resultCardActionRegion()
         }
     }
 
@@ -261,6 +344,7 @@ struct ResultCardView: View {
                 Spacer()
                 Button(strings.copy, action: onCopy)
                     .disabled(job.prompt?.isEmpty != false)
+                    .resultCardActionRegion()
             }
             Text(job.prompt?.isEmpty == false ? job.prompt! : strings.promptUnavailable)
                 .appFont(.caption)
@@ -291,52 +375,23 @@ struct ResultCardView: View {
     private var artifactButtons: some View {
         Button("manifest", action: onManifest)
             .disabled(job.manifestViewUrl == nil)
+            .resultCardActionRegion()
         Button("handoff", action: onHandoff)
             .disabled(job.handoffViewUrl == nil)
+            .resultCardActionRegion()
         Button(strings.reveal, action: onReveal)
             .disabled(job.outputPath == nil || job.status != "done")
+            .resultCardActionRegion()
     }
 
-    private var preview: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(strings.preview)
-                        .appFont(.title3)
-                    Text("\(job.filename ?? strings.image) · Run \(job.runId ?? "—")")
-                        .appFont(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button(strings.close) {
-                    showsPreview = false
-                }
-                .keyboardShortcut(.cancelAction)
-            }
-            if let imageURL {
-                AsyncImage(url: imageURL) { phase in
-                    switch phase {
-                    case .empty:
-                        ProgressView()
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    case let .success(image):
-                        image
-                            .resizable()
-                            .scaledToFit()
-                    case .failure:
-                        ContentUnavailableView(
-                            strings.imageUnavailable,
-                            systemImage: "photo.badge.exclamationmark"
-                        )
-                    @unknown default:
-                        EmptyView()
-                    }
-                }
-                .id(imageRequestIdentity(imageURL))
-            }
-        }
-        .padding(18)
-        .frame(minWidth: 520, idealWidth: 900, minHeight: 420, idealHeight: 680)
+    private var previewPayload: ImageGridPreviewPayload? {
+        guard let imageURL else { return nil }
+        return ImageGridPreviewPayload(
+            jobID: job.id,
+            imageURL: imageURL,
+            filename: job.filename,
+            runID: job.runId
+        )
     }
 
     private var title: String {
@@ -406,7 +461,6 @@ private struct ResultCardStrings {
     }
 
     var preview: String { localized("プレビュー", "Preview") }
-    var close: String { localized("閉じる", "Close") }
     var copy: String { localized("コピー", "Copy") }
     var reveal: String { localized("Finderに表示", "Reveal") }
     var usedPrompt: String { localized("使用Prompt", "Prompt used") }
@@ -418,7 +472,6 @@ private struct ResultCardStrings {
     var finalizingImage: String { localized("画像生成を完了しています...", "Finalizing image...") }
     var generationFailed: String { localized("画像生成に失敗しました", "Image generation failed") }
     var imageUnavailable: String { localized("画像を読み込めません", "Image unavailable") }
-    var image: String { localized("画像", "Image") }
     var markForDeletion: String { localized("削除対象にする", "Mark for deletion") }
     var selectedForDeletion: String { localized("削除対象", "Selected for deletion") }
     var addToDeletion: String { localized("このrunを削除対象に追加", "Add this run to deletion") }
