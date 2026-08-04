@@ -171,15 +171,25 @@ struct ImageGridView: View {
     }
 
     private var mainWorkspace: some View {
-        ScrollView {
+        VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 22) {
                 header
                 generationPanel
-                resultsPanel
             }
             .padding(.horizontal, 32)
-            .padding(.vertical, 28)
+            .padding(.top, 28)
+            .padding(.bottom, 22)
             .frame(maxWidth: .infinity)
+
+            Divider()
+
+            ScrollView(.vertical) {
+                resultsPanel
+                    .padding(.horizontal, 32)
+                    .padding(.vertical, 28)
+                    .frame(maxWidth: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
