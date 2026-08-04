@@ -57,25 +57,31 @@ public enum AppShellFontFamily: String, CaseIterable, Identifiable {
     }
 }
 
-public enum AppShellFontSize: String, CaseIterable, Identifiable {
-    case small
-    case standard
-    case large
-    case extraLarge
+public struct AppShellFontSize: RawRepresentable, Hashable, Identifiable {
+    public static let minimumPoints = 10
+    public static let maximumPoints = 32
+    public static let defaultValue = AppShellFontSize(points: 16)
 
-    public var id: String { rawValue }
+    public let rawValue: Int
+
+    public var id: Int { rawValue }
+    public var points: Int { rawValue }
+
+    public init?(rawValue: Int) {
+        guard Self.range.contains(rawValue) else { return nil }
+        self.rawValue = rawValue
+    }
+
+    public init(points: Int) {
+        rawValue = min(max(points, Self.minimumPoints), Self.maximumPoints)
+    }
+
+    public static var range: ClosedRange<Int> {
+        minimumPoints...maximumPoints
+    }
 
     fileprivate var scale: CGFloat {
-        switch self {
-        case .small:
-            return 0.9
-        case .standard:
-            return 1
-        case .large:
-            return 1.15
-        case .extraLarge:
-            return 1.3
-        }
+        CGFloat(points) / 17
     }
 }
 
@@ -148,7 +154,10 @@ public struct AppShellTypography {
 }
 
 private struct AppShellTypographyKey: EnvironmentKey {
-    static let defaultValue = AppShellTypography(family: .system, size: .standard)
+    static let defaultValue = AppShellTypography(
+        family: .system,
+        size: .defaultValue
+    )
 }
 
 private struct AppShellLanguageKey: EnvironmentKey {
@@ -191,7 +200,12 @@ public enum AppShellPreferenceKeys {
     public static let language = "appShell.language"
     public static let theme = "appShell.theme"
     public static let fontFamily = "appShell.fontFamily"
-    public static let fontSize = "appShell.fontSize"
+    public static let fontSize = "appShell.fontSizePoints"
+}
+
+public enum AppShellPreferencesLayout {
+    public static let width: CGFloat = 520
+    public static let height: CGFloat = 320
 }
 
 @MainActor
@@ -212,7 +226,8 @@ public struct AppShellRoot<Content: View>: View {
     @AppStorage(AppShellPreferenceKeys.language) private var language = AppShellLanguage.system
     @AppStorage(AppShellPreferenceKeys.theme) private var theme = AppShellTheme.system
     @AppStorage(AppShellPreferenceKeys.fontFamily) private var fontFamily = AppShellFontFamily.system
-    @AppStorage(AppShellPreferenceKeys.fontSize) private var fontSize = AppShellFontSize.standard
+    @AppStorage(AppShellPreferenceKeys.fontSize) private var fontSize =
+        AppShellFontSize.defaultValue
 
     private let content: Content
 
@@ -253,7 +268,8 @@ public struct AppShellPreferencesView: View {
     @AppStorage(AppShellPreferenceKeys.language) private var language = AppShellLanguage.system
     @AppStorage(AppShellPreferenceKeys.theme) private var theme = AppShellTheme.system
     @AppStorage(AppShellPreferenceKeys.fontFamily) private var fontFamily = AppShellFontFamily.system
-    @AppStorage(AppShellPreferenceKeys.fontSize) private var fontSize = AppShellFontSize.standard
+    @AppStorage(AppShellPreferenceKeys.fontSize) private var fontSize =
+        AppShellFontSize.defaultValue
 
     public init() {}
 
@@ -279,9 +295,28 @@ public struct AppShellPreferencesView: View {
                 }
             }
 
-            Picker(strings.fontSize, selection: $fontSize) {
-                ForEach(AppShellFontSize.allCases) { choice in
-                    Text(strings.name(for: choice)).tag(choice)
+            LabeledContent(strings.fontSize) {
+                HStack(spacing: 6) {
+                    TextField(
+                        strings.fontSize,
+                        value: fontSizePoints,
+                        format: .number
+                    )
+                    .labelsHidden()
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 54)
+
+                    Text(strings.pointUnit)
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+
+                    Stepper(
+                        strings.fontSize,
+                        value: fontSizePoints,
+                        in: AppShellFontSize.range,
+                        step: 1
+                    )
+                    .labelsHidden()
                 }
             }
 
@@ -292,7 +327,17 @@ public struct AppShellPreferencesView: View {
         }
         .formStyle(.grouped)
         .padding()
-        .frame(minWidth: 420)
+        .frame(
+            width: AppShellPreferencesLayout.width,
+            height: AppShellPreferencesLayout.height
+        )
+    }
+
+    private var fontSizePoints: Binding<Int> {
+        Binding(
+            get: { fontSize.points },
+            set: { fontSize = AppShellFontSize(points: $0) }
+        )
     }
 }
 
@@ -300,7 +345,8 @@ public struct AppShellSettingsMenu: Commands {
     @AppStorage(AppShellPreferenceKeys.language) private var language = AppShellLanguage.system
     @AppStorage(AppShellPreferenceKeys.theme) private var theme = AppShellTheme.system
     @AppStorage(AppShellPreferenceKeys.fontFamily) private var fontFamily = AppShellFontFamily.system
-    @AppStorage(AppShellPreferenceKeys.fontSize) private var fontSize = AppShellFontSize.standard
+    @AppStorage(AppShellPreferenceKeys.fontSize) private var fontSize =
+        AppShellFontSize.defaultValue
 
     public init() {}
 
@@ -324,10 +370,27 @@ public struct AppShellSettingsMenu: Commands {
                 }
             }
 
-            Picker(AppShellStrings(language: language).fontSize, selection: $fontSize) {
-                ForEach(AppShellFontSize.allCases) { choice in
-                    Text(AppShellStrings(language: language).name(for: choice)).tag(choice)
+            Menu(
+                "\(AppShellStrings(language: language).fontSize): "
+                    + "\(fontSize.points) "
+                    + AppShellStrings(language: language).pointUnit
+            ) {
+                Button(AppShellStrings(language: language).decreaseFontSize) {
+                    fontSize = AppShellFontSize(points: fontSize.points - 1)
                 }
+                .disabled(fontSize.points == AppShellFontSize.minimumPoints)
+
+                Button(AppShellStrings(language: language).increaseFontSize) {
+                    fontSize = AppShellFontSize(points: fontSize.points + 1)
+                }
+                .disabled(fontSize.points == AppShellFontSize.maximumPoints)
+
+                Divider()
+
+                Button(AppShellStrings(language: language).resetFontSize) {
+                    fontSize = .defaultValue
+                }
+                .disabled(fontSize == .defaultValue)
             }
         }
     }
@@ -362,6 +425,20 @@ public struct AppShellStrings {
 
     public var fontSize: String {
         localized(japanese: "文字サイズ", english: "Text size")
+    }
+
+    public var pointUnit: String { "pt" }
+
+    public var decreaseFontSize: String {
+        localized(japanese: "文字を1 pt小さく", english: "Decrease by 1 pt")
+    }
+
+    public var increaseFontSize: String {
+        localized(japanese: "文字を1 pt大きく", english: "Increase by 1 pt")
+    }
+
+    public var resetFontSize: String {
+        localized(japanese: "16 ptに戻す", english: "Reset to 16 pt")
     }
 
     public var preview: String {
@@ -406,16 +483,4 @@ public struct AppShellStrings {
         }
     }
 
-    public func name(for value: AppShellFontSize) -> String {
-        switch value {
-        case .small:
-            return localized(japanese: "小", english: "Small")
-        case .standard:
-            return localized(japanese: "標準", english: "Standard")
-        case .large:
-            return localized(japanese: "大", english: "Large")
-        case .extraLarge:
-            return localized(japanese: "特大", english: "Extra Large")
-        }
-    }
 }

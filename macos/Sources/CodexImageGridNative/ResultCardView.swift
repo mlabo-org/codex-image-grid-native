@@ -281,7 +281,7 @@ struct ResultCardView: View {
     private var generationFailurePlaceholder: some View {
         VStack(spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 28, weight: .semibold))
+                .appFont(.title, weight: .semibold)
                 .foregroundStyle(.red)
                 .accessibilityHidden(true)
             Text(strings.generationFailed)
@@ -303,7 +303,7 @@ struct ResultCardView: View {
     private var imageUnavailablePlaceholder: some View {
         VStack(spacing: 8) {
             Image(systemName: "photo.badge.exclamationmark")
-                .font(.system(size: 24, weight: .medium))
+                .appFont(.title2, weight: .medium)
                 .accessibilityHidden(true)
             Text(strings.imageUnavailable)
                 .appFont(.caption, weight: .semibold)

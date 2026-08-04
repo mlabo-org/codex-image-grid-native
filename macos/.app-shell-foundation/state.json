@@ -1,13 +1,13 @@
 {
   "files": {
-    "Sources/CodexImageGridNative/AppShellFoundation.swift": "3399aa3639b22f06c6b9302e38bd185ea6b1405891af87f8cd604b06b50dd610"
+    "Sources/CodexImageGridNative/AppShellFoundation.swift": "07cb2f92411f9c17e65af9740a72839672a6c73056cdb760c45d5528e2c14b9d"
   },
   "platform": "swiftui",
   "schemaVersion": 1,
   "sourceDir": "Sources/CodexImageGridNative",
   "task": {
     "deliveryMode": "iterative",
-    "id": "native-ui-parity-20260729"
+    "id": "numeric-font-settings-20260805"
   },
-  "templateVersion": "0.1.0"
+  "templateVersion": "0.2.0"
 }

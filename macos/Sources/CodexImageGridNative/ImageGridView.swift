@@ -960,7 +960,7 @@ struct ImageGridView: View {
     private func hiddenFailureCopy(count: Int) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 20, weight: .semibold))
+                .appFont(.title3, weight: .semibold)
                 .foregroundStyle(.red)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
