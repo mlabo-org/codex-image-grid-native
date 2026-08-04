@@ -38,6 +38,20 @@ struct CodexImageGridApp: App {
         .defaultSize(width: 1180, height: 820)
         .windowResizability(.contentMinSize)
 
+        WindowGroup(
+            "Codex Image Grid — プレビュー",
+            for: ImageGridPreviewPayload.self
+        ) { $payload in
+            if let payload {
+                ImageGridPreviewView(payload: payload)
+            }
+        }
+        .defaultSize(
+            width: ImageGridPreviewLayout.defaultWidth,
+            height: ImageGridPreviewLayout.defaultHeight
+        )
+        .windowResizability(.contentMinSize)
+
         Settings {
             AppShellRoot {
                 AppShellPreferencesView()

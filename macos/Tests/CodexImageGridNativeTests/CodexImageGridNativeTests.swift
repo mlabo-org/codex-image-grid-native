@@ -192,6 +192,49 @@ import Foundation
     #expect(grid.gridItems(for: 3_840, itemCount: 2).count == 2)
 }
 
+@Test func selectableResultCardUsesTheWholeCardExceptActionControls() {
+    let actionBounds = [
+        CGRect(x: 320, y: 12, width: 100, height: 32),
+        CGRect(x: 12, y: 260, width: 90, height: 32),
+    ]
+
+    #expect(ResultCardSelectionHitTesting.shouldToggle(
+        isSelectable: true,
+        actionBounds: actionBounds,
+        location: CGPoint(x: 180, y: 140)
+    ))
+    #expect(!ResultCardSelectionHitTesting.shouldToggle(
+        isSelectable: true,
+        actionBounds: actionBounds,
+        location: CGPoint(x: 350, y: 28)
+    ))
+    #expect(!ResultCardSelectionHitTesting.shouldToggle(
+        isSelectable: false,
+        actionBounds: actionBounds,
+        location: CGPoint(x: 180, y: 140)
+    ))
+}
+
+@Test func previewWindowPayloadRoundTripsWithLargeWindowDefaults() throws {
+    let payload = ImageGridPreviewPayload(
+        jobID: "preview-job",
+        imageURL: URL(fileURLWithPath: "/tmp/generated/preview.png"),
+        filename: "preview.png",
+        runID: "preview-run"
+    )
+
+    let restored = try JSONDecoder().decode(
+        ImageGridPreviewPayload.self,
+        from: JSONEncoder().encode(payload)
+    )
+
+    #expect(restored == payload)
+    #expect(ImageGridPreviewLayout.defaultWidth == 1180)
+    #expect(ImageGridPreviewLayout.defaultHeight == 820)
+    #expect(ImageGridPreviewLayout.minimumWidth < ImageGridPreviewLayout.defaultWidth)
+    #expect(ImageGridPreviewLayout.minimumHeight < ImageGridPreviewLayout.defaultHeight)
+}
+
 @Test func referenceContractMatchesNativeServerLimitAndFormats() {
     #expect(ImageGridReference.maximumBytes == 100 * 1_024 * 1_024)
     #expect(ImageGridReference.supportedExtensions == ["png", "jpg", "jpeg", "webp"])
