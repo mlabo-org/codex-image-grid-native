@@ -19,6 +19,7 @@ command -v curl >/dev/null
 command -v jq >/dev/null
 
 cargo build \
+  --locked \
   --manifest-path "$repo_root/Cargo.toml" \
   --package image-grid-server \
   --package image-grid-mcp

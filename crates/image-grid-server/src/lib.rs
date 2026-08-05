@@ -15,6 +15,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, Request as AxumRequest, State};
 use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -30,6 +31,7 @@ use std::convert::Infallible;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -299,7 +301,44 @@ fn router_with_state(state: RuntimeState) -> Router {
             "/api/preflight/app-server-image",
             get(preflight).post(preflight),
         )
+        .layer(middleware::from_fn(reject_non_loopback_origin))
         .with_state(state)
+}
+
+async fn reject_non_loopback_origin(request: AxumRequest, next: Next) -> Response {
+    let Some(origin) = request.headers().get(header::ORIGIN) else {
+        return next.run(request).await;
+    };
+    let allowed = origin.to_str().ok().is_some_and(is_loopback_web_origin);
+    if allowed {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "browser origin must be loopback",
+                "code": "ForbiddenOrigin"
+            })),
+        )
+            .into_response()
+    }
+}
+
+fn is_loopback_web_origin(origin: &str) -> bool {
+    let Ok(uri) = origin.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let host = authority.host().trim_matches(['[', ']']);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 async fn health(State(state): State<RuntimeState>) -> Json<HealthResponse> {
@@ -816,7 +855,12 @@ fn classify_package_root(path: &Path) -> &'static str {
         "cache"
     } else if normalized.ends_with(".app") || normalized.contains(".app/Contents/Resources/") {
         "packaged"
-    } else if normalized.ends_with("/plugins/codex-image-grid-native") {
+    } else if path.join("Cargo.toml").is_file()
+        && path.join("crates/image-grid-server/Cargo.toml").is_file()
+        && path
+            .join("plugin/codex-image-grid/.codex-plugin/plugin.json")
+            .is_file()
+    {
         "source"
     } else {
         "unknown"
@@ -853,10 +897,46 @@ mod tests {
     }
 
     #[test]
+    fn browser_origins_are_limited_to_loopback() {
+        for origin in [
+            "http://localhost:3000",
+            "http://127.0.0.1:4322",
+            "https://[::1]:4322",
+        ] {
+            assert!(is_loopback_web_origin(origin), "{origin}");
+        }
+        for origin in [
+            "https://example.com",
+            "http://192.168.1.10:4322",
+            "null",
+            "file:///tmp/client.html",
+        ] {
+            assert!(!is_loopback_web_origin(origin), "{origin}");
+        }
+    }
+
+    #[test]
     fn fresh_health_uses_public_identity_with_native_paths() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let source_root = temporary.path().join("renamed-checkout");
+        fs::create_dir_all(source_root.join("crates/image-grid-server"))
+            .expect("server crate directory");
+        fs::create_dir_all(source_root.join("plugin/codex-image-grid/.codex-plugin"))
+            .expect("plugin manifest directory");
+        fs::write(source_root.join("Cargo.toml"), "[workspace]\n").expect("workspace manifest");
+        fs::write(
+            source_root.join("crates/image-grid-server/Cargo.toml"),
+            "[package]\nname = \"image-grid-server\"\n",
+        )
+        .expect("server manifest");
+        fs::write(
+            source_root.join("plugin/codex-image-grid/.codex-plugin/plugin.json"),
+            "{}\n",
+        )
+        .expect("plugin manifest");
         let config = RuntimeConfig::new(
-            PathBuf::from("/Users/example/plugins/codex-image-grid-native"),
-            PathBuf::from("/tmp/codex-image-grid-native"),
+            source_root,
+            temporary.path().join("data"),
             None,
             "server".to_owned(),
         );
@@ -870,7 +950,10 @@ mod tests {
         assert_eq!(health.identity.app, "codex-image-grid");
         assert_eq!(health.identity.package_name, "codex-image-grid");
         assert_eq!(health.identity.package_version, "0.2.4");
-        assert_eq!(health.identity.data_dir, "/tmp/codex-image-grid-native");
+        assert_eq!(
+            health.identity.data_dir,
+            display_path(&temporary.path().join("data"))
+        );
         assert_eq!(health.identity.package_root_kind, "source");
         assert_eq!(
             health.identity.app_server_image_scheduler,

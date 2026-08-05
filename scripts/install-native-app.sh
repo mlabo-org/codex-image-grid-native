@@ -3,7 +3,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-INSTALL_PARENT="/Users/suzukimakoto/Applications"
+USER_HOME="${HOME:?HOME must be set to install Codex Image Grid}"
+INSTALL_PARENT="$USER_HOME/Applications"
 APP_NAME="Codex Image Grid Native.app"
 INSTALL_TARGET="$INSTALL_PARENT/$APP_NAME"
 APP_EXECUTABLE="CodexImageGridNative"
@@ -11,7 +12,7 @@ MCP_EXECUTABLE="image-grid-mcp"
 SERVER_EXECUTABLE="image-grid-server"
 PACKAGE_VERSION="0.2.4"
 BUNDLE_IDENTIFIER="local.codex.image-grid.native"
-DATA_ROOT="/Users/suzukimakoto/Library/Application Support/codex-image-grid"
+DATA_ROOT="$USER_HOME/Library/Application Support/codex-image-grid"
 INFO_PLIST_SOURCE="$REPO_ROOT/macos/App/Info.plist"
 APP_ICON_SOURCE="$REPO_ROOT/macos/App/AppIcon.icns"
 
@@ -45,7 +46,7 @@ print_plan() {
     echo "infoPlistSource: $INFO_PLIST_SOURCE"
     echo "appIconSource: $APP_ICON_SOURCE"
     echo "build:"
-    echo "- cargo build --release -p image-grid-mcp -p image-grid-server"
+    echo "- cargo build --locked --release -p image-grid-mcp -p image-grid-server"
     echo "- swift build -c release --package-path $REPO_ROOT/macos"
     echo "bundleContents:"
     echo "- Contents/Info.plist"
@@ -93,7 +94,7 @@ fi
 
 (
     cd "$REPO_ROOT"
-    cargo build --release -p image-grid-mcp -p image-grid-server
+    cargo build --locked --release -p image-grid-mcp -p image-grid-server
 )
 swift build -c release --package-path "$REPO_ROOT/macos"
 
@@ -157,7 +158,8 @@ INSTALLED_NEW=1
 
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$INSTALL_TARGET"
 if [[ -n "$PREVIOUS_APP" && -d "$PREVIOUS_APP" ]]; then
-    TRASH_TARGET="/Users/suzukimakoto/.Trash/Codex Image Grid Native.before-$(
+    /bin/mkdir -p "$USER_HOME/.Trash"
+    TRASH_TARGET="$USER_HOME/.Trash/Codex Image Grid Native.before-$(
         /bin/date +%Y%m%d-%H%M%S
     )-$$.app"
     /bin/mv "$PREVIOUS_APP" "$TRASH_TARGET"

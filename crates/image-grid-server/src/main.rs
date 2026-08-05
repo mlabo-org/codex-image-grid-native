@@ -21,6 +21,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         print_help();
         return Ok(());
     }
+    validate_loopback_bind(options.bind)?;
 
     let data_dir = prepare_absolute_directory(options.data_dir, "data directory")?;
     let server_root = canonical_directory(options.server_root, "server root")?;
@@ -46,6 +47,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
     shutdown.shutdown().await;
     serve_result?;
     Ok(())
+}
+
+fn validate_loopback_bind(bind: SocketAddr) -> Result<(), String> {
+    if bind.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(format!(
+            "bind address must be loopback-only; received {bind}"
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +250,16 @@ mod tests {
         assert_eq!(
             select_shutdown_signal(pending(), ready(())).await,
             ShutdownSignal::Sigterm
+        );
+    }
+
+    #[test]
+    fn public_network_bind_is_rejected() {
+        assert!(validate_loopback_bind("127.0.0.1:4322".parse().unwrap()).is_ok());
+        assert!(validate_loopback_bind("[::1]:4322".parse().unwrap()).is_ok());
+        assert_eq!(
+            validate_loopback_bind("0.0.0.0:4322".parse().unwrap()).unwrap_err(),
+            "bind address must be loopback-only; received 0.0.0.0:4322"
         );
     }
 }

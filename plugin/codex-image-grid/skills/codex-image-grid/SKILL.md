@@ -21,17 +21,16 @@ or fall back to the separate retired Electron project.
 
 ## Source, cache, install, and refresh boundaries
 
-- Public plugin source authority is
-  `/Users/suzukimakoto/plugins/codex-image-grid-native/plugin/codex-image-grid`.
-- Its Rust and Swift implementation source remains in
-  `/Users/suzukimakoto/plugins/codex-image-grid-native`.
-- Codex plugin cache under `/Users/suzukimakoto/.codex/plugins/cache/` is
-  generated runtime state, not an edit target.
+- Public plugin source authority is this plugin directory under
+  `plugin/codex-image-grid/` in the source repository.
+- Its Rust and Swift implementation source is the repository root.
+- Codex plugin cache is generated runtime state, not an edit target.
 - An installed plugin or cached copy is an activation surface, not source.
   Never repair source behavior by patching it in place.
-- Refresh and installation are separate activation actions. After a source
-  change, use the source-first `refresh-codex-plugin` flow only when that
-  action is authorized; do not claim that a source edit activated the plugin.
+- Build, installation, and active-session pickup are separate actions. In a
+  source checkout, use `scripts/bootstrap-codex.sh` only when repository setup
+  or activation is authorized; do not claim that a source edit activated the
+  plugin.
 
 ## Stop conditions
 

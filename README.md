@@ -1,135 +1,234 @@
 # Codex Image Grid
 
-Native Rust + SwiftUI implementation repository for the public
-`codex-image-grid` plugin. The installable public plugin package lives at
-`plugin/codex-image-grid/`; the repository root remains the implementation
-workspace.
+A native macOS image-generation workspace for Codex, built with Rust and
+SwiftUI. It provides Prompt Batch generation, reference-image analysis,
+Japanese/English UI, light/dark themes, run history, and artifact handoff
+through the `codex_image_grid/generate_image_grid` MCP tool.
 
-Codex routes English or Japanese image-generation requests, Prompt Batch,
-thumbnails, and project, article, or video visuals through
-`codex_image_grid/generate_image_grid`. The same public route is used when
-CodexVideo or RelayPress requests visuals. Calling the tool
-launches or joins the native runtime and automatically opens the SwiftUI app.
-The live tool schema is authoritative for accepted inputs and returned
-artifacts.
+Codex向けのmacOSネイティブ画像生成ワークスペースです。RustとSwiftUIで
+実装され、Prompt Batch、参照画像解析、日英UI、ライト/ダークテーマ、
+生成履歴、成果物の受け渡しに対応しています。
 
-The separate Electron project that supplied the behavioral baseline is retired
-and archived. It is not this repository's Git parent or prior checkout, and it
-is never an implicit runtime fallback.
+[English](#english) · [日本語](#日本語)
 
-The Rust server, MCP binary, and SwiftUI primary path have passed the
-provider-free and live App Server acceptance slices. The public plugin's
-`.mcp.json` launches the MCP binary bundled inside the installed native app.
+## UI preview / UIプレビュー
 
-## Public and internal identity
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/codex-image-grid-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="./docs/assets/codex-image-grid-light.png">
+  <img alt="Codex Image Grid native macOS UI" src="./docs/assets/codex-image-grid-light.png" width="100%">
+</picture>
 
-- Public plugin and skill identity: `codex-image-grid`.
-- Public MCP route: `codex_image_grid/generate_image_grid`.
-- Public plugin source:
-  `/Users/suzukimakoto/plugins/codex-image-grid-native/plugin/codex-image-grid`.
-- Rust and Swift implementation source:
-  `/Users/suzukimakoto/plugins/codex-image-grid-native`.
-- Public runtime, health, manifest, and MCP server identity:
-  `codex-image-grid`.
-- Internal loopback port: `127.0.0.1:4322`.
-- Compatible runtime data and image history:
-  `~/Library/Application Support/codex-image-grid`.
-- Installed app:
-  `~/Applications/Codex Image Grid Native.app`.
-- Internal bundle identifier and executable:
-  `local.codex.image-grid.native` / `CodexImageGridNative`.
+<details>
+<summary>Show both themes / 両テーマを表示</summary>
 
-The nested public root lets its folder and manifest both use
-`codex-image-grid` while this `codex-image-grid-native` repository remains a
-separate project with its own Git history. The native port, bundle, executable,
-and install identities remain isolated, while user-visible generated images,
-manifests, handoffs, and restored history use the baseline-compatible runtime
-data root. The separate retired Electron runtime must remain stopped so both
-projects never write that shared runtime data root concurrently.
+| Light / ライト | Dark / ダーク |
+| --- | --- |
+| ![Light theme](./docs/assets/codex-image-grid-light.png) | ![Dark theme](./docs/assets/codex-image-grid-dark.png) |
 
-The detailed baseline contract is [docs/frozen-baseline-spec.md](docs/frozen-baseline-spec.md).
-It records the frozen source commit, observable API/MCP/job/artifact behavior,
-and the existing test evidence that the native implementation must reproduce.
+</details>
 
-## Target runtime
+## English
 
-- `image-grid-core`: Rust domain model, validation, job state, retry policy,
-  artifact contract, and reference-image staging.
-- `image-grid-server`: Rust local runtime exposing the compatibility HTTP/SSE
-  surface and Codex App Server JSON-RPC bridge.
-- `image-grid-mcp`: Rust stdio MCP server used by the Codex plugin.
-- `macos/`: SwiftUI native app. It owns the window, native file picker,
-  display preferences, image grid, and lifecycle of the Rust runtime.
+### Requirements
 
-The SwiftUI app passes a validated local reference-image path to the Rust
-runtime. The MCP tool also accepts a local absolute path, but snapshots the
-file before startup and submits the frozen inline data-URL HTTP shape. Browser
-clients use that same bounded inline HTTP contract. In every case, the Rust
-runtime stages an owned copy in the run directory before starting jobs.
+- macOS 14 or later
+- Apple Swift 6.3 toolchain
+- Rust 1.95 (selected automatically by `rust-toolchain.toml`)
+- Codex CLI installed and signed in
+- `jq`, `rg`, `curl`, Xcode command-line tools, and internet access for the
+  first dependency build
 
-## Current status
+The generated-image route uses `codex app-server`, so the active Codex account
+must have access to image generation.
 
-The provider-free first runnable slice now includes:
+### Automatic setup when opened in Codex
 
-- reference-image validation and copied staging as
-  `reference.png`, `reference.jpg`, or `reference.webp`;
-- an internal native server on `127.0.0.1:4322` with the baseline-compatible
-  `GET /api/health` identity shape;
-- deterministic Codex executable selection, an owned `codex app-server`
-  JSONL child, and compatible `GET`/`POST
-  `/api/preflight/app-server-image` diagnostics;
-- compatible `/api/run`, `/api/run-batch`, `/api/runs`, `/events`, generated
-  file, manifest, handoff, and safe artifact-view routes for
-  `app-server-image`;
-- a separate concurrency-one `codex-svg` App Server path that writes only to
-  its exact native run output and preserves the same job/artifact lifecycle;
-- the frozen `queued → starting → running → done|error` primary job state,
-  global 24-slot image scheduler, exact output naming, prompt construction,
-  stable App Server image notifications, atomic image/artifact writes, and
-  attempt-scoped timeout/rate-limit/missing-output recovery;
-- compatible `POST /api/analyze-reference` staging, ephemeral read-only App
-  Server analysis, bounded JSON input, and cleanup;
-- stdio MCP JSONL handling for `initialize`, `ping`, `tools/list`, and
-  `tools/call`, including the frozen `generate_image_grid` schema and
-  validation errors, bounded native-server launch/join, health and App Server
-  preflight checks, and compatible success summaries/structured content;
-- a responsive SwiftUI runtime client with the frozen language, theme, prompt,
-  generation-option, reference-image, and result-filter controls, plus
-  health/preflight/run calls, SSE progress, validated/downscaled
-  choose/drop/paste references, reference analysis states, native file
-  actions, and adaptive result cards;
-- persisted draft/reference restoration, bounded long-session result
-  retention, restart-safe run restoration, Finder-compatible host routes, and
-  graceful owned-runtime shutdown with joined-runtime preservation.
+Clone this repository and open the clone as a Codex workspace. On the first
+setup, build, test, run, or source task, the repository-scoped `AGENTS.md`
+instructs Codex to run:
 
-The provider-free fixture now completes real HTTP and MCP runs through the
-owned App Server transport and validates generated images, local reference
-copy staging, compatible MCP handoff fields, run responses, manifests,
-history, artifact routes, bounded recovery, and reference analysis.
-The live acceptance slice completed one real MCP-launched App Server image run,
-then restored that run in the SwiftUI app. It also exercised native
-choose/clear reference handling, language/theme and engine switches,
-single/batch prompts, flexible two-column and narrow one-column layouts, and
-owned/joined runtime shutdown.
+```bash
+scripts/bootstrap-codex.sh
+```
 
-## Build and checks
+The idempotent bootstrap:
+
+1. checks the macOS toolchain;
+2. builds the locked Rust workspace and release SwiftUI app;
+3. installs the signed app at
+   `~/Applications/Codex Image Grid Native.app`;
+4. registers this clone as the `codex-image-grid-native` local marketplace;
+5. installs the `codex-image-grid` plugin; and
+6. records a source fingerprint under the ignored `.run/` directory so an
+   unchanged clone is not rebuilt.
+
+Passive cloning alone does not execute repository code. Codex performs the
+bootstrap when it starts an applicable task in the imported workspace. The
+script stops without replacing anything if another source already owns the
+same plugin or marketplace identity.
+
+Preview the setup without changing the machine:
+
+```bash
+scripts/bootstrap-codex.sh --dry-run
+```
+
+Rebuild and refresh a plugin installed by this repository's marketplace after
+an intentional source change:
+
+```bash
+scripts/bootstrap-codex.sh --force
+```
+
+Start a new Codex task after first-time plugin installation so the newly
+installed MCP route is discovered.
+
+### Build and install manually
+
+Run the complete provider-free acceptance command:
 
 ```bash
 scripts/check.sh
-scripts/install-native-app.sh
+```
+
+Build the components directly:
+
+```bash
+cargo build --workspace --locked
+swift build --package-path macos
+```
+
+Inspect or execute the native app installer:
+
+```bash
+scripts/install-native-app.sh --dry-run
 scripts/install-native-app.sh --execute
 ```
 
-The check script validates the Rust workspace and Swift package scaffold. It
-also runs the provider-free health, fake-App-Server preflight, reference
-analysis, complete one-image run/artifact, and MCP process smoke with an
-isolated temporary native data root. It does not start a provider, launch or
-modify the separate retired Electron app, refresh plugin cache, activate the plugin, or
-write runtime state into this repository.
+Register the plugin manually from the repository root:
 
-The installer is dry-run by default. `--execute` builds the Rust and Swift
-release products, assembles and ad-hoc signs the native app, verifies it, and
-atomically installs it at the path above. The public plugin's `.mcp.json`
-executes the MCP binary inside that bundle; a valid tool call opens or
-re-activates the app before joining its SwiftUI-owned runtime. Runtime data
-remains under the isolated native data directory above.
+```bash
+codex plugin marketplace add .
+codex plugin add codex-image-grid@codex-image-grid-native
+```
+
+### Repository layout
+
+- `crates/image-grid-core/` — validation, job state, retry policy, and artifact
+  contracts.
+- `crates/image-grid-server/` — loopback-only HTTP/SSE runtime and Codex App
+  Server bridge.
+- `crates/image-grid-mcp/` — stdio MCP server for
+  `generate_image_grid`.
+- `macos/` — native SwiftUI application.
+- `plugin/codex-image-grid/` — installable Codex plugin package.
+- `.agents/plugins/marketplace.json` — local marketplace metadata for Codex.
+
+Runtime files and generated images are stored outside the repository at
+`~/Library/Application Support/codex-image-grid`. The local HTTP runtime binds
+only to loopback and rejects non-loopback browser origins.
+
+### License
+
+MIT. See [LICENSE](LICENSE).
+
+## 日本語
+
+### 必要環境
+
+- macOS 14以降
+- Apple Swift 6.3ツールチェーン
+- Rust 1.95（`rust-toolchain.toml`で自動選択）
+- インストール・サインイン済みのCodex CLI
+- `jq`、`rg`、`curl`、Xcode Command Line Tools
+- 初回の依存関係取得に使うインターネット接続
+
+画像生成は`codex app-server`を使用します。利用中のCodexアカウントで画像生成が
+使える必要があります。
+
+### Codexに取り込んだときの自動セットアップ
+
+このリポジトリをcloneし、そのcloneをCodexのワークスペースとして開いてください。
+初回のセットアップ・ビルド・テスト・実行・ソース変更タスクで、リポジトリ内の
+`AGENTS.md`に従い、Codexが次を実行します。
+
+```bash
+scripts/bootstrap-codex.sh
+```
+
+このスクリプトは一度の実行で次を行います。
+
+1. macOSのビルド環境を確認
+2. lock済みRustワークスペースとSwiftUIリリースアプリをビルド
+3. `~/Applications/Codex Image Grid Native.app`へ署名・配置
+4. このcloneを`codex-image-grid-native`ローカルマーケットプレイスとして登録
+5. `codex-image-grid`プラグインをインストール
+6. 無視対象の`.run/`へソース指紋を保存し、変更がなければ次回ビルドを省略
+
+cloneしただけではリポジトリ内のコードは実行されません。Codexが取り込んだ
+ワークスペースで対象タスクを開始した時点でセットアップされます。同名の
+プラグインまたはマーケットプレイスを別ソースが所有している場合は、上書きせず
+停止します。
+
+マシンを変更せず内容だけ確認する場合:
+
+```bash
+scripts/bootstrap-codex.sh --dry-run
+```
+
+意図的なソース変更後、このリポジトリのマーケットプレイスから入れたプラグインを
+再ビルド・再反映する場合:
+
+```bash
+scripts/bootstrap-codex.sh --force
+```
+
+初回プラグインインストール後は、新しいCodexタスクを開始すると追加されたMCPが
+検出されます。
+
+### 手動ビルド・インストール
+
+プロバイダー不要の一括検証:
+
+```bash
+scripts/check.sh
+```
+
+各コンポーネントを直接ビルド:
+
+```bash
+cargo build --workspace --locked
+swift build --package-path macos
+```
+
+ネイティブアプリのインストール内容確認・実行:
+
+```bash
+scripts/install-native-app.sh --dry-run
+scripts/install-native-app.sh --execute
+```
+
+リポジトリルートからプラグインを手動登録:
+
+```bash
+codex plugin marketplace add .
+codex plugin add codex-image-grid@codex-image-grid-native
+```
+
+### リポジトリ構成
+
+- `crates/image-grid-core/` — 入力検証、ジョブ状態、再試行、成果物契約
+- `crates/image-grid-server/` — loopback限定HTTP/SSEとCodex App Server接続
+- `crates/image-grid-mcp/` — `generate_image_grid`用stdio MCPサーバー
+- `macos/` — SwiftUIネイティブアプリ
+- `plugin/codex-image-grid/` — Codexへインストールするプラグイン一式
+- `.agents/plugins/marketplace.json` — Codex用ローカルマーケットプレイス定義
+
+実行データと生成画像はリポジトリ外の
+`~/Library/Application Support/codex-image-grid`へ保存されます。ローカルHTTP
+サーバーはloopbackだけにbindし、外部オリジンからのブラウザ要求を拒否します。
+
+### ライセンス
+
+MITです。[LICENSE](LICENSE)を参照してください。

@@ -1,10 +1,10 @@
 {
   "name": "codex-image-grid",
   "version": "0.2.4",
-  "description": "Public Codex image-generation plugin package for generic image requests, Prompt Batch, thumbnails, and project, article, or video visuals. It calls codex_image_grid/generate_image_grid and automatically opens the native SwiftUI app. CodexVideo and RelayPress use this same route; the separate retired Electron project is out of scope.",
+  "description": "Native macOS image-generation plugin for Codex. It supports Prompt Batch, reference images, thumbnails, and project, article, or video visuals through codex_image_grid/generate_image_grid.",
   "author": {
-    "name": "Local",
-    "email": "local@example.com"
+    "name": "mlabo-org",
+    "url": "https://github.com/mlabo-org"
   },
   "keywords": [
     "codex",
@@ -30,7 +30,7 @@
     "displayName": "Codex Image Grid",
     "shortDescription": "Native Prompt Batch image generation for Codex workflows",
     "longDescription": "The public Codex Image Grid route for English or Japanese image-generation requests, Prompt Batch work, thumbnails, and project, article, or video visuals. It exposes codex_image_grid/generate_image_grid through MCP, automatically opens the native SwiftUI app, accepts local reference-image paths, and returns the job status, manifest, handoff, image paths, and Codex Markdown contract used by CodexVideo and RelayPress. The separate retired Electron project is not a runtime fallback.",
-    "developerName": "Local",
+    "developerName": "mlabo-org",
     "category": "Productivity",
     "capabilities": [
       "Image Generation",
