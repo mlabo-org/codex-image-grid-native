@@ -8,15 +8,14 @@ workspace.
 Codex routes English or Japanese image-generation requests, Prompt Batch,
 thumbnails, and project, article, or video visuals through
 `codex_image_grid/generate_image_grid`. The same public route is used when
-CodexVideo, Agentic StructCiv, or RelayPress requests visuals. Calling the tool
+CodexVideo or RelayPress requests visuals. Calling the tool
 launches or joins the native runtime and automatically opens the SwiftUI app.
 The live tool schema is authoritative for accepted inputs and returned
 artifacts.
 
-The old Electron repository at
-`/Users/suzukimakoto/plugins/codex-image-grid` is frozen and out of scope for
-runtime routing. It remains a read-only behavioral reference and is never an
-implicit fallback.
+The separate Electron project that supplied the behavioral baseline is retired
+and archived. It is not this repository's Git parent or prior checkout, and it
+is never an implicit runtime fallback.
 
 The Rust server, MCP binary, and SwiftUI primary path have passed the
 provider-free and live App Server acceptance slices. The public plugin's
@@ -41,12 +40,12 @@ provider-free and live App Server acceptance slices. The public plugin's
   `local.codex.image-grid.native` / `CodexImageGridNative`.
 
 The nested public root lets its folder and manifest both use
-`codex-image-grid` without reusing the frozen repository path. The native
-port, bundle, executable, and install identities remain isolated, while the
-user-visible generated images, manifests, handoffs, and restored history keep
-the frozen product's original data root. The frozen Electron runtime must
-remain stopped so both implementations never write that shared data root
-concurrently.
+`codex-image-grid` while this `codex-image-grid-native` repository remains a
+separate project with its own Git history. The native port, bundle, executable,
+and install identities remain isolated, while user-visible generated images,
+manifests, handoffs, and restored history use the baseline-compatible runtime
+data root. The separate retired Electron runtime must remain stopped so both
+projects never write that shared runtime data root concurrently.
 
 The detailed baseline contract is [docs/frozen-baseline-spec.md](docs/frozen-baseline-spec.md).
 It records the frozen source commit, observable API/MCP/job/artifact behavior,
@@ -125,7 +124,7 @@ The check script validates the Rust workspace and Swift package scaffold. It
 also runs the provider-free health, fake-App-Server preflight, reference
 analysis, complete one-image run/artifact, and MCP process smoke with an
 isolated temporary native data root. It does not start a provider, launch or
-modify the frozen Electron app, refresh plugin cache, activate the plugin, or
+modify the separate retired Electron app, refresh plugin cache, activate the plugin, or
 write runtime state into this repository.
 
 The installer is dry-run by default. `--execute` builds the Rust and Swift

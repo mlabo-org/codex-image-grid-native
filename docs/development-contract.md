@@ -15,8 +15,9 @@ index; executable Rust/Swift tests and protocol fixtures remain the validators.
   registration and skill discovery.
 - This repository root is the source of truth for the native Rust and Swift
   implementation.
-- The frozen baseline at `/Users/suzukimakoto/plugins/codex-image-grid` is a
-  read-only historical behavioral reference, not an active runtime route.
+- The separate retired Electron project's source is archived. Its observed
+  behavior is preserved in `docs/frozen-baseline-spec.md`, not consumed from a
+  live source path or treated as this repository's Git history.
 - Codex plugin cache, generated images, run manifests, logs, and build output
   are not source.
 - No runtime state is stored in this repository.
@@ -40,11 +41,11 @@ index; executable Rust/Swift tests and protocol fixtures remain the validators.
 
 Source edits, cache refresh, installation, and active-session pickup are
 separate boundaries. Cache or installed copies are not edited in place. The
-old Electron plugin is frozen and out of scope; no registration or failure
-path may dispatch to it.
+separate Electron plugin project is retired and out of scope; no registration
+or failure path may dispatch to it.
 
-The frozen Electron runtime must remain stopped because rollback and Native
-share the original user-visible data root and may not write it concurrently.
+The separate Electron runtime must remain stopped because it and the native
+runtime may not write the shared user-visible data root concurrently.
 
 ## Parent-orchestrated work units
 
@@ -57,7 +58,7 @@ Each future work unit must have one owner and one contract-complete handoff:
 | Runtime | `crates/image-grid-server` | runnable local server | server smoke + affected Rust tests | Codex RPC contract is unresolved |
 | MCP | `crates/image-grid-mcp`, `plugin/codex-image-grid/.mcp.json` | stdio tool and installed-app launch route | initialize/list/call smoke | binary or launch identity is unavailable |
 | UI | `macos/` | SwiftUI native surface | `swift test` and representative app build | Rust runtime boundary is not stable |
-| Parity | `docs/parity/`, tests | machine-readable comparison receipt | old/new external-contract comparison | a declared behavior differs |
+| Parity | `docs/parity/`, tests | machine-readable comparison receipt | separate-project external-contract comparison | a declared behavior differs |
 
 The parent keeps the global acceptance decision. A worker returns changed
 paths, artifact paths, validation results, blocker, and remaining unknowns;
@@ -77,4 +78,4 @@ The native release acceptance bundle covers:
 The public plugin `.mcp.json` executes the MCP binary inside the verified
 installed app. A valid call opens or re-activates that exact app, requires its
 packaged `0.2.4` SwiftUI-owned health identity on the isolated port, and never
-uses the frozen Electron or a headless server fallback.
+uses the separate retired Electron project or a headless server fallback.
