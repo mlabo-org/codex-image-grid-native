@@ -30,6 +30,16 @@ struct ResponsiveResultGrid {
             count: max(1, count)
         )
     }
+
+    var adaptiveGridItems: [GridItem] {
+        [
+            GridItem(
+                .adaptive(minimum: minimumColumnWidth),
+                spacing: spacing,
+                alignment: .top
+            ),
+        ]
+    }
 }
 
 enum ResultCardImageLoadFailurePresentation: Equatable {
@@ -110,18 +120,23 @@ private struct ResultCardSelectionInteraction: ViewModifier {
 }
 
 private extension View {
-    func resultCardActionRegion() -> some View {
-        background {
-            GeometryReader { geometry in
-                Color.clear.preference(
-                    key: ResultCardActionBoundsPreferenceKey.self,
-                    value: [
-                        geometry.frame(
-                            in: .named(ResultCardSelectionCoordinateSpace.name)
-                        ),
-                    ]
-                )
+    @ViewBuilder
+    func resultCardActionRegion(enabled: Bool) -> some View {
+        if enabled {
+            background {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: ResultCardActionBoundsPreferenceKey.self,
+                        value: [
+                            geometry.frame(
+                                in: .named(ResultCardSelectionCoordinateSpace.name)
+                            ),
+                        ]
+                    )
+                }
             }
+        } else {
+            self
         }
     }
 }
@@ -161,7 +176,7 @@ struct ResultCardView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.top, 6)
                     }
-                    .resultCardActionRegion()
+                    .resultCardActionRegion(enabled: isSelectable)
                 }
             }
             .padding(14)
@@ -254,7 +269,7 @@ struct ResultCardView: View {
                 }
                 .buttonStyle(.plain)
                 .padding(10)
-                .resultCardActionRegion()
+                .resultCardActionRegion(enabled: isSelectable)
                 .accessibilityLabel(
                     isSelected ? strings.removeFromDeletion : strings.addToDeletion
                 )
@@ -331,7 +346,7 @@ struct ResultCardView: View {
                 }
             }
             .disabled(previewPayload == nil)
-            .resultCardActionRegion()
+            .resultCardActionRegion(enabled: isSelectable)
         }
     }
 
@@ -344,7 +359,7 @@ struct ResultCardView: View {
                 Spacer()
                 Button(strings.copy, action: onCopy)
                     .disabled(job.prompt?.isEmpty != false)
-                    .resultCardActionRegion()
+                    .resultCardActionRegion(enabled: isSelectable)
             }
             Text(job.prompt?.isEmpty == false ? job.prompt! : strings.promptUnavailable)
                 .appFont(.caption)
@@ -361,13 +376,8 @@ struct ResultCardView: View {
     }
 
     private var artifactActions: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 10) {
-                artifactButtons
-            }
-            VStack(alignment: .leading, spacing: 8) {
-                artifactButtons
-            }
+        HStack(spacing: 10) {
+            artifactButtons
         }
     }
 
@@ -375,13 +385,13 @@ struct ResultCardView: View {
     private var artifactButtons: some View {
         Button("manifest", action: onManifest)
             .disabled(job.manifestViewUrl == nil)
-            .resultCardActionRegion()
+            .resultCardActionRegion(enabled: isSelectable)
         Button("handoff", action: onHandoff)
             .disabled(job.handoffViewUrl == nil)
-            .resultCardActionRegion()
+            .resultCardActionRegion(enabled: isSelectable)
         Button(strings.reveal, action: onReveal)
             .disabled(job.outputPath == nil || job.status != "done")
-            .resultCardActionRegion()
+            .resultCardActionRegion(enabled: isSelectable)
     }
 
     private var previewPayload: ImageGridPreviewPayload? {
