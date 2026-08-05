@@ -1,19 +1,19 @@
 # Frozen Image Grid Behavioral Specification
 
-Status: observed baseline for the native replacement.
+Status: observed baseline sourced from a separate retired Electron project.
 
 Evidence snapshot:
 
-- Repository: `/Users/suzukimakoto/plugins/codex-image-grid`
+- Source status: archived locally; not an active source or runtime dependency
 - Git commit: `b92af946c1ceca3d4826406c0b63305cbcfb02bb`
 - Branch: `codex/image-grid-app-server-queue-diagnostics`
 - Observed: 2026-07-29
 
-This document fixes externally observable behavior for the Rust + SwiftUI
-replacement. It does not require preserving Node modules, Electron internals,
-DOM structure, or accidental implementation details. The upstream image
-provider is stochastic, so byte-for-byte image equality is not a parity
-requirement.
+This document fixes externally observable behavior selected for the independent
+Rust + SwiftUI project. It does not merge repository identity or require
+preserving Node modules, Electron internals, DOM structure, or accidental
+implementation details. The upstream image provider is stochastic, so
+byte-for-byte image equality is not a parity requirement.
 
 ## 1. Product identity and runtime modes
 
@@ -26,8 +26,8 @@ It has three related routes:
 3. Codex plugin: exposes one stdio MCP tool and launches or verifies the local
    server before submitting a run.
 
-The native replacement makes SwiftUI the primary route. The local Rust runtime
-remains the shared execution boundary. A browser client is compatibility-only.
+The native project makes SwiftUI the primary route. The local Rust runtime
+remains its execution boundary. A browser client is compatibility-only.
 
 During migration, the native runtime must use a separate port, bundle/app
 identity, and data directory. It must not attach to or silently fall back to
@@ -207,7 +207,7 @@ paths outside the generated root are not restored.
 
 ## 8. Electron and UI behavior that remains user-visible
 
-The native replacement must preserve user-visible intent even though its
+The native project must preserve the selected user-visible intent even though its
 implementation is SwiftUI:
 
 - Japanese / English / System language choices;
@@ -219,13 +219,13 @@ implementation is SwiftUI:
 - artifact preview, close/focus restoration, open/reveal generated file, and
   generated-directory actions.
 
-The old Electron security policy is a baseline for equivalent native behavior:
+The separate Electron project's security policy is a baseline for equivalent native behavior:
 single-instance ownership, external URL delegation, blocked non-web schemes,
 artifact-only child windows, and clean shutdown of an owned server.
 
 ## 9. Parity evidence map
 
-The frozen repository's tests are the initial executable evidence set:
+The archived separate repository's tests are the initial executable evidence set:
 
 - shared limits and schema: `tests/benchmark-contract.test.mjs`,
   `tests/contract-parity.test.mjs`;

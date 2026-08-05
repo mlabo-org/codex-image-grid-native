@@ -15,8 +15,8 @@ the Codex plugin and an optional browser client.
 The public plugin and skill identity is `codex-image-grid`, and its MCP route is
 `codex_image_grid/generate_image_grid`. Generic image generation/画像生成,
 Prompt Batch, thumbnail, project, article, and video-visual requests use this
-route, including requests originating in CodexVideo, Agentic StructCiv, and
-RelayPress. The route automatically opens the native SwiftUI app.
+route, including requests originating in CodexVideo and RelayPress. The route
+automatically opens the native SwiftUI app.
 
 The implementation keeps separate internal identities:
 
@@ -34,11 +34,12 @@ The implementation keeps separate internal identities:
   `local.codex.image-grid.native` / `CodexImageGridNative`.
 
 The nested public root gives the plugin a folder matching its public manifest
-name without taking over the frozen repository path. Port, bundle identifier,
+name while `codex-image-grid-native` remains a separate project and Git
+repository from the retired Electron project. Port, bundle identifier,
 executable, and install path remain isolated implementation details. Generated
 images, manifests, handoffs, and restored history deliberately retain the
-original product data root. The old Electron app and repository are frozen,
-out of scope for runtime dispatch, and never a fallback; the Electron runtime
+baseline-compatible runtime data root. The separate retired Electron app and
+source are out of scope for runtime dispatch and never a fallback; its runtime
 must remain stopped so it cannot write the shared data root concurrently.
 
 ## Ownership
