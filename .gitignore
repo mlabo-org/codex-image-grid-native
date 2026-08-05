@@ -4,6 +4,7 @@
 /.run/
 /generated/
 /artifacts/
+.coding-agents/
 .DS_Store
 
 # Swift Package Manager build output.
@@ -13,4 +14,3 @@ macos/.swiftpm/
 # Local runtime state and developer-only configuration.
 .env
 *.local.json
-

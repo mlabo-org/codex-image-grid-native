@@ -20,10 +20,8 @@ automatically opens the native SwiftUI app.
 
 The implementation keeps separate internal identities:
 
-- public plugin root:
-  `/Users/suzukimakoto/plugins/codex-image-grid-native/plugin/codex-image-grid`;
-- implementation workspace:
-  `/Users/suzukimakoto/plugins/codex-image-grid-native`;
+- public plugin root: `plugin/codex-image-grid/` in this repository;
+- implementation workspace: this repository root;
 - public runtime, health, manifest, and MCP server identity:
   `codex-image-grid`;
 - loopback endpoint: `127.0.0.1:4322`;

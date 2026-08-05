@@ -33,6 +33,7 @@ impl IntoResponse for JsonBodyError {
 
 pub(crate) async fn read_json_body(request: Request<Body>) -> Result<Value, JsonBodyError> {
     let limit = configured_json_body_limit();
+    let content_type = request.headers().get(header::CONTENT_TYPE).cloned();
     if request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -49,10 +50,26 @@ pub(crate) async fn read_json_body(request: Request<Body>) -> Result<Value, Json
     if bytes.is_empty() {
         return Ok(Value::Object(Map::new()));
     }
+    if !content_type.as_ref().is_some_and(is_json_content_type) {
+        return Err(JsonBodyError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            code: "UnsupportedContentType",
+            message: "non-empty request bodies require Content-Type: application/json".to_owned(),
+        });
+    }
     serde_json::from_slice(&bytes).map_err(|error| JsonBodyError {
         status: StatusCode::BAD_REQUEST,
         code: "InvalidJsonBody",
         message: format!("invalid JSON request body: {error}"),
+    })
+}
+
+fn is_json_content_type(value: &axum::http::HeaderValue) -> bool {
+    value.to_str().ok().is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
     })
 }
 
@@ -85,6 +102,7 @@ mod tests {
     async fn malformed_and_declared_oversized_json_have_compatible_errors() {
         let malformed = read_json_body(
             Request::builder()
+                .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from("{"))
                 .expect("malformed request"),
         )
@@ -103,5 +121,15 @@ mod tests {
         .expect_err("over-limit content length must be rejected");
         assert_eq!(oversized.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(oversized.code, "RequestBodyTooLarge");
+
+        let unsupported = read_json_body(
+            Request::builder()
+                .body(Body::from("{}"))
+                .expect("unsupported request"),
+        )
+        .await
+        .expect_err("non-empty body without JSON content type must be rejected");
+        assert_eq!(unsupported.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(unsupported.code, "UnsupportedContentType");
     }
 }

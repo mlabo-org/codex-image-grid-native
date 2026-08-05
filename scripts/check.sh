@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-cargo test --workspace --manifest-path "$repo_root/Cargo.toml"
+cargo test --workspace --locked --manifest-path "$repo_root/Cargo.toml"
 "$repo_root/scripts/smoke-first-slice.sh"
 swift test --package-path "$repo_root/macos"
 

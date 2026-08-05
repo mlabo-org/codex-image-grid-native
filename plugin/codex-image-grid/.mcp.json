@@ -1,13 +1,13 @@
 {
   "mcpServers": {
     "codex_image_grid": {
-      "command": "/Users/suzukimakoto/Applications/Codex Image Grid Native.app/Contents/Resources/image-grid-mcp",
-      "cwd": "/Users/suzukimakoto/Applications/Codex Image Grid Native.app",
+      "command": "/bin/bash",
+      "args": [
+        "-lc",
+        "set -euo pipefail; app_dir=\"${HOME:?HOME must be set}/Applications/Codex Image Grid Native.app\"; export IMAGE_GRID_APP_DIR=\"$app_dir\" IMAGE_GRID_NATIVE_APP_PATH=\"$app_dir\" IMAGE_GRID_RUNTIME_STATE_DIR=\"${HOME}/Library/Application Support/codex-image-grid-native/.run\"; exec \"$app_dir/Contents/Resources/image-grid-mcp\""
+      ],
       "env": {
         "IMAGE_GRID_URL": "http://127.0.0.1:4322",
-        "IMAGE_GRID_APP_DIR": "/Users/suzukimakoto/Applications/Codex Image Grid Native.app",
-        "IMAGE_GRID_NATIVE_APP_PATH": "/Users/suzukimakoto/Applications/Codex Image Grid Native.app",
-        "IMAGE_GRID_RUNTIME_STATE_DIR": "/Users/suzukimakoto/Library/Application Support/codex-image-grid-native/.run",
         "IMAGE_GRID_STRICT_APP_DIR": "1",
         "IMAGE_GRID_LAUNCH_TIMEOUT_MS": "15000",
         "IMAGE_GRID_APP_ACTIVATION_TIMEOUT_MS": "5000",

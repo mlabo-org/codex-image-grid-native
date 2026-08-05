@@ -3,7 +3,7 @@
 This repository is the source of truth for the public `codex-image-grid`
 plugin's native implementation. Its installable plugin package is rooted at
 `plugin/codex-image-grid/`, where the folder and manifest identity match. The
-parent plugin contract at `/Users/suzukimakoto/plugins/AGENTS.md` applies.
+repository-scoped `AGENTS.md` applies to Codex work in a clone.
 
 The frozen behavior target is recorded in
 `docs/frozen-baseline-spec.md`. That file is an evidence-backed contract
@@ -26,10 +26,8 @@ index; executable Rust/Swift tests and protocol fixtures remain the validators.
 
 - Public plugin and skill name: `codex-image-grid`.
 - Public MCP route: `codex_image_grid/generate_image_grid`.
-- Public plugin source:
-  `/Users/suzukimakoto/plugins/codex-image-grid-native/plugin/codex-image-grid`.
-- Native implementation workspace:
-  `/Users/suzukimakoto/plugins/codex-image-grid-native`.
+- Public plugin source: `plugin/codex-image-grid/`.
+- Native implementation workspace: this repository root.
 - Public runtime, health, manifest, and MCP server identity:
   `codex-image-grid`.
 - Compatible generated-image and history root:
