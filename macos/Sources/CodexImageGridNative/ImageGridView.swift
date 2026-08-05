@@ -110,7 +110,6 @@ struct ImageGridView: View {
     @State private var referenceLoadGeneration = 0
     @State private var formError: String?
     @State private var draftReady = false
-    @State private var resultGridColumnCount = 1
 
     private var strings: ImageGridStrings {
         ImageGridStrings(language: selectedLanguage)
@@ -118,9 +117,11 @@ struct ImageGridView: View {
 
     var body: some View {
         AppShellRoot {
-            mainWorkspace
-            .background(Color(nsColor: .windowBackgroundColor))
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            GeometryReader { _ in
+                mainWorkspace
+                    .background(Color(nsColor: .windowBackgroundColor))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
             .frame(minHeight: 560)
         }
         .onAppear {
@@ -899,9 +900,7 @@ struct ImageGridView: View {
                 }
 
                 LazyVGrid(
-                    columns: grid.gridItems(
-                        count: min(resultGridColumnCount, visible.count)
-                    ),
+                    columns: grid.adaptiveGridItems,
                     alignment: .leading,
                     spacing: grid.spacing
                 ) {
@@ -921,22 +920,6 @@ struct ImageGridView: View {
                     }
                 }
                 .frame(maxWidth: .infinity)
-                .background {
-                    GeometryReader { geometry in
-                        Color.clear
-                            .onChange(
-                                of: grid.columnCount(
-                                    for: geometry.size.width,
-                                    itemCount: visible.count
-                                ),
-                                initial: true
-                            ) { _, columnCount in
-                                if columnCount != resultGridColumnCount {
-                                    resultGridColumnCount = columnCount
-                                }
-                            }
-                    }
-                }
             }
         }
     }
