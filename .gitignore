@@ -4,6 +4,7 @@
 /.run/
 /generated/
 /artifacts/
+.CAO/
 .coding-agent-orchestrator/
 # Preserve ignored remnants from the superseded workflow state.
 .coding-agents/
