@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "codex-image-grid/generate-image-grid-input/v1",
+  "title": "Codex Image Grid generate_image_grid input",
+  "type": "object",
+  "description": "The live MCP input. Prompt count multiplied by variants per prompt must not exceed 24 total jobs.",
+  "properties": {
+    "prompts": {
+      "type": "array",
+      "description": "Prompt Batch input. Pass project-specific visual directions.",
+      "minItems": 1,
+      "maxItems": 12,
+      "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
+    },
+    "count": {
+      "type": "integer",
+      "description": "Variants per prompt. prompts.length × count must be at most 24.",
+      "minimum": 1,
+      "maximum": 6,
+      "default": 1
+    },
+    "mood": {
+      "type": "string",
+      "enum": ["warm-mascot", "clean-thumbnail", "editorial-soft", "cinematic", "minimal-product"],
+      "default": "warm-mascot"
+    },
+    "engine": {
+      "type": "string",
+      "enum": ["app-server-image", "codex-svg"],
+      "default": "app-server-image"
+    },
+    "aspectRatio": {
+      "type": "string",
+      "enum": ["16:9", "4:3", "1:1", "3:4", "9:16"],
+      "default": "16:9"
+    },
+    "referencePremise": {
+      "type": "string",
+      "description": "Optional visual identity notes from the current product or reference image."
+    },
+    "referenceImagePath": {
+      "type": "string",
+      "description": "Optional absolute local PNG, JPEG, or WebP path to attach as the visual reference."
+    },
+    "waitMs": {
+      "type": "integer",
+      "description": "Optional short wait for completion before returning.",
+      "minimum": 0,
+      "maximum": 120000,
+      "default": 0
+    }
+  },
+  "required": ["prompts"],
+  "allOf": [
+    { "if": { "required": ["count"], "properties": { "count": { "const": 1 } } }, "then": { "properties": { "prompts": { "maxItems": 12 } } } },
+    { "if": { "required": ["count"], "properties": { "count": { "const": 2 } } }, "then": { "properties": { "prompts": { "maxItems": 12 } } } },
+    { "if": { "required": ["count"], "properties": { "count": { "const": 3 } } }, "then": { "properties": { "prompts": { "maxItems": 8 } } } },
+    { "if": { "required": ["count"], "properties": { "count": { "const": 4 } } }, "then": { "properties": { "prompts": { "maxItems": 6 } } } },
+    { "if": { "required": ["count"], "properties": { "count": { "const": 5 } } }, "then": { "properties": { "prompts": { "maxItems": 4 } } } },
+    { "if": { "required": ["count"], "properties": { "count": { "const": 6 } } }, "then": { "properties": { "prompts": { "maxItems": 4 } } } }
+  ],
+  "x-image-grid-total-job-constraint": { "formula": "prompts.length * count", "maximum": 24 }
+}

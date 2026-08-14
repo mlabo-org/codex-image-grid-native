@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "codex-image-grid/generate-image-grid-output/v1",
+  "title": "Successful Codex Image Grid MCP CallToolResult",
+  "type": "object",
+  "required": ["content", "structuredContent", "isError"],
+  "properties": {
+    "content": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["type", "text"],
+        "properties": { "type": { "const": "text" }, "text": { "type": "string" } }
+      }
+    },
+    "structuredContent": { "$ref": "#/$defs/structuredContent" },
+    "isError": { "const": false }
+  },
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "integer": { "type": "integer" },
+    "counts": {
+      "type": "object",
+      "required": ["total", "done", "running", "failed"],
+      "properties": {
+        "total": { "$ref": "#/$defs/integer" },
+        "done": { "$ref": "#/$defs/integer" },
+        "running": { "$ref": "#/$defs/integer" },
+        "failed": { "$ref": "#/$defs/integer" }
+      }
+    },
+    "diagnosticError": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": { "code": { "type": "string" }, "message": { "type": "string" } }
+    },
+    "candidate": {
+      "type": "object",
+      "required": ["source", "command", "status", "reason"],
+      "properties": {
+        "source": { "type": "string" }, "command": { "$ref": "#/$defs/nullableString" }, "status": { "type": "string" },
+        "reason": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "appServerDiagnostics": {
+      "type": "object",
+      "required": ["status", "ready", "selectedCommand", "selectedSource", "candidates", "error", "platformOs", "checkedAt"],
+      "properties": {
+        "status": { "type": "string" }, "ready": { "type": "boolean" },
+        "selectedCommand": { "$ref": "#/$defs/nullableString" }, "selectedSource": { "$ref": "#/$defs/nullableString" },
+        "candidates": { "type": "array", "items": { "$ref": "#/$defs/candidate" } },
+        "error": { "oneOf": [{ "$ref": "#/$defs/diagnosticError" }, { "type": "null" }] },
+        "platformOs": { "$ref": "#/$defs/nullableString" }, "checkedAt": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "scheduler": {
+      "type": "object",
+      "required": ["configuredMax", "adaptive", "currentLimit", "active", "queued"],
+      "properties": {
+        "configuredMax": { "$ref": "#/$defs/integer" }, "adaptive": { "type": "boolean" },
+        "currentLimit": { "$ref": "#/$defs/integer" }, "active": { "$ref": "#/$defs/integer" }, "queued": { "$ref": "#/$defs/integer" }
+      }
+    },
+    "runtimeIdentity": {
+      "type": "object",
+      "required": ["app", "serverRoot", "dataDir", "generatedDir", "runDir", "workspaceDir", "launchTarget", "packageName", "packageVersion", "packageRootKind", "codexAppServer", "appServerImageScheduler"],
+      "properties": {
+        "app": { "const": "codex-image-grid" }, "serverRoot": { "type": "string" }, "dataDir": { "type": "string" },
+        "generatedDir": { "type": "string" }, "runDir": { "type": "string" }, "workspaceDir": { "type": "string" },
+        "launchTarget": { "type": "string" }, "packageName": { "const": "codex-image-grid" }, "packageVersion": { "type": "string" },
+        "packageRootKind": { "type": "string" }, "codexAppServer": { "$ref": "#/$defs/appServerDiagnostics" },
+        "appServerImageScheduler": { "$ref": "#/$defs/scheduler" }
+      }
+    },
+    "health": {
+      "type": "object",
+      "required": ["ok", "jobs", "appServerImage", "appServerImageReady", "appServerImageDiagnostics", "identity"],
+      "properties": {
+        "ok": { "const": true }, "jobs": { "$ref": "#/$defs/integer" }, "appServerImage": { "type": "boolean" },
+        "appServerImageReady": { "type": "boolean" }, "appServerImageDiagnostics": { "$ref": "#/$defs/appServerDiagnostics" },
+        "app": { "const": "codex-image-grid" }, "serverRoot": { "type": "string" }, "dataDir": { "type": "string" },
+        "generatedDir": { "type": "string" }, "runDir": { "type": "string" }, "workspaceDir": { "type": "string" },
+        "launchTarget": { "type": "string" }, "packageName": { "const": "codex-image-grid" }, "packageVersion": { "type": "string" },
+        "packageRootKind": { "type": "string" }, "codexAppServer": { "$ref": "#/$defs/appServerDiagnostics" },
+        "appServerImageScheduler": { "$ref": "#/$defs/scheduler" }, "identity": { "$ref": "#/$defs/runtimeIdentity" }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "required": ["phase", "phaseChangedAt", "enqueuedAt", "dequeuedAt", "firstStartedAt", "firstRunningAt", "completedAt", "queueMs", "executionMs", "totalMs", "cooldownMs", "attemptCount", "currentAttemptStartedAt", "lastAttemptCompletedAt", "lastAttemptMs"],
+      "properties": {
+        "phase": { "type": "string" }, "phaseChangedAt": { "$ref": "#/$defs/integer" }, "enqueuedAt": { "$ref": "#/$defs/integer" },
+        "dequeuedAt": { "type": ["integer", "null"] }, "firstStartedAt": { "type": ["integer", "null"] },
+        "firstRunningAt": { "type": ["integer", "null"] }, "completedAt": { "type": ["integer", "null"] },
+        "queueMs": { "type": ["integer", "null"] }, "executionMs": { "type": ["integer", "null"] }, "totalMs": { "type": ["integer", "null"] },
+        "cooldownMs": { "$ref": "#/$defs/integer" }, "attemptCount": { "$ref": "#/$defs/integer" },
+        "currentAttemptStartedAt": { "type": ["integer", "null"] }, "lastAttemptCompletedAt": { "type": ["integer", "null"] }, "lastAttemptMs": { "type": ["integer", "null"] }
+      }
+    },
+    "outputImage": {
+      "type": "object",
+      "required": ["id", "prompt", "promptIndex", "promptTotal", "variant", "total", "status", "statusText", "engine", "model", "mood", "aspectRatio", "filename", "outputFormat", "outputPath", "imageUrl", "referenceImagePath", "referenceImageUrl", "threadId", "turnId", "errorCode", "errorMessage", "upstreamStatus", "diagnosticLog", "retryCount", "timing", "createdAt", "updatedAt", "absoluteImageUrl", "codexMarkdown"],
+      "properties": {
+        "id": { "type": "string" }, "prompt": { "type": "string" }, "promptIndex": { "$ref": "#/$defs/integer" }, "promptTotal": { "$ref": "#/$defs/integer" },
+        "variant": { "$ref": "#/$defs/integer" }, "total": { "$ref": "#/$defs/integer" }, "status": { "type": "string" }, "statusText": { "type": "string" },
+        "engine": { "type": "string" }, "model": { "type": "string" }, "mood": { "type": "string" }, "aspectRatio": { "type": "string" },
+        "filename": { "type": "string" }, "outputFormat": { "type": "string" }, "outputPath": { "type": "string" },
+        "imageUrl": { "$ref": "#/$defs/nullableString" }, "referenceImagePath": { "$ref": "#/$defs/nullableString" }, "referenceImageUrl": { "$ref": "#/$defs/nullableString" },
+        "threadId": { "$ref": "#/$defs/nullableString" }, "turnId": { "$ref": "#/$defs/nullableString" }, "errorCode": { "$ref": "#/$defs/nullableString" },
+        "errorMessage": { "$ref": "#/$defs/nullableString" }, "upstreamStatus": { "$ref": "#/$defs/nullableString" }, "diagnosticLog": { "type": "string" },
+        "retryCount": { "$ref": "#/$defs/integer" }, "timing": { "$ref": "#/$defs/timing" }, "createdAt": { "type": "string" }, "updatedAt": { "type": "string" },
+        "absoluteImageUrl": { "$ref": "#/$defs/nullableString" }, "codexMarkdown": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "required": ["id", "promptIndex", "variant", "status", "statusText", "errorCode", "errorMessage", "upstreamStatus", "threadId", "turnId", "diagnosticLog"],
+      "properties": {
+        "id": { "type": "string" }, "promptIndex": { "$ref": "#/$defs/integer" }, "variant": { "$ref": "#/$defs/integer" },
+        "status": { "type": "string" }, "statusText": { "type": "string" }, "errorCode": { "$ref": "#/$defs/nullableString" },
+        "errorMessage": { "$ref": "#/$defs/nullableString" }, "upstreamStatus": { "$ref": "#/$defs/nullableString" },
+        "threadId": { "$ref": "#/$defs/nullableString" }, "turnId": { "$ref": "#/$defs/nullableString" }, "diagnosticLog": { "type": "string" }
+      }
+    },
+    "structuredContent": {
+      "type": "object",
+      "required": ["runId", "status", "completed", "serverStarted", "health", "server", "statusUrl", "manifestUrl", "manifestViewUrl", "handoffUrl", "handoffViewUrl", "manifestPath", "handoffPath", "outputPaths", "imageUrls", "codexMarkdown", "outputs", "diagnostics", "counts"],
+      "properties": {
+        "runId": { "type": "string" }, "status": { "enum": ["queued", "running", "done", "error", "unknown"] }, "completed": { "type": "boolean" }, "serverStarted": { "type": "boolean" },
+        "health": { "$ref": "#/$defs/health" }, "server": { "$ref": "#/$defs/runtimeIdentity" },
+        "statusUrl": { "$ref": "#/$defs/nullableString" }, "manifestUrl": { "$ref": "#/$defs/nullableString" }, "manifestViewUrl": { "$ref": "#/$defs/nullableString" },
+        "handoffUrl": { "$ref": "#/$defs/nullableString" }, "handoffViewUrl": { "$ref": "#/$defs/nullableString" },
+        "manifestPath": { "$ref": "#/$defs/nullableString" }, "handoffPath": { "$ref": "#/$defs/nullableString" },
+        "outputPaths": { "type": "array", "items": { "type": "string" } }, "imageUrls": { "type": "array", "items": { "type": "string" } },
+        "codexMarkdown": { "type": "string" }, "outputs": { "type": "array", "items": { "$ref": "#/$defs/outputImage" } },
+        "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } }, "counts": { "$ref": "#/$defs/counts" },
+        "launchPlan": { "type": "string" }
+      }
+    }
+  }
+}
