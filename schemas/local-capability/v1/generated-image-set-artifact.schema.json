@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "codex-image-grid/generated-image-set-artifact/v1",
+  "title": "Codex Image Grid generated image set",
+  "description": "The semantic set of completed images from one run. It may be absent while results are queued or running.",
+  "type": "object",
+  "required": ["runId", "images"],
+  "properties": {
+    "runId": { "type": "string" },
+    "images": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "promptIndex", "variant", "status", "outputPath", "imageUrl", "absoluteImageUrl", "codexMarkdown"],
+        "properties": {
+          "id": { "type": "string" }, "promptIndex": { "type": "integer" }, "variant": { "type": "integer" }, "status": { "const": "done" },
+          "outputPath": { "type": "string" }, "imageUrl": { "type": "string" }, "absoluteImageUrl": { "type": "string" }, "codexMarkdown": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,74 @@
+{
+  "manifestVersion": "local-capability-manifest/v1",
+  "publisher": "suzuki-makoto",
+  "packageKind": "plugin",
+  "packageId": "codex-image-grid",
+  "descriptorVersion": "0.2.4",
+  "capabilities": [
+    {
+      "leafId": "generate-image-grid",
+      "title": "Generate Image Grid",
+      "description": "Generate project-ready image variants from Prompt Batch input through the installed native Codex Image Grid MCP tool.",
+      "executionClass": "server_stateful",
+      "runtimeBinding": {
+        "kind": "mcp_tool",
+        "mcpServer": "codex_image_grid",
+        "tool": "generate_image_grid"
+      },
+      "authorityRequests": [
+        {
+          "authority": "filesystem.read",
+          "reason": "Conditionally reads referenceImagePath when the caller supplies an absolute local PNG, JPEG, or WebP reference file."
+        },
+        {
+          "authority": "filesystem.write",
+          "reason": "Conditionally creates runtime run state and generated artifacts outside this source package after a generation is submitted."
+        },
+        {
+          "authority": "process.execute",
+          "reason": "Conditionally activates the installed native macOS app or launches its configured native server when the loopback runtime is not already healthy."
+        },
+        {
+          "authority": "network.loopback",
+          "reason": "Connects only to the configured localhost or loopback Image Grid bridge for health checks and run submission."
+        },
+        {
+          "authority": "image.generate",
+          "reason": "Conditionally requests image generation when engine is app-server-image; codex-svg remains a local deterministic image-output route."
+        }
+      ],
+      "artifactRoots": [],
+      "inputSchema": {
+        "schemaVersion": "local-capability-schema/v1",
+        "schemaId": "codex-image-grid/generate-image-grid-input/v1",
+        "path": "schemas/local-capability/v1/generate-image-grid-input.schema.json"
+      },
+      "outputSchema": {
+        "schemaVersion": "local-capability-schema/v1",
+        "schemaId": "codex-image-grid/generate-image-grid-output/v1",
+        "path": "schemas/local-capability/v1/generate-image-grid-output.schema.json"
+      },
+      "inputPorts": [],
+      "outputPorts": [
+        {
+          "name": "run-manifest",
+          "semanticType": "application/vnd.codex-image-grid.run-manifest+json",
+          "schemaId": "codex-image-grid/run-manifest-artifact/v1",
+          "required": true
+        },
+        {
+          "name": "handoff-markdown",
+          "semanticType": "text/markdown",
+          "schemaId": "codex-image-grid/handoff-markdown-artifact/v1",
+          "required": true
+        },
+        {
+          "name": "generated-images",
+          "semanticType": "application/vnd.codex-image-grid.generated-image-set+json",
+          "schemaId": "codex-image-grid/generated-image-set-artifact/v1",
+          "required": false
+        }
+      ]
+    }
+  ]
+}

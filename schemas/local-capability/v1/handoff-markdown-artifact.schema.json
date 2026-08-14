@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "codex-image-grid/handoff-markdown-artifact/v1",
+  "title": "Codex Image Grid Markdown handoff",
+  "description": "UTF-8 Markdown handoff for one generated run, beginning with the Codex Image Grid handoff heading.",
+  "type": "string",
+  "contentMediaType": "text/markdown",
+  "pattern": "^# Codex Image Grid Handoff"
+}
