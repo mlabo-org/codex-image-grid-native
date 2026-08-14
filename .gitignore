@@ -4,6 +4,8 @@
 /.run/
 /generated/
 /artifacts/
+.coding-agent-orchestrator/
+# Preserve ignored remnants from the superseded workflow state.
 .coding-agents/
 .DS_Store
 
