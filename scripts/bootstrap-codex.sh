@@ -66,38 +66,50 @@ SERVER_EXECUTABLE="$APP_PATH/Contents/Resources/image-grid-server"
 PLUGIN_STATE="$(codex plugin list --json)"
 MARKETPLACE_STATE="$(codex plugin marketplace list --json)"
 
-if jq -e --arg name "$PLUGIN_NAME" --arg path "$PLUGIN_ROOT" \
-    '.installed[]? | select(.name == $name and (.source.path // "") != $path)' \
-    <<<"$PLUGIN_STATE" >/dev/null; then
+same_existing_path() {
+    local left="$1"
+    local right="$2"
+    [[ -n "$left" && -n "$right" && -e "$left" && -e "$right" && "$left" -ef "$right" ]]
+}
+
+plugin_owned=0
+plugin_marketplace=""
+plugin_conflict=0
+while IFS=$'\t' read -r installed_path installed_marketplace; do
+    [[ -n "$installed_path" ]] || continue
+    if same_existing_path "$installed_path" "$PLUGIN_ROOT"; then
+        plugin_owned=1
+        plugin_marketplace="$installed_marketplace"
+    else
+        plugin_conflict=1
+    fi
+done < <(
+    jq -r --arg name "$PLUGIN_NAME" \
+        '.installed[]? | select(.name == $name) | [(.source.path // ""), (.marketplaceName // "")] | @tsv' \
+        <<<"$PLUGIN_STATE"
+)
+if [[ $plugin_conflict -eq 1 ]]; then
     echo "a different source already owns the installed $PLUGIN_NAME plugin; no changes were made" >&2
     exit 73
 fi
 
-if jq -e --arg name "$MARKETPLACE_NAME" --arg root "$REPO_ROOT" \
-    '.marketplaces[]? | select(.name == $name and (.root // "") != $root)' \
-    <<<"$MARKETPLACE_STATE" >/dev/null; then
+marketplace_owned=0
+marketplace_conflict=0
+while IFS= read -r marketplace_root; do
+    [[ -n "$marketplace_root" ]] || continue
+    if same_existing_path "$marketplace_root" "$REPO_ROOT"; then
+        marketplace_owned=1
+    else
+        marketplace_conflict=1
+    fi
+done < <(
+    jq -r --arg name "$MARKETPLACE_NAME" \
+        '.marketplaces[]? | select(.name == $name) | (.root // "")' \
+        <<<"$MARKETPLACE_STATE"
+)
+if [[ $marketplace_conflict -eq 1 ]]; then
     echo "a different source already owns the $MARKETPLACE_NAME marketplace name; no changes were made" >&2
     exit 73
-fi
-
-plugin_owned=0
-plugin_marketplace=""
-if jq -e --arg name "$PLUGIN_NAME" --arg path "$PLUGIN_ROOT" \
-    '.installed[]? | select(.name == $name and (.source.path // "") == $path)' \
-    <<<"$PLUGIN_STATE" >/dev/null; then
-    plugin_owned=1
-    plugin_marketplace="$(
-        jq -r --arg name "$PLUGIN_NAME" --arg path "$PLUGIN_ROOT" \
-            '.installed[]? | select(.name == $name and (.source.path // "") == $path) | .marketplaceName' \
-            <<<"$PLUGIN_STATE" | head -n 1
-    )"
-fi
-
-marketplace_owned=0
-if jq -e --arg name "$MARKETPLACE_NAME" --arg root "$REPO_ROOT" \
-    '.marketplaces[]? | select(.name == $name and (.root // "") == $root)' \
-    <<<"$MARKETPLACE_STATE" >/dev/null; then
-    marketplace_owned=1
 fi
 
 if [[ $force -eq 0 && $plugin_owned -eq 1 && -f "$RECEIPT_PATH" && -x "$APP_EXECUTABLE" && -x "$MCP_EXECUTABLE" && -x "$SERVER_EXECUTABLE" ]]; then
