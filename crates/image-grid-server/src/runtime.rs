@@ -2173,6 +2173,7 @@ impl GenerationRuntime {
         let bytes = BASE64_STANDARD
             .decode(encoded)
             .map_err(|error| RunApiError::message(format!("invalid image result: {error}")))?;
+        validate_generated_image_bytes(&bytes, &job.output_format)?;
         let output_path = PathBuf::from(&job.output_path);
         let temporary_path =
             output_path.with_extension(format!("{}.{}.tmp", job.output_format, Uuid::new_v4()));
@@ -2410,6 +2411,24 @@ impl GenerationRuntime {
             self.write_artifacts_or_emit(run_id).await;
         }
         self.inner.shutdown_complete.store(true, Ordering::Release);
+    }
+}
+
+fn validate_generated_image_bytes(bytes: &[u8], output_format: &str) -> Result<(), RunApiError> {
+    let valid = match output_format {
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" | "jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "webp" => {
+            bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(RunApiError::message(format!(
+            "invalid image result: decoded data is not a valid {output_format} image"
+        )))
     }
 }
 
@@ -4149,6 +4168,68 @@ done
                 .as_str()
                 .is_some_and(|path| Path::new(path).is_file())
         );
+    }
+
+    #[tokio::test]
+    async fn empty_image_result_is_rejected_without_publishing_an_artifact() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let script = r#"#!/bin/sh
+test "$1" = "app-server" || exit 2
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"empty-image-thread"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"empty-image-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"empty-image-thread","turnId":"empty-image-turn","completedAtMs":1,"item":{"type":"imageGeneration","id":"image-empty","status":"completed","revisedPrompt":null,"result":""}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"empty-image-thread","turn":{"id":"empty-image-turn","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'
+      ;;
+  esac
+done
+"#;
+        let (runtime, _) = provider_free_runtime(
+            &temporary,
+            script,
+            RecoveryConfig {
+                max_retries: 0,
+                retry_base: Duration::ZERO,
+                rate_limit_cooldown: Duration::ZERO,
+                rate_limit_cooldown_max: Duration::ZERO,
+                job_timeout: Duration::from_secs(5),
+            },
+        );
+        let (_, response) = runtime
+            .create_run(
+                &json!({
+                    "prompts": ["reject empty image output"],
+                    "count": 1,
+                    "waitMs": 7000
+                }),
+                true,
+                None,
+            )
+            .await
+            .expect("provider-free run");
+        let output = &response["outputs"][0];
+        assert_eq!(output["status"], "error");
+        assert_eq!(output["errorCode"], "ImageWriteFailed");
+        assert!(
+            output["errorMessage"]
+                .as_str()
+                .is_some_and(|message| message.contains("not a valid png image"))
+        );
+        assert!(
+            output["outputPath"]
+                .as_str()
+                .is_some_and(|path| !Path::new(path).exists())
+        );
+        assert_eq!(output["imageUrl"], Value::Null);
     }
 
     #[tokio::test]
