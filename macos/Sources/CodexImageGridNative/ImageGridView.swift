@@ -127,6 +127,13 @@ struct ImageGridView: View {
         .onAppear {
             store.applyRetentionMode(resultLimit: resultLimit)
         }
+        .onReceive(
+            NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+        ) { _ in
+            Task {
+                await store.hydrateRuns()
+            }
+        }
         .onChange(of: runtimeLifecycle.state, initial: true) { _, state in
             store.synchronize(with: state)
         }

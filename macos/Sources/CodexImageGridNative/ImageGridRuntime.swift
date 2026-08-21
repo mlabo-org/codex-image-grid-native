@@ -1157,7 +1157,10 @@ final class ImageGridStore: ObservableObject {
     }
 
     private func updateActiveRunReconciliation() {
-        guard jobs.values.contains(where: \.isActive) else {
+        // Keep polling after local jobs go idle so MCP-created runs still
+        // appear in the grid without a live SSE event.
+        let shouldReconcile = lifecycleTask != nil || jobs.values.contains(where: \.isActive)
+        guard shouldReconcile else {
             activeRunReconciliationToken = nil
             activeRunReconciliationTask?.cancel()
             activeRunReconciliationTask = nil
@@ -1191,13 +1194,23 @@ final class ImageGridStore: ObservableObject {
                 return
             }
 
+            do {
+                let inbound = try await client.runs().flatMap(\.hydratedJobs)
+                guard !Task.isCancelled, activeRunReconciliationToken == token else {
+                    return
+                }
+                merge(inbound)
+            } catch is CancellationError {
+                return
+            } catch {
+                // Keep discovering inbound MCP runs even if one list fetch fails.
+            }
+
             let runIDs = Set(
                 jobs.values
                     .filter(\.isActive)
                     .compactMap(\.runId)
             ).sorted()
-            guard !runIDs.isEmpty else { return }
-
             for runID in runIDs {
                 guard !Task.isCancelled, activeRunReconciliationToken == token else {
                     return
