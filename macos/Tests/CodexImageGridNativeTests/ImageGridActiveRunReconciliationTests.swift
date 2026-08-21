@@ -33,7 +33,7 @@ struct ImageGridActiveRunReconciliationTests {
 
         #expect(completed)
         #expect(store.jobs["job-one"]?.imageUrl == "/generated/run-one/variant-01.png")
-        #expect(fixture.runListRequestCount == 1)
+        #expect(fixture.runListRequestCount >= 1)
         #expect(fixture.targetedRunRequestCount >= 1)
     }
 
@@ -81,6 +81,38 @@ struct ImageGridActiveRunReconciliationTests {
 
         #expect(fixture.targetedRunRequestCount == requestsAfterStopSettled)
     }
+
+    @Test
+    @MainActor
+    func inboundMcpRunIsDiscoveredWithoutALiveSseEvent() async {
+        let fixture = ActiveRunHTTPFixture(
+            targetedResponse: .queued,
+            inboundRunAfterListCount: 2
+        )
+        ActiveRunURLProtocol.install(fixture)
+        let session = makeActiveRunTestSession()
+        let store = ImageGridStore(
+            client: ImageGridAPIClient(
+                baseURL: URL(string: "http://image-grid-reconciliation.test")!,
+                session: session
+            ),
+            activeRunReconciliationInterval: .milliseconds(5)
+        )
+        defer {
+            store.stop()
+            session.invalidateAndCancel()
+            ActiveRunURLProtocol.uninstall()
+        }
+
+        store.start()
+        let discovered = await waitForActiveRunCondition(timeout: .seconds(2)) {
+            store.jobs["job-mcp"]?.status == "queued"
+        }
+
+        #expect(discovered)
+        #expect(store.jobs["job-mcp"]?.prompt == "flower field")
+        #expect(fixture.runListRequestCount >= 2)
+    }
 }
 
 @MainActor
@@ -113,11 +145,13 @@ private final class ActiveRunHTTPFixture: @unchecked Sendable {
 
     private let lock = NSLock()
     private let targetedResponse: TargetedResponse
+    private let inboundRunAfterListCount: Int?
     private var runListRequests = 0
     private var targetedRunRequests = 0
 
-    init(targetedResponse: TargetedResponse) {
+    init(targetedResponse: TargetedResponse, inboundRunAfterListCount: Int? = nil) {
         self.targetedResponse = targetedResponse
+        self.inboundRunAfterListCount = inboundRunAfterListCount
     }
 
     var runListRequestCount: Int {
@@ -147,7 +181,36 @@ private final class ActiveRunHTTPFixture: @unchecked Sendable {
         case "/api/runs":
             lock.lock()
             runListRequests += 1
+            let listCount = runListRequests
+            let inboundAfter = inboundRunAfterListCount
             lock.unlock()
+            if let inboundAfter {
+                var data: [[String: Any]] = [
+                    runEnvelope(
+                        runId: "run-old",
+                        jobId: "job-old",
+                        status: "done",
+                        statusText: "Generated",
+                        imageUrl: "/generated/run-old/variant-01.png",
+                        updatedAt: 1,
+                        prompt: "coffee cup"
+                    )
+                ]
+                if listCount >= inboundAfter {
+                    data.append(
+                        runEnvelope(
+                            runId: "run-mcp",
+                            jobId: "job-mcp",
+                            status: "queued",
+                            statusText: "Queued",
+                            imageUrl: nil,
+                            updatedAt: 3,
+                            prompt: "flower field"
+                        )
+                    )
+                }
+                return (200, try encoded(["data": data]))
+            }
             return (200, try encoded([
                 "data": [
                     runEnvelope(
@@ -158,6 +221,8 @@ private final class ActiveRunHTTPFixture: @unchecked Sendable {
                     ),
                 ],
             ]))
+        case "/events":
+            return (404, try encoded(["error": "not found"]))
         case "/api/runs/run-one":
             lock.lock()
             targetedRunRequests += 1
@@ -188,13 +253,16 @@ private final class ActiveRunHTTPFixture: @unchecked Sendable {
     }
 
     private func runEnvelope(
+        runId: String = "run-one",
+        jobId: String = "job-one",
         status: String,
         statusText: String,
         imageUrl: String?,
-        updatedAt: Int
+        updatedAt: Int,
+        prompt: String? = nil
     ) -> [String: Any] {
         var output: [String: Any] = [
-            "id": "job-one",
+            "id": jobId,
             "status": status,
             "statusText": statusText,
             "updatedAt": updatedAt,
@@ -202,8 +270,11 @@ private final class ActiveRunHTTPFixture: @unchecked Sendable {
         if let imageUrl {
             output["imageUrl"] = imageUrl
         }
+        if let prompt {
+            output["prompt"] = prompt
+        }
         return [
-            "runId": "run-one",
+            "runId": runId,
             "outputs": [output],
             "server": serverIdentity,
         ]
