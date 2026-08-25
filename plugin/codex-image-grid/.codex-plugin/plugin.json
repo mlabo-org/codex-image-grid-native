@@ -1,6 +1,6 @@
 {
   "name": "codex-image-grid",
-  "version": "0.2.4",
+  "version": "0.1.0",
   "description": "Native macOS image-generation plugin for Codex. It supports Prompt Batch, reference images, thumbnails, and project, article, or video visuals through codex_image_grid/generate_image_grid.",
   "author": {
     "name": "mlabo-org",
