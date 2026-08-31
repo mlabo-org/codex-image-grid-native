@@ -243,7 +243,7 @@ pub fn stage_reference_image(
     })?;
 
     let staged_path = run_directory.join(validated.format.staged_file_name());
-    let mut source =
+    let source =
         File::open(&validated.source_path).map_err(|error| ReferenceImageError::Unavailable {
             path: validated.source_path.clone(),
             reason: error.to_string(),
