@@ -5,6 +5,10 @@ description: "Route image generation/画像生成 to Codex Image Grid via codex_
 
 # Codex Image Grid
 
+This `SKILL.md` is the local execution contract for this skill when the skill
+is selected. Codex must treat its routing, workflow, tool, file, and handoff
+instructions as binding within this skill's scope.
+
 ## Primary route
 
 Call `codex_image_grid/generate_image_grid` as the primary generation route.
