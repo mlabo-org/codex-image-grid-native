@@ -1062,39 +1062,60 @@ impl GenerationRuntime {
             return Err(GeneratedJobFileError::GeneratedFileNotFound);
         }
 
+        self.resolve_generated_file(Path::new(&job.output_path)).await
+    }
+
+    pub(crate) async fn resolve_generated_file(
+        &self,
+        path: &Path,
+    ) -> Result<PathBuf, GeneratedJobFileError> {
         let generated_root = absolute_lexical_path(&self.inner.config.generated_dir)
             .map_err(GeneratedJobFileError::Io)?;
-        let candidate = absolute_lexical_path(Path::new(&job.output_path))
-            .map_err(GeneratedJobFileError::Io)?;
+        let candidate = absolute_lexical_path(path).map_err(GeneratedJobFileError::Io)?;
         if candidate == generated_root || !candidate.starts_with(&generated_root) {
             return Err(GeneratedJobFileError::Forbidden);
         }
 
-        let candidate_metadata = fs::symlink_metadata(&candidate).await.map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                GeneratedJobFileError::GeneratedFileNotFound
-            } else {
-                GeneratedJobFileError::Io(error)
-            }
-        })?;
+        let run_directory = candidate
+            .parent()
+            .filter(|parent| *parent != generated_root)
+            .ok_or(GeneratedJobFileError::Forbidden)?;
+        let run_metadata = fs::symlink_metadata(run_directory)
+            .await
+            .map_err(map_generated_file_io_error)?;
+        if run_metadata.file_type().is_symlink() || !run_metadata.is_dir() {
+            return Err(GeneratedJobFileError::Forbidden);
+        }
+
+        let candidate_metadata = fs::symlink_metadata(&candidate)
+            .await
+            .map_err(map_generated_file_io_error)?;
+        if !candidate_metadata.file_type().is_symlink() && !candidate_metadata.is_file() {
+            return Err(GeneratedJobFileError::GeneratedFileNotFound);
+        }
+
         let real_generated_root = fs::canonicalize(&generated_root)
             .await
             .map_err(GeneratedJobFileError::Io)?;
-        let real_file = fs::canonicalize(&candidate).await.map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                GeneratedJobFileError::GeneratedFileNotFound
-            } else {
-                GeneratedJobFileError::Io(error)
-            }
-        })?;
-        if real_file == real_generated_root || !real_file.starts_with(&real_generated_root) {
+        let real_run_directory = fs::canonicalize(run_directory)
+            .await
+            .map_err(map_generated_file_io_error)?;
+        if real_run_directory.parent() != Some(real_generated_root.as_path()) {
             return Err(GeneratedJobFileError::Forbidden);
         }
-        if candidate_metadata.file_type().is_symlink()
-            || !fs::metadata(&real_file)
-                .await
-                .map_err(GeneratedJobFileError::Io)?
-                .is_file()
+        let real_file = fs::canonicalize(&candidate)
+            .await
+            .map_err(map_generated_file_io_error)?;
+        if real_file.parent() != Some(real_run_directory.as_path()) {
+            return Err(GeneratedJobFileError::Forbidden);
+        }
+        if candidate_metadata.file_type().is_symlink() {
+            return Err(GeneratedJobFileError::GeneratedFileNotFound);
+        }
+        if !fs::metadata(&real_file)
+            .await
+            .map_err(GeneratedJobFileError::Io)?
+            .is_file()
         {
             return Err(GeneratedJobFileError::GeneratedFileNotFound);
         }
@@ -2852,6 +2873,14 @@ fn absolute_lexical_path(path: &Path) -> io::Result<PathBuf> {
         }
     }
     Ok(normalized)
+}
+
+fn map_generated_file_io_error(error: io::Error) -> GeneratedJobFileError {
+    if error.kind() == io::ErrorKind::NotFound {
+        GeneratedJobFileError::GeneratedFileNotFound
+    } else {
+        GeneratedJobFileError::Io(error)
+    }
 }
 
 fn expected_file_state(path: &Path) -> ExpectedFileState {

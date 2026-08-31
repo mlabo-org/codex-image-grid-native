@@ -745,6 +745,10 @@ async fn generated_file(
         Ok(path) => path,
         Err(error) => return (StatusCode::BAD_REQUEST, Json(error.body())).into_response(),
     };
+    let path = match state.generation.resolve_generated_file(&path).await {
+        Ok(path) => path,
+        Err(error) => return generated_file_resolution_error(error, "generated file not found"),
+    };
     file_response(path).await
 }
 
@@ -762,6 +766,10 @@ async fn artifact_view(
             };
             return (status, Json(error.body())).into_response();
         }
+    };
+    let path = match state.generation.resolve_generated_file(&path).await {
+        Ok(path) => path,
+        Err(error) => return generated_file_resolution_error(error, "artifact not found"),
     };
     let content = match tokio::fs::read_to_string(path).await {
         Ok(content) => content,
@@ -799,16 +807,10 @@ async fn generated_image_view(
         Ok(path) => path,
         Err(error) => return (StatusCode::BAD_REQUEST, Json(error.body())).into_response(),
     };
-    match tokio::fs::metadata(&path).await {
-        Ok(metadata) if metadata.is_file() => {}
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "image not found" })),
-            )
-                .into_response();
-        }
-    }
+    let path = match state.generation.resolve_generated_file(&path).await {
+        Ok(path) => path,
+        Err(error) => return generated_file_resolution_error(error, "image not found"),
+    };
     if !content_type(&path).starts_with("image/") {
         return (
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -821,6 +823,27 @@ async fn generated_image_view(
         filename,
         &format!("/generated/{run_id}/{filename}"),
     ))
+}
+
+fn generated_file_resolution_error(
+    error: GeneratedJobFileError,
+    not_found_message: &'static str,
+) -> Response {
+    match error {
+        GeneratedJobFileError::JobNotFound | GeneratedJobFileError::GeneratedFileNotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": not_found_message })),
+        )
+            .into_response(),
+        GeneratedJobFileError::Forbidden => {
+            (StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))).into_response()
+        }
+        GeneratedJobFileError::Io(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn file_response(path: PathBuf) -> Response {
@@ -1467,6 +1490,68 @@ done
                 .expect("compatibility route response");
             assert_eq!(response.status(), StatusCode::OK);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generated_and_artifact_routes_reject_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let opener = Arc::new(RecordingHostOpener::default());
+        let (app, _, config) = finder_test_app(&temporary, opener).await;
+        let run_directory = config.generated_dir.join("feedface");
+        fs::create_dir_all(&run_directory).expect("generated run directory");
+
+        let outside_image = temporary.path().join("outside.png");
+        fs::write(&outside_image, b"outside image").expect("outside image");
+        symlink(&outside_image, run_directory.join("variant-01.png"))
+            .expect("linked generated image");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/generated/feedface/variant-01.png")
+                    .body(Body::empty())
+                    .expect("linked image request"),
+            )
+            .await
+            .expect("linked image response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let outside_manifest = temporary.path().join("outside.json");
+        fs::write(&outside_manifest, br#"{"outside":true}"#).expect("outside manifest");
+        symlink(&outside_manifest, run_directory.join("manifest.json"))
+            .expect("linked manifest");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/artifacts/feedface/manifest")
+                    .body(Body::empty())
+                    .expect("linked manifest request"),
+            )
+            .await
+            .expect("linked manifest response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let outside_run = temporary.path().join("outside-run");
+        fs::create_dir_all(&outside_run).expect("outside run directory");
+        fs::write(outside_run.join("variant-02.png"), b"outside run image")
+            .expect("outside run image");
+        symlink(&outside_run, config.generated_dir.join("deadbeef"))
+            .expect("linked run directory");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/generated/deadbeef/variant-02.png")
+                    .body(Body::empty())
+                    .expect("linked run request"),
+            )
+            .await
+            .expect("linked run response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
