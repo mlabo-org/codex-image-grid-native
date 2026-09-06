@@ -36,6 +36,11 @@
       "required": ["code", "message"],
       "properties": { "code": { "type": "string" }, "message": { "type": "string" } }
     },
+    "artifactError": {
+      "type": ["object", "null"],
+      "required": ["code", "message"],
+      "properties": { "code": { "const": "ArtifactWriteFailed" }, "message": { "type": "string" } }
+    },
     "candidate": {
       "type": "object",
       "required": ["source", "command", "status", "reason"],
@@ -128,7 +133,7 @@
       "type": "object",
       "required": ["runId", "status", "completed", "serverStarted", "health", "server", "statusUrl", "manifestUrl", "manifestViewUrl", "handoffUrl", "handoffViewUrl", "manifestPath", "handoffPath", "outputPaths", "imageUrls", "codexMarkdown", "outputs", "diagnostics", "counts"],
       "properties": {
-        "runId": { "type": "string" }, "status": { "enum": ["queued", "running", "done", "error", "unknown"] }, "completed": { "type": "boolean" }, "serverStarted": { "type": "boolean" },
+        "runId": { "type": "string" }, "status": { "enum": ["queued", "running", "done", "error", "unknown"] }, "completed": { "type": "boolean" }, "serverStarted": { "type": "boolean" }, "artifactError": { "$ref": "#/$defs/artifactError" },
         "health": { "$ref": "#/$defs/health" }, "server": { "$ref": "#/$defs/runtimeIdentity" },
         "statusUrl": { "$ref": "#/$defs/nullableString" }, "manifestUrl": { "$ref": "#/$defs/nullableString" }, "manifestViewUrl": { "$ref": "#/$defs/nullableString" },
         "handoffUrl": { "$ref": "#/$defs/nullableString" }, "handoffViewUrl": { "$ref": "#/$defs/nullableString" },

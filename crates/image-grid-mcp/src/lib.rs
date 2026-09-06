@@ -1,5 +1,6 @@
 use image_grid_core::{
-    MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES, MAX_RUN_JOBS, MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS,
+    BatchValidationError, MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES, MAX_RUN_JOBS,
+    MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS, validate_batch_shape,
 };
 use serde_json::{Value, json};
 use std::env;
@@ -1513,6 +1514,10 @@ fn render_tool_result(data: &Value, server: &ServerStartup, base_url: &str) -> V
 
     let run_id = string_field(data, "runId").unwrap_or_default();
     let status = string_field(data, "status").unwrap_or("queued");
+    let artifact_error = data
+        .get("artifactError")
+        .cloned()
+        .unwrap_or(Value::Null);
     let status_url = absolute_url(base_url, data.get("statusUrl"));
     let manifest_path = string_field(data, "manifestPath").unwrap_or_default();
     let handoff_path = string_field(data, "handoffPath").unwrap_or_default();
@@ -1521,6 +1526,17 @@ fn render_tool_result(data: &Value, server: &ServerStartup, base_url: &str) -> V
         format!("status: {status}"),
         format!("serverStarted: {}", server.started),
     ];
+    if let Some(error) = artifact_error.as_object() {
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("ArtifactWriteFailed");
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("artifact write failed");
+        summary.push(format!("artifactError: {code}: {message}"));
+    }
     if let Some(launch_plan) = &server.launch_plan {
         summary.push(format!("launchPlan: {launch_plan}"));
     }
@@ -1588,6 +1604,7 @@ fn render_tool_result(data: &Value, server: &ServerStartup, base_url: &str) -> V
     for (name, value) in [
         ("runId", data.get("runId").cloned().unwrap_or(Value::Null)),
         ("status", data.get("status").cloned().unwrap_or(Value::Null)),
+        ("artifactError", artifact_error),
         (
             "completed",
             data.get("completed").cloned().unwrap_or(Value::Null),
@@ -1868,20 +1885,16 @@ fn validate_tool_arguments(arguments: &Value) -> Result<(), String> {
         .get("prompts")
         .and_then(Value::as_array)
         .ok_or_else(|| "prompts must be an array".to_owned())?;
-    if prompts.is_empty() {
-        return Err("prompts array must contain at least one prompt".to_owned());
-    }
-    if prompts.len() > MAX_PROMPTS {
-        return Err(format!("prompt batch is limited to {MAX_PROMPTS} prompts"));
-    }
-    for (index, prompt) in prompts.iter().enumerate() {
-        let prompt = prompt
-            .as_str()
-            .ok_or_else(|| format!("prompt {} must be a string", index + 1))?;
-        if prompt.trim().is_empty() {
-            return Err(format!("prompt {} must not be empty", index + 1));
-        }
-    }
+    let prompt_values = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            let prompt = prompt
+                .as_str()
+                .ok_or_else(|| format!("prompt {} must be a string", index + 1))?;
+            Ok(prompt.to_owned())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     let count = match arguments.get("count") {
         None => 1_i128,
@@ -1892,9 +1905,25 @@ fn validate_tool_arguments(arguments: &Value) -> Result<(), String> {
             "count must be between 1 and {MAX_VARIANTS_PER_PROMPT}"
         ));
     }
-    if prompts.len() * count as usize > MAX_RUN_JOBS {
-        return Err(format!("a run is limited to {MAX_RUN_JOBS} total jobs"));
-    }
+    validate_batch_shape(&prompt_values, count as u8).map_err(|error| match error {
+        BatchValidationError::PromptsRequired => {
+            "prompts array must contain at least one prompt".to_owned()
+        }
+        BatchValidationError::TooManyPrompts => {
+            format!("prompt batch is limited to {MAX_PROMPTS} prompts")
+        }
+        BatchValidationError::PromptEmpty => prompt_values
+            .iter()
+            .position(|prompt| prompt.trim().is_empty())
+            .map(|index| format!("prompt {} must not be empty", index + 1))
+            .unwrap_or_else(|| "prompt must not be empty".to_owned()),
+        BatchValidationError::CountOutOfRange => {
+            format!("count must be between 1 and {MAX_VARIANTS_PER_PROMPT}")
+        }
+        BatchValidationError::TooManyJobs => {
+            format!("a run is limited to {MAX_RUN_JOBS} total jobs")
+        }
+    })?;
 
     validate_enum(
         arguments,
@@ -2295,6 +2324,21 @@ mod tests {
     }
 
     #[test]
+    fn batch_shape_errors_are_mapped_from_the_shared_core_contract() {
+        assert_eq!(
+            validate_tool_arguments(&json!({"prompts": [" "]})),
+            Err("prompt 1 must not be empty".to_owned())
+        );
+        assert_eq!(
+            validate_tool_arguments(&json!({
+                "prompts": ["one", "two", "three", "four", "five"],
+                "count": 5
+            })),
+            Err("a run is limited to 24 total jobs".to_owned())
+        );
+    }
+
+    #[test]
     fn installed_route_strict_app_dir_rejects_stale_or_foreign_health_metadata() {
         let directory = TestDirectory::new("strict-health");
         let expected_root = directory.path.join("Codex Image Grid Native.app");
@@ -2589,6 +2633,7 @@ skipped PATH=(none): PATH is unavailable."
         assert_eq!(run_body["waitMs"], 250);
 
         assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["artifactError"], Value::Null);
         assert_eq!(
             result["structuredContent"]["statusUrl"],
             format!("{}/api/runs/abc12345", config.image_grid_url)
@@ -2619,6 +2664,40 @@ skipped PATH=(none): PATH is unavailable."
         assert!(summary.contains("runId: abc12345"));
         assert!(summary.contains("serverStarted: false"));
         assert!(summary.contains("diagnostics:\n- none"));
+    }
+
+    #[test]
+    fn render_tool_result_surfaces_artifact_write_failure() {
+        let server = ServerStartup {
+            started: false,
+            launch_plan: None,
+            health: json!({}),
+        };
+        let result = render_tool_result(
+            &json!({
+                "runId": "abc12345",
+                "status": "error",
+                "completed": true,
+                "artifactError": {
+                    "code": "ArtifactWriteFailed",
+                    "message": "manifest write failed"
+                }
+            }),
+            &server,
+            "http://127.0.0.1:4322",
+        );
+
+        assert_eq!(
+            result["structuredContent"]["artifactError"],
+            json!({
+                "code": "ArtifactWriteFailed",
+                "message": "manifest write failed"
+            })
+        );
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .expect("summary")
+            .contains("artifactError: ArtifactWriteFailed: manifest write failed"));
     }
 
     #[test]

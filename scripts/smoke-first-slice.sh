@@ -6,6 +6,16 @@ temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/codex-image-grid-native-smoke.XXXXX
 temporary_root="$(cd "$temporary_root" && pwd -P)"
 server_pid=""
 
+source "$repo_root/scripts/build-paths.sh"
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  CARGO_TARGET_DIR_WAS_SET=1
+else
+  CARGO_TARGET_DIR_WAS_SET=0
+fi
+export CARGO_TARGET_DIR_WAS_SET
+image_grid_init_build_paths "$repo_root"
+trap image_grid_cleanup_build_paths EXIT
+
 cleanup() {
   if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
     kill "$server_pid" 2>/dev/null || true
@@ -13,7 +23,9 @@ cleanup() {
   fi
   rm -rf -- "$temporary_root"
 }
-trap cleanup EXIT
+trap 'cleanup; image_grid_cleanup_build_paths' EXIT
+
+image_grid_prepare_cargo_target "$repo_root/Cargo.toml"
 
 command -v curl >/dev/null
 command -v jq >/dev/null
@@ -78,7 +90,7 @@ printf '%s' \
 cp "$expected_image_path" "$reference_image"
 
 IMAGE_GRID_SMOKE_ANALYSIS_CAPTURE="$analysis_reference_capture" \
-IMAGE_GRID_CODEX_BIN="$fake_codex" "$repo_root/target/debug/image-grid-server" \
+IMAGE_GRID_CODEX_BIN="$fake_codex" "$CARGO_TARGET_DIR/debug/image-grid-server" \
   --bind 127.0.0.1:0 \
   --data-root "$data_root" \
   --server-root "$repo_root" \
@@ -289,7 +301,7 @@ jq --compact-output --null-input \
   }' \
   >>"$mcp_input"
 IMAGE_GRID_URL="$server_url" \
-  "$repo_root/target/debug/image-grid-mcp" <"$mcp_input" >"$mcp_output"
+  "$CARGO_TARGET_DIR/debug/image-grid-mcp" <"$mcp_input" >"$mcp_output"
 
 jq --slurp --exit-status \
   --arg serverUrl "$server_url" \

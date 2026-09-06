@@ -135,6 +135,40 @@ struct ImageGridJob: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+struct ImageGridArtifactError: Codable, Equatable, Sendable {
+    let code: String
+    let message: String
+}
+
+struct ImageGridArtifactErrorTracker: Equatable, Sendable {
+    private(set) var messages: [String: String] = [:]
+
+    mutating func record(
+        runID: String?,
+        error: ImageGridArtifactError?,
+        currentMessage: String?,
+        currentOwnerRunID: String?
+    ) -> (message: String?, ownerRunID: String?) {
+        guard let runID, !runID.isEmpty else {
+            return (currentMessage, currentOwnerRunID)
+        }
+        if let error {
+            messages[runID] = error.message
+            return (error.message, runID)
+        }
+        guard let previous = messages.removeValue(forKey: runID) else {
+            return (currentMessage, currentOwnerRunID)
+        }
+        guard currentOwnerRunID == runID, currentMessage == previous else {
+            return (currentMessage, currentOwnerRunID)
+        }
+        if let next = messages.first {
+            return (next.value, next.key)
+        }
+        return (nil, nil)
+    }
+}
+
 struct ImageGridGenerationRequest: Encodable, Equatable, Sendable {
     let prompt: String
     let prompts: [String]?
@@ -150,6 +184,7 @@ struct ImageGridRunEnvelope: Decodable, Sendable {
     let runId: String?
     let jobs: [ImageGridJob]?
     let outputs: [ImageGridJob]?
+    let artifactError: ImageGridArtifactError?
     let manifestViewUrl: String?
     let handoffViewUrl: String?
     let server: ImageGridRuntimeIdentity?
@@ -198,6 +233,11 @@ struct ImageGridDeleteRunsResponse: Decodable, Equatable, Sendable {
 
 private struct ImageGridRunsDeletedEvent: Decodable {
     let runIds: [String]
+}
+
+struct ImageGridRunArtifactsEvent: Decodable, Equatable, Sendable {
+    let runId: String
+    let artifactError: ImageGridArtifactError?
 }
 
 struct ImageGridRuntimeIdentity: Decodable, Equatable, Sendable {
@@ -767,6 +807,8 @@ final class ImageGridStore: ObservableObject {
     private var deletionWorkspaceActive = false
     private var connectivityMessage: String?
     private var failureNoticeTracker = ImageGridFailureNoticeTracker()
+    private var artifactErrorTracker = ImageGridArtifactErrorTracker()
+    private var artifactErrorMessageOwnerRunID: String?
 
     init(
         client: ImageGridAPIClient = ImageGridAPIClient(),
@@ -828,6 +870,7 @@ final class ImageGridStore: ObservableObject {
         do {
             for run in try await client.runs() {
                 merge(run.hydratedJobs)
+                recordArtifactError(runID: run.runId, run.artifactError)
             }
         } catch {
             if jobs.isEmpty {
@@ -843,6 +886,20 @@ final class ImageGridStore: ObservableObject {
         defer { isSubmitting = false }
 
         do {
+            let referenceLease = try Self.makeReferenceOperationLease(
+                referenceImagePath: request.referenceImagePath
+            )
+            defer { referenceLease?.remove() }
+            let request = ImageGridGenerationRequest(
+                prompt: request.prompt,
+                prompts: request.prompts,
+                referencePremise: request.referencePremise,
+                mood: request.mood,
+                engine: request.engine,
+                count: request.count,
+                aspectRatio: request.aspectRatio,
+                referenceImagePath: referenceLease?.path ?? request.referenceImagePath
+            )
             if request.engine == "app-server-image" {
                 runtimeState = .starting
                 try await client.preflight()
@@ -850,6 +907,7 @@ final class ImageGridStore: ObservableObject {
             }
             let run = try await client.generate(request: request, batch: batch)
             merge(run.hydratedJobs)
+            recordArtifactError(runID: run.runId, run.artifactError)
             await refreshHealth()
             if lifecycleTask == nil {
                 start()
@@ -868,7 +926,13 @@ final class ImageGridStore: ObservableObject {
         referenceAnalysisMessage = nil
         defer { isAnalyzing = false }
         do {
-            return try await client.analyze(referenceImagePath: reference.url.path)
+            let referenceLease = try Self.makeReferenceOperationLease(
+                referenceImagePath: reference.url.path
+            )
+            defer { referenceLease?.remove() }
+            return try await client.analyze(
+                referenceImagePath: referenceLease?.path ?? reference.url.path
+            )
         } catch {
             referenceAnalysisMessage = error.localizedDescription
             return nil
@@ -1036,6 +1100,13 @@ final class ImageGridStore: ObservableObject {
             if let run = try? decoder.decode(ImageGridRunEvent.self, from: event.data) {
                 merge(run.jobs)
             }
+        case "run-artifacts":
+            if let artifacts = try? decoder.decode(
+                ImageGridRunArtifactsEvent.self,
+                from: event.data
+            ) {
+                recordArtifactError(runID: artifacts.runId, artifacts.artifactError)
+            }
         case "job":
             if let job = try? decoder.decode(ImageGridJob.self, from: event.data) {
                 merge([job])
@@ -1053,8 +1124,23 @@ final class ImageGridStore: ObservableObject {
     }
 
     private func recordConnectivityFailure(_ message: String) {
+        artifactErrorMessageOwnerRunID = nil
         connectivityMessage = message
         generationMessage = message
+    }
+
+    private func recordArtifactError(
+        runID: String?,
+        _ error: ImageGridArtifactError?
+    ) {
+        let update = artifactErrorTracker.record(
+            runID: runID,
+            error: error,
+            currentMessage: generationMessage,
+            currentOwnerRunID: artifactErrorMessageOwnerRunID
+        )
+        generationMessage = update.message
+        artifactErrorMessageOwnerRunID = update.ownerRunID
     }
 
     private func clearConnectivityFailure() {
@@ -1153,6 +1239,44 @@ final class ImageGridStore: ObservableObject {
         let count = failureNoticeTracker.unacknowledgedCount
         if unacknowledgedFailureCount != count {
             unacknowledgedFailureCount = count
+        }
+    }
+
+    private struct ReferenceOperationLease {
+        let url: URL
+
+        var path: String { url.path }
+
+        func remove() {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private static func makeReferenceOperationLease(
+        referenceImagePath: String?
+    ) throws -> ReferenceOperationLease? {
+        guard let referenceImagePath, !referenceImagePath.isEmpty else {
+            return nil
+        }
+        let sourceURL = URL(fileURLWithPath: referenceImagePath)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-image-grid-native/inflight", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let extensionName = sourceURL.pathExtension.isEmpty
+            ? "png"
+            : sourceURL.pathExtension
+        let destination = directory.appendingPathComponent(
+            "reference-\(UUID().uuidString).\(extensionName)"
+        )
+        do {
+            try FileManager.default.copyItem(at: sourceURL, to: destination)
+            return ReferenceOperationLease(url: destination)
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw ImageGridAPIError(message: "The reference image could not be prepared.")
         }
     }
 
