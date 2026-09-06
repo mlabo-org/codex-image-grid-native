@@ -3,6 +3,15 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+source "$REPO_ROOT/scripts/build-paths.sh"
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    CARGO_TARGET_DIR_WAS_SET=1
+else
+    CARGO_TARGET_DIR_WAS_SET=0
+fi
+export CARGO_TARGET_DIR_WAS_SET
+image_grid_init_build_paths "$REPO_ROOT"
+trap image_grid_cleanup_build_paths EXIT
 USER_HOME="${HOME:?HOME must be set to install Codex Image Grid}"
 INSTALL_PARENT="$USER_HOME/Applications"
 APP_NAME="Codex Image Grid Native.app"
@@ -46,8 +55,8 @@ print_plan() {
     echo "infoPlistSource: $INFO_PLIST_SOURCE"
     echo "appIconSource: $APP_ICON_SOURCE"
     echo "build:"
-    echo "- cargo build --locked --release -p image-grid-mcp -p image-grid-server"
-    echo "- swift build -c release --package-path $REPO_ROOT/macos"
+    echo "- cargo build --locked --release -p image-grid-mcp -p image-grid-server (target: $CARGO_TARGET_DIR)"
+    echo "- swift build -c release --scratch-path $CODEX_IMAGE_GRID_SWIFT_SCRATCH_PATH --package-path $REPO_ROOT/macos"
     echo "bundleContents:"
     echo "- Contents/Info.plist"
     echo "- Contents/MacOS/$APP_EXECUTABLE"
@@ -94,14 +103,15 @@ fi
 
 (
     cd "$REPO_ROOT"
+    image_grid_prepare_cargo_target "$REPO_ROOT/Cargo.toml"
     cargo build --locked --release -p image-grid-mcp -p image-grid-server
 )
-swift build -c release --package-path "$REPO_ROOT/macos"
+swift build -c release --scratch-path "$CODEX_IMAGE_GRID_SWIFT_SCRATCH_PATH" --package-path "$REPO_ROOT/macos"
 
-SWIFT_BIN_DIR="$(swift build -c release --package-path "$REPO_ROOT/macos" --show-bin-path)"
+SWIFT_BIN_DIR="$(swift build -c release --scratch-path "$CODEX_IMAGE_GRID_SWIFT_SCRATCH_PATH" --package-path "$REPO_ROOT/macos" --show-bin-path)"
 APP_SOURCE="$SWIFT_BIN_DIR/$APP_EXECUTABLE"
-MCP_SOURCE="$REPO_ROOT/target/release/$MCP_EXECUTABLE"
-SERVER_SOURCE="$REPO_ROOT/target/release/$SERVER_EXECUTABLE"
+MCP_SOURCE="$CARGO_TARGET_DIR/release/$MCP_EXECUTABLE"
+SERVER_SOURCE="$CARGO_TARGET_DIR/release/$SERVER_EXECUTABLE"
 for artifact in "$APP_SOURCE" "$MCP_SOURCE" "$SERVER_SOURCE"; do
     if [[ ! -f "$artifact" || ! -x "$artifact" ]]; then
         echo "release artifact is unavailable or not executable: $artifact" >&2
@@ -119,6 +129,7 @@ cleanup() {
     if [[ -n "${STAGE_ROOT:-}" && -d "$STAGE_ROOT" ]]; then
         /bin/rm -rf -- "$STAGE_ROOT"
     fi
+    image_grid_cleanup_build_paths
 }
 rollback() {
     local status=$?
@@ -170,5 +181,6 @@ fi
 STAGE_ROOT=""
 INSTALLED_NEW=0
 trap - EXIT
+image_grid_cleanup_build_paths
 echo "result: installed and verified"
 echo "installedApp: $INSTALL_TARGET"

@@ -46,6 +46,103 @@ import Foundation
     #expect(object["referenceImage"] == nil)
 }
 
+@Test func runEnvelopeDecodesArtifactWriteFailureWithoutChangingJobs() throws {
+    let data = try JSONSerialization.data(withJSONObject: [
+        "runId": "run-one",
+        "status": "error",
+        "artifactError": [
+            "code": "ArtifactWriteFailed",
+            "message": "保存に失敗しました",
+        ],
+        "jobs": [[
+            "id": "job-one",
+            "runId": "run-one",
+            "status": "done",
+            "imageUrl": "/generated/run-one/variant-01.png",
+        ]],
+    ])
+
+    let envelope = try JSONDecoder().decode(ImageGridRunEnvelope.self, from: data)
+    #expect(envelope.artifactError == ImageGridArtifactError(
+        code: "ArtifactWriteFailed",
+        message: "保存に失敗しました"
+    ))
+    #expect(envelope.hydratedJobs.first?.status == "done")
+    #expect(envelope.hydratedJobs.first?.imageUrl == "/generated/run-one/variant-01.png")
+}
+
+@Test func runArtifactsEventPayloadDecodesNullAndFailureValues() throws {
+    let failure = try JSONDecoder().decode(
+        ImageGridRunArtifactsEvent.self,
+        from: Data("{\"runId\":\"run-one\",\"artifactError\":{\"code\":\"ArtifactWriteFailed\",\"message\":\"保存失敗\"}}".utf8)
+    )
+    #expect(failure.runId == "run-one")
+    #expect(failure.artifactError?.code == "ArtifactWriteFailed")
+
+    let normal = try JSONDecoder().decode(
+        ImageGridRunArtifactsEvent.self,
+        from: Data("{\"runId\":\"run-one\",\"artifactError\":null}".utf8)
+    )
+    #expect(normal.artifactError == nil)
+}
+
+@Test func artifactErrorRecoveryClearsOnlyTheMatchingRunMessage() {
+    var tracker = ImageGridArtifactErrorTracker()
+    let failureA = ImageGridArtifactError(code: "ArtifactWriteFailed", message: "run A 保存失敗")
+    let failureB = ImageGridArtifactError(code: "ArtifactWriteFailed", message: "run B 保存失敗")
+
+    var update = tracker.record(
+        runID: "run-a",
+        error: failureA,
+        currentMessage: nil,
+        currentOwnerRunID: nil
+    )
+    var message = update.message
+    #expect(message == "run A 保存失敗")
+    update = tracker.record(
+        runID: "run-b",
+        error: failureB,
+        currentMessage: message,
+        currentOwnerRunID: update.ownerRunID
+    )
+    message = update.message
+    #expect(message == "run B 保存失敗")
+    update = tracker.record(
+        runID: "run-a",
+        error: nil,
+        currentMessage: message,
+        currentOwnerRunID: update.ownerRunID
+    )
+    message = update.message
+    #expect(message == "run B 保存失敗")
+
+    update = tracker.record(
+        runID: "run-b",
+        error: nil,
+        currentMessage: message,
+        currentOwnerRunID: update.ownerRunID
+    )
+    message = update.message
+    #expect(message == nil)
+
+    update = tracker.record(
+        runID: "run-a",
+        error: failureA,
+        currentMessage: nil,
+        currentOwnerRunID: update.ownerRunID
+    )
+    message = update.message
+    #expect(message == "run A 保存失敗")
+    update = tracker.record(
+        runID: "run-a",
+        error: nil,
+        currentMessage: "API request failed",
+        currentOwnerRunID: update.ownerRunID
+    )
+    message = update.message
+    #expect(message == "API request failed")
+}
+
 @Test func sseParserBuildsNamedMultilineEvent() throws {
     var parser = ImageGridSSEParser()
     #expect(parser.consume(line: "event: job") == nil)

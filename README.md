@@ -182,9 +182,18 @@ scripts/check.sh
 Build the components directly:
 
 ```bash
-cargo build --workspace --locked
-swift build --package-path macos
+CARGO_TARGET_DIR=/path/to/cargo-target cargo build --workspace --locked
+swift build --scratch-path /path/to/swift-scratch --package-path macos
 ```
+
+`scripts/check.sh`, `scripts/smoke-first-slice.sh`, and
+`scripts/install-native-app.sh` place Cargo and Swift intermediate files in a
+temporary directory outside the repository by default. Set
+`CARGO_TARGET_DIR` to reuse an existing Cargo target directory; that directory
+is preserved and is never cleaned by the scripts. To share one task-scoped
+temporary build root across commands, set `CODEX_IMAGE_GRID_BUILD_ROOT` to an
+existing directory and let the scripts derive the Cargo and Swift paths from
+it.
 
 Inspect or execute the native app installer:
 
@@ -372,9 +381,16 @@ scripts/check.sh
 各コンポーネントを直接ビルド:
 
 ```bash
-cargo build --workspace --locked
-swift build --package-path macos
+CARGO_TARGET_DIR=/path/to/cargo-target cargo build --workspace --locked
+swift build --scratch-path /path/to/swift-scratch --package-path macos
 ```
+
+`scripts/check.sh`、`scripts/smoke-first-slice.sh`、
+`scripts/install-native-app.sh`は、既定ではリポジトリ外の一時ディレクトリに
+CargoとSwiftの中間物を置きます。既存のCargo出力先を使う場合は
+`CARGO_TARGET_DIR`を指定してください。指定した出力先は保持され、スクリプトから
+削除されません。作業単位の一時ビルドルートを複数のコマンドで共有する場合は、
+既存ディレクトリを`CODEX_IMAGE_GRID_BUILD_ROOT`に指定してください。
 
 ネイティブアプリのインストール内容確認・実行:
 

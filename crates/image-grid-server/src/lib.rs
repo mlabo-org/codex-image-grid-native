@@ -694,10 +694,12 @@ async fn create_run_response(
         )
             .into_response(),
         Err(error) => (
-            if error.code.as_deref() == Some("RuntimeClosed") {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::BAD_REQUEST
+            match error.code.as_deref() {
+                Some("RuntimeClosed") => StatusCode::SERVICE_UNAVAILABLE,
+                Some("ArtifactWriteFailed" | "RunStorageUnavailable") => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                _ => StatusCode::BAD_REQUEST,
             },
             Json(error.body()),
         )
@@ -1522,8 +1524,7 @@ done
 
         let outside_manifest = temporary.path().join("outside.json");
         fs::write(&outside_manifest, br#"{"outside":true}"#).expect("outside manifest");
-        symlink(&outside_manifest, run_directory.join("manifest.json"))
-            .expect("linked manifest");
+        symlink(&outside_manifest, run_directory.join("manifest.json")).expect("linked manifest");
         let response = app
             .clone()
             .oneshot(
@@ -1540,8 +1541,7 @@ done
         fs::create_dir_all(&outside_run).expect("outside run directory");
         fs::write(outside_run.join("variant-02.png"), b"outside run image")
             .expect("outside run image");
-        symlink(&outside_run, config.generated_dir.join("deadbeef"))
-            .expect("linked run directory");
+        symlink(&outside_run, config.generated_dir.join("deadbeef")).expect("linked run directory");
         let response = app
             .oneshot(
                 Request::builder()

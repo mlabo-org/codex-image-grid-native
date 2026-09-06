@@ -92,6 +92,21 @@ fields, accepted inputs, limits, defaults, and artifact validity. Plugin and
 skill prose describe ownership and dispatch only; they do not redefine that
 contract.
 
+### Generation and artifact persistence
+
+A new run is admitted only after its initial handoff and manifest have been
+saved. Each run directory is reserved exclusively; a colliding ID never
+reuses an existing directory. Updates save the handoff before the manifest,
+which serves as the persisted completion record.
+
+Generation success and artifact persistence are separate results. HTTP and
+MCP run responses include `artifactError: null`, or an object containing
+`code: "ArtifactWriteFailed"` and `message`. A terminal run with a persistence
+error reports `status: "error"` while keeping generated jobs and image URLs
+intact. This error does not trigger image regeneration. SSE clients receive
+`run-artifacts` events containing `runId` and `artifactError`; a later successful
+save clears the error for that run.
+
 ## Reference-image policy
 
 The SwiftUI app may send a validated local absolute path as a native extension.

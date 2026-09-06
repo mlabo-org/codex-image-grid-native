@@ -3,8 +3,8 @@ use crate::{RuntimeConfig, RuntimeIdentity, SchedulerSnapshot};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use image_grid_core::{
-    APP_IDENTITY, MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES, MAX_RUN_JOBS, MAX_VARIANTS_PER_PROMPT,
-    MAX_WAIT_MS, stage_reference_image,
+    APP_IDENTITY, BatchValidationError, MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES, MAX_RUN_JOBS,
+    MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS, stage_reference_image, validate_batch_shape,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -307,6 +307,13 @@ struct RunRecord {
     artifacts: RunArtifacts,
     created_at: i64,
     notify: Arc<Notify>,
+    artifact_error: Option<ArtifactError>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ArtifactError {
+    code: &'static str,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,6 +470,8 @@ struct RuntimeInner {
     shutdown_gate: Mutex<()>,
     shutdown_signal: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    #[cfg(test)]
+    fail_artifact_write: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -507,6 +516,8 @@ impl GenerationRuntime {
                 shutdown_gate: Mutex::new(()),
                 shutdown_signal,
                 tasks: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                fail_artifact_write: AtomicBool::new(false),
             }),
         };
         runtime.persist_normalized_restorations(restored.normalized_run_ids);
@@ -562,6 +573,7 @@ impl GenerationRuntime {
     }
 
     pub(crate) async fn snapshot(&self) -> Vec<ImageGridJob> {
+        let _artifact_guard = self.inner.artifact_write.lock().await;
         let mut jobs = self
             .inner
             .jobs
@@ -588,6 +600,7 @@ impl GenerationRuntime {
         run_ids: &[String],
     ) -> Result<DeleteRunsResult, DeleteRunsError> {
         let _admission_guard = self.inner.admission_gate.write().await;
+        let _artifact_guard = self.inner.artifact_write.lock().await;
         let requested = run_ids.iter().cloned().collect::<HashSet<_>>();
         let mut active_run_ids = self
             .inner
@@ -712,6 +725,41 @@ impl GenerationRuntime {
         }
     }
 
+    async fn reserve_run_directory(
+        &self,
+        mut next_run_id: impl FnMut() -> String,
+    ) -> Result<(String, PathBuf), RunApiError> {
+        fs::create_dir_all(&self.inner.config.generated_dir)
+            .await
+            .map_err(|error| {
+                RunApiError::new(
+                    format!("could not create generated directory: {error}"),
+                    "RunStorageUnavailable",
+                )
+            })?;
+        for _ in 0..16 {
+            let run_id = next_run_id();
+            if self.inner.runs.read().await.contains_key(&run_id) {
+                continue;
+            }
+            let directory = self.inner.config.generated_dir.join(&run_id);
+            match fs::create_dir(&directory).await {
+                Ok(()) => return Ok((run_id, directory)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(RunApiError::new(
+                        format!("could not reserve run directory: {error}"),
+                        "RunStorageUnavailable",
+                    ));
+                }
+            }
+        }
+        Err(RunApiError::new(
+            "could not reserve a unique run directory",
+            "RunStorageUnavailable",
+        ))
+    }
+
     pub(crate) async fn create_run(
         &self,
         body: &Value,
@@ -726,147 +774,168 @@ impl GenerationRuntime {
             return Err(runtime_closed_api_error());
         }
         let request = normalize_request(body, require_prompts_array, query_wait_ms)?;
-        let run_id = Uuid::new_v4().to_string()[..8].to_owned();
-        let run_directory = self.inner.config.generated_dir.join(&run_id);
-        fs::create_dir_all(&run_directory).await.map_err(|error| {
-            RunApiError::message(format!("could not create run directory: {error}"))
-        })?;
+        let (run_id, run_directory) = self
+            .reserve_run_directory(|| Uuid::new_v4().to_string()[..8].to_owned())
+            .await?;
 
-        let reference = if let Some(inline) = request.inline_reference_image.clone() {
-            let filename = format!("reference.{}", inline.extension);
-            let staged_path = run_directory.join(&filename);
-            atomic_write(&staged_path, &inline.bytes).await?;
-            let staged_path = fs::canonicalize(&staged_path).await.map_err(|error| {
-                RunApiError::message(format!("reference staging failed: {error}"))
-            })?;
-            Some(ReferenceRecord {
-                path: display_path(&staged_path),
-                url: format!("/generated/{run_id}/{filename}"),
-            })
-        } else if let Some(source_path) = request.reference_image_path.clone() {
-            let staging_directory = run_directory.clone();
-            let staged = tokio::task::spawn_blocking(move || {
-                stage_reference_image(source_path, staging_directory)
-            })
-            .await
-            .map_err(|error| RunApiError::message(format!("reference staging failed: {error}")))?
-            .map_err(|error| RunApiError::message(error.to_string()))?;
-            let filename = staged
-                .staged_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("reference.png")
-                .to_owned();
-            Some(ReferenceRecord {
-                path: display_path(&staged.staged_path),
-                url: format!("/generated/{run_id}/{filename}"),
-            })
-        } else {
-            None
-        };
-
-        let artifacts = run_artifacts(&self.inner.config.generated_dir, &run_id);
-        let model = if request.engine == "app-server-image" {
-            "app-server-image"
-        } else {
-            "codex-app-server"
-        }
-        .to_owned();
-        let request_record = RunRequestRecord {
-            prompts: request
-                .prompts
-                .iter()
-                .enumerate()
-                .map(|(index, prompt)| PromptRecord {
-                    index: index + 1,
-                    prompt: prompt.clone(),
+        let prepared = async {
+            let reference = if let Some(inline) = request.inline_reference_image.clone() {
+                let filename = format!("reference.{}", inline.extension);
+                let staged_path = run_directory.join(&filename);
+                atomic_write(&staged_path, &inline.bytes).await?;
+                let staged_path = fs::canonicalize(&staged_path).await.map_err(|error| {
+                    RunApiError::message(format!("reference staging failed: {error}"))
+                })?;
+                Some(ReferenceRecord {
+                    path: display_path(&staged_path),
+                    url: format!("/generated/{run_id}/{filename}"),
                 })
-                .collect(),
-            mood: request.mood.clone(),
-            engine: request.engine.clone(),
-            model: model.clone(),
-            aspect_ratio: request.aspect_ratio.clone(),
-            variants_per_prompt: request.count,
-            prompt_total: request.prompts.len(),
-            reference_premise: request.reference_premise.clone(),
-            reference_image: reference.clone(),
-        };
+            } else if let Some(source_path) = request.reference_image_path.clone() {
+                let staging_directory = run_directory.clone();
+                let staged = tokio::task::spawn_blocking(move || {
+                    stage_reference_image(source_path, staging_directory)
+                })
+                .await
+                .map_err(|error| {
+                    RunApiError::message(format!("reference staging failed: {error}"))
+                })?
+                .map_err(|error| RunApiError::message(error.to_string()))?;
+                let filename = staged
+                    .staged_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("reference.png")
+                    .to_owned();
+                Some(ReferenceRecord {
+                    path: display_path(&staged.staged_path),
+                    url: format!("/generated/{run_id}/{filename}"),
+                })
+            } else {
+                None
+            };
 
-        let now = now_millis();
-        let mut created = Vec::with_capacity(request.prompts.len() * request.count);
-        for (prompt_index, prompt) in request.prompts.iter().enumerate() {
-            for variant_index in 0..request.count {
-                let extension = if request.engine == "codex-svg" {
-                    "svg"
-                } else {
-                    "png"
-                };
-                let prompt_part = if request.prompts.len() > 1 {
-                    format!("prompt-{:02}-", prompt_index + 1)
-                } else {
-                    String::new()
-                };
-                let filename = format!("{prompt_part}variant-{:02}.{extension}", variant_index + 1);
-                created.push(ImageGridJob {
-                    id: Uuid::new_v4().to_string(),
-                    run_id: run_id.clone(),
-                    engine: request.engine.clone(),
-                    model: model.clone(),
-                    prompt: prompt.clone(),
-                    reference_premise: request.reference_premise.clone(),
-                    mood: request.mood.clone(),
-                    prompt_index: prompt_index + 1,
-                    prompt_total: request.prompts.len(),
-                    variant: variant_index + 1,
-                    total: request.count,
-                    filename: filename.clone(),
-                    output_path: display_path(&run_directory.join(&filename)),
-                    aspect_ratio: request.aspect_ratio.clone(),
-                    reference_image_path: reference.as_ref().map(|value| value.path.clone()),
-                    reference_image_url: reference.as_ref().map(|value| value.url.clone()),
-                    manifest_path: artifacts.manifest_path.clone(),
-                    manifest_url: artifacts.manifest_url.clone(),
-                    manifest_view_url: artifacts.manifest_view_url.clone(),
-                    handoff_path: artifacts.handoff_path.clone(),
-                    handoff_url: artifacts.handoff_url.clone(),
-                    handoff_view_url: artifacts.handoff_view_url.clone(),
-                    output_format: extension.to_owned(),
-                    status: "queued".to_owned(),
-                    status_text: "Queued".to_owned(),
-                    image_url: None,
-                    log: String::new(),
-                    thread_id: None,
-                    turn_id: None,
-                    error_code: None,
-                    error_message: None,
-                    upstream_status: None,
-                    diagnostic_log: String::new(),
-                    retry_count: 0,
-                    timing: JobTiming::queued(now),
-                    created_at: now,
-                    updated_at: now,
-                });
+            let artifacts = run_artifacts(&self.inner.config.generated_dir, &run_id);
+            let model = if request.engine == "app-server-image" {
+                "app-server-image"
+            } else {
+                "codex-app-server"
             }
-        }
+            .to_owned();
+            let request_record = RunRequestRecord {
+                prompts: request
+                    .prompts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, prompt)| PromptRecord {
+                        index: index + 1,
+                        prompt: prompt.clone(),
+                    })
+                    .collect(),
+                mood: request.mood.clone(),
+                engine: request.engine.clone(),
+                model: model.clone(),
+                aspect_ratio: request.aspect_ratio.clone(),
+                variants_per_prompt: request.count,
+                prompt_total: request.prompts.len(),
+                reference_premise: request.reference_premise.clone(),
+                reference_image: reference.clone(),
+            };
 
-        let job_ids = created.iter().map(|job| job.id.clone()).collect::<Vec<_>>();
+            let now = now_millis();
+            let mut created = Vec::with_capacity(request.prompts.len() * request.count);
+            for (prompt_index, prompt) in request.prompts.iter().enumerate() {
+                for variant_index in 0..request.count {
+                    let extension = if request.engine == "codex-svg" {
+                        "svg"
+                    } else {
+                        "png"
+                    };
+                    let prompt_part = if request.prompts.len() > 1 {
+                        format!("prompt-{:02}-", prompt_index + 1)
+                    } else {
+                        String::new()
+                    };
+                    let filename =
+                        format!("{prompt_part}variant-{:02}.{extension}", variant_index + 1);
+                    created.push(ImageGridJob {
+                        id: Uuid::new_v4().to_string(),
+                        run_id: run_id.clone(),
+                        engine: request.engine.clone(),
+                        model: model.clone(),
+                        prompt: prompt.clone(),
+                        reference_premise: request.reference_premise.clone(),
+                        mood: request.mood.clone(),
+                        prompt_index: prompt_index + 1,
+                        prompt_total: request.prompts.len(),
+                        variant: variant_index + 1,
+                        total: request.count,
+                        filename: filename.clone(),
+                        output_path: display_path(&run_directory.join(&filename)),
+                        aspect_ratio: request.aspect_ratio.clone(),
+                        reference_image_path: reference.as_ref().map(|value| value.path.clone()),
+                        reference_image_url: reference.as_ref().map(|value| value.url.clone()),
+                        manifest_path: artifacts.manifest_path.clone(),
+                        manifest_url: artifacts.manifest_url.clone(),
+                        manifest_view_url: artifacts.manifest_view_url.clone(),
+                        handoff_path: artifacts.handoff_path.clone(),
+                        handoff_url: artifacts.handoff_url.clone(),
+                        handoff_view_url: artifacts.handoff_view_url.clone(),
+                        output_format: extension.to_owned(),
+                        status: "queued".to_owned(),
+                        status_text: "Queued".to_owned(),
+                        image_url: None,
+                        log: String::new(),
+                        thread_id: None,
+                        turn_id: None,
+                        error_code: None,
+                        error_message: None,
+                        upstream_status: None,
+                        diagnostic_log: String::new(),
+                        retry_count: 0,
+                        timing: JobTiming::queued(now),
+                        created_at: now,
+                        updated_at: now,
+                    });
+                }
+            }
+
+            let job_ids = created.iter().map(|job| job.id.clone()).collect::<Vec<_>>();
+            let run = RunRecord {
+                run_id: run_id.clone(),
+                job_ids,
+                initial_jobs: created.clone(),
+                request: request_record,
+                artifacts,
+                created_at: now,
+                notify: Arc::new(Notify::new()),
+                artifact_error: None,
+            };
+            self.persist_run_artifacts(&run, &created)
+                .await
+                .map_err(|error| RunApiError::new(error.error, "ArtifactWriteFailed"))?;
+            Ok::<_, RunApiError>((run, created))
+        }
+        .await;
+        let (run, created) = match prepared {
+            Ok(prepared) => prepared,
+            Err(mut error) => {
+                // This directory was exclusively reserved by this request. No job
+                // has been admitted, and no generated output can exist yet.
+                if let Err(cleanup) = fs::remove_dir_all(&run_directory).await {
+                    error.error.push_str(&format!(
+                        "; could not remove rejected run directory: {cleanup}"
+                    ));
+                }
+                return Err(error);
+            }
+        };
         {
             let mut jobs = self.inner.jobs.write().await;
             for job in &created {
                 jobs.insert(job.id.clone(), job.clone());
             }
         }
-        let run = RunRecord {
-            run_id: run_id.clone(),
-            job_ids,
-            initial_jobs: created.clone(),
-            request: request_record,
-            artifacts,
-            created_at: now,
-            notify: Arc::new(Notify::new()),
-        };
         self.inner.runs.write().await.insert(run_id.clone(), run);
-        self.write_artifacts(&run_id).await?;
         self.emit(
             "run",
             json!({
@@ -922,9 +991,16 @@ impl GenerationRuntime {
     }
 
     pub(crate) async fn run_response(&self, run_id: &str, include_jobs: bool) -> Option<Value> {
+        let artifact_guard = self.inner.artifact_write.lock().await;
         let run = self.inner.runs.read().await.get(run_id).cloned()?;
         let jobs = self.jobs_for_run(&run).await;
+        drop(artifact_guard);
         let (status, counts, completed) = run_status(&jobs);
+        let status = if completed && run.artifact_error.is_some() {
+            "error"
+        } else {
+            status
+        };
         let diagnostics = diagnostic_outputs(&jobs);
         let server = self.server_identity_value().await;
         let outputs = jobs.iter().map(output_value).collect::<Vec<_>>();
@@ -932,6 +1008,7 @@ impl GenerationRuntime {
             "runId": run_id,
             "status": status,
             "completed": completed,
+            "artifactError": run.artifact_error,
             "counts": counts,
             "statusUrl": format!("/api/runs/{run_id}"),
             "manifestPath": run.artifacts.manifest_path,
@@ -1062,7 +1139,8 @@ impl GenerationRuntime {
             return Err(GeneratedJobFileError::GeneratedFileNotFound);
         }
 
-        self.resolve_generated_file(Path::new(&job.output_path)).await
+        self.resolve_generated_file(Path::new(&job.output_path))
+            .await
     }
 
     pub(crate) async fn resolve_generated_file(
@@ -2194,7 +2272,13 @@ impl GenerationRuntime {
         let bytes = BASE64_STANDARD
             .decode(encoded)
             .map_err(|error| RunApiError::message(format!("invalid image result: {error}")))?;
-        validate_generated_image_bytes(&bytes, &job.output_format)?;
+        let output_format = job.output_format.clone();
+        let bytes = tokio::task::spawn_blocking(move || {
+            validate_generated_image_bytes(&bytes, &output_format)?;
+            Ok::<_, RunApiError>(bytes)
+        })
+        .await
+        .map_err(|error| RunApiError::message(format!("image decoding failed: {error}")))??;
         let output_path = PathBuf::from(&job.output_path);
         let temporary_path =
             output_path.with_extension(format!("{}.{}.tmp", job.output_format, Uuid::new_v4()));
@@ -2258,6 +2342,7 @@ impl GenerationRuntime {
     where
         F: FnOnce(&mut ImageGridJob, i64),
     {
+        let _artifact_guard = self.inner.artifact_write.lock().await;
         if self.is_closed() {
             return;
         }
@@ -2271,8 +2356,8 @@ impl GenerationRuntime {
             job.updated_at = now;
             (job.clone(), job.run_id.clone(), job.is_terminal())
         };
+        let _ = self.write_artifacts_locked(&run_id).await;
         self.emit("job", serde_json::to_value(&updated).unwrap_or(Value::Null));
-        self.write_artifacts_or_emit(&run_id).await;
         if terminal && let Some(run) = self.inner.runs.read().await.get(&run_id) {
             run.notify.notify_waiters();
         }
@@ -2292,11 +2377,19 @@ impl GenerationRuntime {
         };
         let deadline = Instant::now() + Duration::from_millis(wait_ms);
         loop {
-            let jobs = self.jobs_for_run(&run).await;
+            // Register before observing state so a completion between the
+            // snapshot and the await cannot be lost.
+            let notified = run.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let jobs = {
+                let _artifact_guard = self.inner.artifact_write.lock().await;
+                self.jobs_for_run(&run).await
+            };
             if jobs.iter().all(ImageGridJob::is_terminal) {
                 return;
             }
-            if timeout_at(deadline, run.notify.notified()).await.is_err() {
+            if timeout_at(deadline, notified).await.is_err() {
                 return;
             }
         }
@@ -2304,6 +2397,10 @@ impl GenerationRuntime {
 
     async fn write_artifacts(&self, run_id: &str) -> Result<(), RunApiError> {
         let _guard = self.inner.artifact_write.lock().await;
+        self.write_artifacts_locked(run_id).await
+    }
+
+    async fn write_artifacts_locked(&self, run_id: &str) -> Result<(), RunApiError> {
         let run = self
             .inner
             .runs
@@ -2313,6 +2410,38 @@ impl GenerationRuntime {
             .cloned()
             .ok_or_else(|| RunApiError::message("run not found"))?;
         let jobs = self.jobs_for_run(&run).await;
+        let result = self.persist_run_artifacts(&run, &jobs).await;
+        let artifact_error = result.as_ref().err().map(|error| ArtifactError {
+            code: "ArtifactWriteFailed",
+            message: error.error.clone(),
+        });
+        if let Some(current) = self.inner.runs.write().await.get_mut(run_id) {
+            current.artifact_error = artifact_error.clone();
+        }
+        if run.artifact_error != artifact_error {
+            self.emit(
+                "run-artifacts",
+                json!({ "runId": run_id, "artifactError": artifact_error }),
+            );
+        }
+        if let Err(error) = &result {
+            self.emit(
+                "server-log",
+                json!({ "stream": "artifact", "text": error.error }),
+            );
+        }
+        result
+    }
+
+    async fn persist_run_artifacts(
+        &self,
+        run: &RunRecord,
+        jobs: &[ImageGridJob],
+    ) -> Result<(), RunApiError> {
+        #[cfg(test)]
+        if self.inner.fail_artifact_write.load(Ordering::Relaxed) {
+            return Err(RunApiError::message("injected artifact write failure"));
+        }
         let updated_at = jobs
             .iter()
             .map(|job| job.updated_at)
@@ -2329,28 +2458,18 @@ impl GenerationRuntime {
             "server": server,
             "artifacts": run.artifacts,
             "request": run.request,
-            "diagnostics": diagnostic_outputs(&jobs),
+            "diagnostics": diagnostic_outputs(jobs),
             "outputs": jobs.iter().map(output_value).collect::<Vec<_>>()
         });
         let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
             RunApiError::message(format!("manifest serialization failed: {error}"))
         })?;
         manifest_bytes.push(b'\n');
-        atomic_write(Path::new(&run.artifacts.manifest_path), &manifest_bytes).await?;
-        let handoff = build_handoff(&run, &jobs, updated_at);
-        atomic_write(Path::new(&run.artifacts.handoff_path), handoff.as_bytes()).await
-    }
-
-    async fn write_artifacts_or_emit(&self, run_id: &str) {
-        if let Err(error) = self.write_artifacts(run_id).await {
-            self.emit(
-                "server-log",
-                json!({
-                    "stream": "artifact",
-                    "text": error.error
-                }),
-            );
-        }
+        let handoff = build_handoff(run, jobs, updated_at);
+        atomic_write(Path::new(&run.artifacts.handoff_path), handoff.as_bytes()).await?;
+        // The manifest is the persisted completion record. Install it only
+        // after the matching handoff has been written successfully.
+        atomic_write(Path::new(&run.artifacts.manifest_path), &manifest_bytes).await
     }
 
     async fn server_identity_value(&self) -> Value {
@@ -2412,7 +2531,7 @@ impl GenerationRuntime {
             }
         }
         for run_id in &affected_runs {
-            self.write_artifacts_or_emit(run_id).await;
+            let _ = self.write_artifacts(run_id).await;
         }
 
         self.inner.app_server.shutdown().await;
@@ -2429,22 +2548,20 @@ impl GenerationRuntime {
             }
         }
         for run_id in &affected_runs {
-            self.write_artifacts_or_emit(run_id).await;
+            let _ = self.write_artifacts(run_id).await;
         }
         self.inner.shutdown_complete.store(true, Ordering::Release);
     }
 }
 
 fn validate_generated_image_bytes(bytes: &[u8], output_format: &str) -> Result<(), RunApiError> {
-    let valid = match output_format {
-        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "jpg" | "jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        "webp" => {
-            bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
-        }
-        _ => false,
+    let format = match output_format {
+        "png" => Some(image::ImageFormat::Png),
+        "jpg" | "jpeg" => Some(image::ImageFormat::Jpeg),
+        "webp" => Some(image::ImageFormat::WebP),
+        _ => None,
     };
-    if valid {
+    if format.is_some_and(|format| image::load_from_memory_with_format(bytes, format).is_ok()) {
         Ok(())
     } else {
         Err(RunApiError::message(format!(
@@ -2596,6 +2713,7 @@ fn restore_persisted_run(
         artifacts,
         created_at,
         notify: Arc::new(Notify::new()),
+        artifact_error: None,
     };
     Some((run, jobs, normalized))
 }
@@ -2920,13 +3038,6 @@ fn normalize_request(
         }
         vec![prompt]
     };
-    if prompts.len() > MAX_PROMPTS {
-        return Err(RunApiError::new(
-            format!("prompt batch is limited to {MAX_PROMPTS} prompts"),
-            "too_many_prompts",
-        ));
-    }
-
     let count = match body.get("count") {
         None => 1,
         Some(value) => {
@@ -2939,18 +3050,32 @@ fn normalize_request(
             count
         }
     };
-    if !(1..=usize::from(MAX_VARIANTS_PER_PROMPT)).contains(&count) {
-        return Err(RunApiError::new(
+    let bounded_count = u8::try_from(count).map_err(|_| {
+        RunApiError::new(
             format!("count must be between 1 and {MAX_VARIANTS_PER_PROMPT}"),
             "count_out_of_range",
-        ));
-    }
-    if prompts.len() * count > MAX_RUN_JOBS {
-        return Err(RunApiError::new(
+        )
+    })?;
+    validate_batch_shape(&prompts, bounded_count).map_err(|error| match error {
+        BatchValidationError::PromptsRequired => {
+            RunApiError::new("at least one prompt is required", "prompts_required")
+        }
+        BatchValidationError::TooManyPrompts => RunApiError::new(
+            format!("prompt batch is limited to {MAX_PROMPTS} prompts"),
+            "too_many_prompts",
+        ),
+        BatchValidationError::PromptEmpty => {
+            RunApiError::new("at least one prompt is required", "prompts_required")
+        }
+        BatchValidationError::CountOutOfRange => RunApiError::new(
+            format!("count must be between 1 and {MAX_VARIANTS_PER_PROMPT}"),
+            "count_out_of_range",
+        ),
+        BatchValidationError::TooManyJobs => RunApiError::new(
             format!("a run is limited to {MAX_RUN_JOBS} total jobs"),
             "too_many_jobs",
-        ));
-    }
+        ),
+    })?;
 
     let mood = body
         .get("mood")
@@ -3344,12 +3469,19 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RunApiError> {
         .and_then(|value| value.to_str())
         .unwrap_or("artifact");
     let temporary_path = parent.join(format!(".{filename}.{}.tmp", Uuid::new_v4()));
-    fs::write(&temporary_path, bytes)
-        .await
-        .map_err(|error| RunApiError::message(format!("could not write artifact: {error}")))?;
-    fs::rename(&temporary_path, path)
-        .await
-        .map_err(|error| RunApiError::message(format!("could not install artifact: {error}")))
+    let result = async {
+        fs::write(&temporary_path, bytes)
+            .await
+            .map_err(|error| RunApiError::message(format!("could not write artifact: {error}")))?;
+        fs::rename(&temporary_path, path)
+            .await
+            .map_err(|error| RunApiError::message(format!("could not install artifact: {error}")))
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path).await;
+    }
+    result
 }
 
 fn build_image_prompt(job: &ImageGridJob) -> String {
@@ -3750,6 +3882,199 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn rejected_initial_artifact_write_admits_no_jobs_or_run_directory() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (runtime, config) =
+            provider_free_runtime(&temporary, "#!/bin/sh\nexit 1\n", RecoveryConfig::default());
+        runtime
+            .inner
+            .fail_artifact_write
+            .store(true, Ordering::Relaxed);
+
+        let error = runtime
+            .create_run(
+                &json!({"prompts": ["rejected run"], "waitMs": 0}),
+                true,
+                None,
+            )
+            .await
+            .expect_err("initial artifact storage must reject admission");
+
+        assert_eq!(error.code.as_deref(), Some("ArtifactWriteFailed"));
+        assert!(runtime.snapshot().await.is_empty());
+        assert!(runtime.inner.runs.read().await.is_empty());
+        assert!(runtime.inner.tasks.lock().await.is_empty());
+        assert_eq!(runtime.scheduler_snapshot().queued, 0);
+        assert_eq!(
+            std_fs::read_dir(&config.generated_dir)
+                .expect("generated root")
+                .count(),
+            0
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn artifact_write_failure_preserves_image_reports_error_and_recovers_without_generation()
+    {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (runtime, config) =
+            provider_free_runtime(&temporary, "#!/bin/sh\nexit 1\n", RecoveryConfig::default());
+        // Keep the provider worker queued; this test completes the generation
+        // state directly so only the artifact persistence boundary is exercised.
+        let _slots = runtime
+            .inner
+            .image_slots
+            .clone()
+            .acquire_many_owned(MAX_RUN_JOBS as u32)
+            .await
+            .expect("image slots");
+        let (_, accepted) = runtime
+            .create_run(
+                &json!({"prompts": ["preserved generated image"], "waitMs": 0}),
+                true,
+                None,
+            )
+            .await
+            .expect("accepted run");
+        let run_id = accepted["runId"].as_str().expect("run ID").to_owned();
+        let job_id = accepted["outputs"][0]["id"]
+            .as_str()
+            .expect("job ID")
+            .to_owned();
+        let directory = config.generated_dir.join(&run_id);
+        let handoff_path = directory.join("handoff.md");
+        let manifest_path = directory.join("manifest.json");
+        let image_path = directory.join("variant-01.png");
+        let image = BASE64_STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ).expect("PNG fixture");
+        std_fs::write(&image_path, &image).expect("generated image");
+        std_fs::remove_file(&handoff_path).expect("remove fixture handoff");
+        std_fs::create_dir(&handoff_path).expect("block handoff replacement");
+
+        let mut events = runtime.subscribe();
+        let first_waiter = {
+            let runtime = runtime.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move { runtime.wait_for_run(&run_id, 30_000).await })
+        };
+        let second_waiter = {
+            let runtime = runtime.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move { runtime.wait_for_run(&run_id, 30_000).await })
+        };
+        tokio::task::yield_now().await;
+        runtime
+            .update_job(&job_id, |job, now| {
+                job.status = "done".to_owned();
+                job.status_text = "Generated".to_owned();
+                job.image_url = Some(format!("/generated/{run_id}/variant-01.png"));
+                job.timing.transition("done", now);
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first_waiter.await.expect("first waiter");
+            second_waiter.await.expect("second waiter");
+        })
+        .await
+        .expect("completion must wake every waiter before its deadline");
+
+        let failed = runtime
+            .run_response(&run_id, false)
+            .await
+            .expect("run response");
+        assert_eq!(failed["status"], "error");
+        assert_eq!(failed["completed"], true);
+        assert_eq!(failed["artifactError"]["code"], "ArtifactWriteFailed");
+        assert_eq!(failed["outputs"][0]["status"], "done");
+        assert!(failed["outputs"][0]["imageUrl"].as_str().is_some());
+        let stale_manifest: Value =
+            serde_json::from_slice(&std_fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(stale_manifest["outputs"][0]["status"], "queued");
+        assert!(!std_fs::read_dir(&directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+
+        std_fs::remove_dir(&handoff_path).expect("unblock handoff replacement");
+        runtime
+            .write_artifacts(&run_id)
+            .await
+            .expect("artifact-only recovery");
+        let recovered = runtime
+            .run_response(&run_id, false)
+            .await
+            .expect("recovered run");
+        assert_eq!(recovered["status"], "done");
+        assert_eq!(recovered["artifactError"], Value::Null);
+        assert_eq!(std_fs::read(&image_path).unwrap(), image);
+        let manifest: Value =
+            serde_json::from_slice(&std_fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["outputs"][0]["status"], "done");
+        assert!(
+            std_fs::read_to_string(&handoff_path)
+                .unwrap()
+                .contains("variant-01.png")
+        );
+        assert!(runtime.inner.app_server.current_client().await.is_none());
+        let mut persistence_events = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event.name == "run-artifacts" {
+                persistence_events.push(event.data);
+            }
+        }
+        assert_eq!(persistence_events.len(), 2);
+        assert_eq!(
+            persistence_events[0]["artifactError"]["code"],
+            "ArtifactWriteFailed"
+        );
+        assert_eq!(persistence_events[1]["artifactError"], Value::Null);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn run_directory_collision_preserves_existing_files_and_reserves_new_id() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (runtime, config) =
+            provider_free_runtime(&temporary, "#!/bin/sh\nexit 1\n", RecoveryConfig::default());
+        let existing = config.generated_dir.join("feedface");
+        std_fs::create_dir(&existing).expect("existing run directory");
+        std_fs::write(existing.join("variant-01.png"), b"preserve original").unwrap();
+        std_fs::write(config.generated_dir.join("deadbeef"), b"preserve file").unwrap();
+        let mut candidates = ["feedface", "deadbeef", "c0decafe"].into_iter();
+        let (run_id, reserved) = runtime
+            .reserve_run_directory(|| candidates.next().unwrap().to_owned())
+            .await
+            .expect("exclusive run directory");
+        assert_eq!(run_id, "c0decafe");
+        assert!(reserved.is_dir());
+        assert_eq!(
+            std_fs::read(existing.join("variant-01.png")).unwrap(),
+            b"preserve original"
+        );
+        assert_eq!(
+            std_fs::read(config.generated_dir.join("deadbeef")).unwrap(),
+            b"preserve file"
+        );
+        runtime.shutdown().await;
+    }
+
+    #[test]
+    fn generated_png_requires_decodable_pixels_not_only_a_signature() {
+        assert!(validate_generated_image_bytes(b"\x89PNG\r\n\x1a\n", "png").is_err());
+        // Use the same complete PNG produced by the provider-free primary route.
+        let png = BASE64_STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ).expect("PNG fixture");
+        assert!(validate_generated_image_bytes(&png[..33], "png").is_err());
+        validate_generated_image_bytes(&png, "png").expect("complete PNG");
+    }
+
     fn svg_fixture_job(run_id: &str, output_path: &Path, now: i64) -> ImageGridJob {
         let run_directory = output_path.parent().expect("SVG run directory");
         let artifacts = run_artifacts(run_directory.parent().expect("generated directory"), run_id);
@@ -4000,6 +4325,7 @@ done
                 artifacts: artifacts.clone(),
                 created_at: now,
                 notify: Arc::new(Notify::new()),
+                artifact_error: None,
             },
         );
         runtime
@@ -4655,6 +4981,7 @@ done
                 artifacts,
                 created_at: now,
                 notify: Arc::new(Notify::new()),
+                artifact_error: None,
             },
         );
         runtime
