@@ -1484,36 +1484,40 @@ private struct ReferenceDropZone: View {
     let strings: ImageGridStrings
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 6)
-                .fill(Color(nsColor: .controlBackgroundColor))
-            RoundedRectangle(cornerRadius: 6)
-                .stroke(
-                    Color(nsColor: .separatorColor),
-                    style: StrokeStyle(lineWidth: 1, dash: [5, 4])
-                )
-
-            if let url, let image = NSImage(contentsOf: url) {
-                Image(nsImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .padding(8)
-            } else {
-                VStack(spacing: 7) {
-                    Image(systemName: "photo.badge.plus")
-                        .foregroundStyle(.secondary)
-                        .accessibilityHidden(true)
-                    Text(strings.dropImage)
-                        .appFont(.body, weight: .semibold)
-                    Text(strings.fileTypes)
-                        .appFont(.caption)
-                        .foregroundStyle(.secondary)
+        GeometryReader { geometry in
+            ZStack {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(
+                        Color(nsColor: .separatorColor),
+                        style: StrokeStyle(lineWidth: 1, dash: [5, 4])
+                    )
+    
+                if let url, let image = NSImage(contentsOf: url) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: max(0, geometry.size.width - 16), height: max(0, geometry.size.height - 16))
+                        .padding(8)
+                } else {
+                    VStack(spacing: 7) {
+                        Image(systemName: "photo.badge.plus")
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                        Text(strings.dropImage)
+                            .appFont(.body, weight: .semibold)
+                        Text(strings.fileTypes)
+                            .appFont(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(16)
                 }
-                .padding(16)
             }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .clipped()
         }
-        .aspectRatio(16 / 9, contentMode: .fit)
-        .frame(minHeight: 210)
+        .frame(height: 210)
         .overlay {
             if isProcessing {
                 ZStack {

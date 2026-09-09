@@ -204,79 +204,83 @@ struct ResultCardView: View {
     }
 
     private var image: some View {
-        ZStack(alignment: .topLeading) {
-            Color(nsColor: .underPageBackgroundColor)
-            if let imageURL {
-                AsyncImage(url: imageURL) { phase in
-                    switch phase {
-                    case .empty:
-                        if job.isActive {
-                            activeImagePlaceholder
-                        } else {
-                            ProgressView()
+        GeometryReader { geometry in
+            ZStack(alignment: .topLeading) {
+                Color(nsColor: .underPageBackgroundColor)
+                if let imageURL {
+                    AsyncImage(url: imageURL) { phase in
+                        switch phase {
+                        case .empty:
+                            if job.isActive {
+                                activeImagePlaceholder
+                            } else {
+                                ProgressView()
+                            }
+                        case let .success(image):
+                            image
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: geometry.size.width, height: geometry.size.height)
+                        case .failure:
+                            switch ResultCardImageLoadFailurePresentation.resolve(for: job) {
+                            case .progress:
+                                activeImagePlaceholder
+                            case .generationFailure:
+                                generationFailurePlaceholder
+                            case .imageUnavailable:
+                                imageUnavailablePlaceholder
+                            }
+                        @unknown default:
+                            EmptyView()
                         }
-                    case let .success(image):
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    case .failure:
-                        switch ResultCardImageLoadFailurePresentation.resolve(for: job) {
-                        case .progress:
-                            activeImagePlaceholder
-                        case .generationFailure:
-                            generationFailurePlaceholder
-                        case .imageUnavailable:
-                            imageUnavailablePlaceholder
+                    }
+                    .id(imageRequestIdentity(imageURL))
+                } else if job.isActive {
+                    activeImagePlaceholder
+                } else if job.status == "error" {
+                    generationFailurePlaceholder
+                } else {
+                    imageUnavailablePlaceholder
+                }
+    
+                if isSelectable {
+                    Button(action: onSelectionToggle) {
+                        Label(
+                            isSelected ? strings.selectedForDeletion : strings.markForDeletion,
+                            systemImage: isSelected ? "checkmark.circle.fill" : "circle"
+                        )
+                        .appFont(.caption, weight: .semibold)
+                        .foregroundStyle(isSelected ? Color.white : Color.primary)
+                        .padding(.horizontal, 10)
+                        .frame(height: 30)
+                        .background(
+                            isSelected
+                                ? Color.accentColor
+                                : Color(nsColor: .windowBackgroundColor).opacity(0.92),
+                            in: Capsule()
+                        )
+                        .overlay {
+                            Capsule()
+                                .stroke(
+                                    isSelected
+                                        ? Color.accentColor
+                                        : Color(nsColor: .separatorColor),
+                                    lineWidth: 1
+                                )
                         }
-                    @unknown default:
-                        EmptyView()
                     }
-                }
-                .id(imageRequestIdentity(imageURL))
-            } else if job.isActive {
-                activeImagePlaceholder
-            } else if job.status == "error" {
-                generationFailurePlaceholder
-            } else {
-                imageUnavailablePlaceholder
-            }
-
-            if isSelectable {
-                Button(action: onSelectionToggle) {
-                    Label(
-                        isSelected ? strings.selectedForDeletion : strings.markForDeletion,
-                        systemImage: isSelected ? "checkmark.circle.fill" : "circle"
+                    .buttonStyle(.plain)
+                    .padding(10)
+                    .resultCardActionRegion(enabled: isSelectable)
+                    .accessibilityLabel(
+                        isSelected ? strings.removeFromDeletion : strings.addToDeletion
                     )
-                    .appFont(.caption, weight: .semibold)
-                    .foregroundStyle(isSelected ? Color.white : Color.primary)
-                    .padding(.horizontal, 10)
-                    .frame(height: 30)
-                    .background(
-                        isSelected
-                            ? Color.accentColor
-                            : Color(nsColor: .windowBackgroundColor).opacity(0.92),
-                        in: Capsule()
-                    )
-                    .overlay {
-                        Capsule()
-                            .stroke(
-                                isSelected
-                                    ? Color.accentColor
-                                    : Color(nsColor: .separatorColor),
-                                lineWidth: 1
-                            )
-                    }
                 }
-                .buttonStyle(.plain)
-                .padding(10)
-                .resultCardActionRegion(enabled: isSelectable)
-                .accessibilityLabel(
-                    isSelected ? strings.removeFromDeletion : strings.addToDeletion
-                )
             }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .clipped()
         }
-        .aspectRatio(aspectRatio, contentMode: .fit)
-        .clipped()
+        .frame(height: 240)
         .accessibilityElement(children: .combine)
     }
 
@@ -427,18 +431,6 @@ struct ResultCardView: View {
 
     private var displayStatusText: String {
         job.isActive ? activeStatusText : (job.statusText ?? job.status)
-    }
-
-    private var aspectRatio: CGFloat {
-        guard let value = job.aspectRatio?.split(separator: ":"),
-              value.count == 2,
-              let width = Double(value[0]),
-              let height = Double(value[1]),
-              height > 0
-        else {
-            return 16 / 9
-        }
-        return CGFloat(width / height)
     }
 
     private var statusSymbol: String {
