@@ -280,7 +280,7 @@ struct ResultCardView: View {
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
         }
-        .frame(height: 240)
+        .aspectRatio(16 / 9, contentMode: .fit)
         .accessibilityElement(children: .combine)
     }
 

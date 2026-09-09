@@ -1517,7 +1517,7 @@ private struct ReferenceDropZone: View {
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
         }
-        .frame(height: 210)
+        .aspectRatio(16 / 9, contentMode: .fit)
         .overlay {
             if isProcessing {
                 ZStack {
