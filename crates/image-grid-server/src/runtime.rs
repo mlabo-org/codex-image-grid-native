@@ -3,8 +3,9 @@ use crate::{RuntimeConfig, RuntimeIdentity, SchedulerSnapshot};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use image_grid_core::{
-    APP_IDENTITY, BatchValidationError, MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES, MAX_RUN_JOBS,
-    MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS, stage_reference_image, validate_batch_shape,
+    APP_IDENTITY, BatchValidationError, ImageOperation, MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES,
+    MAX_RUN_JOBS, MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS, stage_reference_image,
+    validate_batch_shape,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -117,6 +118,8 @@ impl JobTiming {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageGridJob {
+    #[serde(default)]
+    pub operation: ImageOperation,
     pub id: String,
     pub run_id: String,
     pub engine: String,
@@ -242,6 +245,7 @@ impl RunApiError {
 
 #[derive(Debug, Clone)]
 struct NormalizedRunRequest {
+    operation: ImageOperation,
     prompts: Vec<String>,
     count: usize,
     mood: String,
@@ -276,6 +280,8 @@ struct ReferenceRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunRequestRecord {
+    #[serde(default)]
+    operation: ImageOperation,
     prompts: Vec<PromptRecord>,
     mood: String,
     engine: String,
@@ -331,6 +337,8 @@ struct PersistedRunManifest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedOutput {
+    #[serde(default)]
+    operation: ImageOperation,
     id: String,
     prompt: String,
     prompt_index: usize,
@@ -822,6 +830,7 @@ impl GenerationRuntime {
             }
             .to_owned();
             let request_record = RunRequestRecord {
+                operation: request.operation,
                 prompts: request
                     .prompts
                     .iter()
@@ -858,6 +867,7 @@ impl GenerationRuntime {
                     let filename =
                         format!("{prompt_part}variant-{:02}.{extension}", variant_index + 1);
                     created.push(ImageGridJob {
+                        operation: request.operation,
                         id: Uuid::new_v4().to_string(),
                         run_id: run_id.clone(),
                         engine: request.engine.clone(),
@@ -2752,6 +2762,10 @@ fn validate_restored_request(
         )?),
         None => None,
     };
+    request
+        .operation
+        .validate(&request.engine, request.reference_image.is_some())
+        .ok()?;
     Some(request)
 }
 
@@ -2807,6 +2821,7 @@ fn restore_persisted_output(
         || output.variant > request.variants_per_prompt
         || output.total != request.variants_per_prompt
         || output.engine != request.engine
+        || output.operation != request.operation
         || output.model != request.model
         || output.mood != request.mood
         || output.aspect_ratio != request.aspect_ratio
@@ -2908,6 +2923,7 @@ fn restore_persisted_output(
 
     Some((
         ImageGridJob {
+            operation: output.operation,
             id: output.id,
             run_id: run_id.to_owned(),
             engine: output.engine,
@@ -3109,9 +3125,29 @@ fn normalize_request(
             .map(PathBuf::from)
     });
     let reference_image_path = reference_image_path.flatten();
+    let operation = body
+        .get("operation")
+        .map(|value| serde_json::from_value::<ImageOperation>(value.clone()))
+        .transpose()
+        .map_err(|_| {
+            RunApiError::new(
+                "operation must be one of: generate, edit",
+                "invalid_operation",
+            )
+        })?
+        .unwrap_or_default();
+    operation
+        .validate(
+            body.get("engine")
+                .and_then(Value::as_str)
+                .unwrap_or("app-server-image"),
+            inline_reference_image.is_some() || reference_image_path.is_some(),
+        )
+        .map_err(|error| RunApiError::new(error, "invalid_edit_request"))?;
     let wait_ms = normalize_wait_ms(body.get("waitMs"), query_wait_ms);
 
     Ok(NormalizedRunRequest {
+        operation,
         prompts,
         count,
         mood,
@@ -3303,6 +3339,7 @@ fn diagnostic_outputs(jobs: &[ImageGridJob]) -> Vec<Value> {
 
 fn output_value(job: &ImageGridJob) -> Value {
     json!({
+        "operation": job.operation,
         "id": job.id,
         "prompt": job.prompt,
         "promptIndex": job.prompt_index,
@@ -3350,9 +3387,24 @@ fn build_handoff(run: &RunRecord, jobs: &[ImageGridJob], updated_at: i64) -> Str
         String::new(),
         "## Request".to_owned(),
         String::new(),
+        format!("- Operation: {}", run.request.operation.as_str()),
         format!("- Engine: {}", run.request.engine),
-        format!("- Mood: {}", run.request.mood),
-        format!("- Aspect ratio: {}", run.request.aspect_ratio),
+        format!(
+            "- Mood: {}",
+            if run.request.operation == ImageOperation::Edit {
+                "preserve source unless requested in prompt"
+            } else {
+                &run.request.mood
+            }
+        ),
+        format!(
+            "- Aspect ratio: {}",
+            if run.request.operation == ImageOperation::Edit {
+                "preserve source unless requested in prompt"
+            } else {
+                &run.request.aspect_ratio
+            }
+        ),
         format!("- Variants per prompt: {}", run.request.variants_per_prompt),
         format!(
             "- Reference image: {}",
@@ -3485,6 +3537,21 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RunApiError> {
 }
 
 fn build_image_prompt(job: &ImageGridJob) -> String {
+    if job.operation == ImageOperation::Edit {
+        return format!(
+            "Use the image generation tool to edit the attached source image and return exactly one edited image.\n\n\
+User edit request:\n{}\n\n\
+Editing requirements:\n\
+- The attached local image is the source to edit, not a character reference for a new composition.\n\
+- Apply only the requested changes. Preserve all other details, including character identity, face, pose, clothing, objects, background, composition, framing, lighting, colors, and art style.\n\
+- Preserve the source aspect ratio unless the user edit request explicitly changes it.\n\
+- Make only the local adjustments needed for a natural result, such as the grip when replacing a held object.\n\
+- Each batch output independently applies its request to the same source. Do not introduce unrelated variation between outputs.\n\
+- Do not create SVG or HTML. Edit the image through the image generation tool using the attached source.\n\
+- Do not ask follow-up questions.\n",
+            job.prompt
+        );
+    }
     let mood = mood_direction(&job.mood);
     let reference = if job.reference_image_path.is_some() {
         "Use the attached local reference image as the visual identity anchor for the character, while creating a fresh composition."
@@ -4079,6 +4146,7 @@ mod tests {
         let run_directory = output_path.parent().expect("SVG run directory");
         let artifacts = run_artifacts(run_directory.parent().expect("generated directory"), run_id);
         ImageGridJob {
+            operation: ImageOperation::Generate,
             id: "svg-job".to_owned(),
             run_id: run_id.to_owned(),
             engine: "codex-svg".to_owned(),
@@ -4157,6 +4225,7 @@ mod tests {
     fn prompt_builder_matches_the_frozen_primary_contract() {
         let now = now_millis();
         let job = ImageGridJob {
+            operation: ImageOperation::Generate,
             id: "job".to_owned(),
             run_id: "run".to_owned(),
             engine: "app-server-image".to_owned(),
@@ -4202,6 +4271,29 @@ mod tests {
         assert!(prompt.contains("Batch position:\nVariant 1 of 2"));
         assert!(prompt.contains("Target aspect ratio: 16:9."));
         assert!(prompt.ends_with("- Do not ask follow-up questions.\n"));
+    }
+
+    #[test]
+    fn edit_requests_require_a_source_and_image_engine_before_scheduling() {
+        for body in [
+            json!({"prompts": ["replace burger"], "operation": "edit"}),
+            json!({"prompts": ["replace burger"], "operation": "edit", "referenceImagePath": ""}),
+            json!({"prompts": ["replace burger"], "operation": "edit", "engine": "codex-svg", "referenceImagePath": "/source.png"}),
+            json!({"prompts": ["replace burger"], "operation": "edti"}),
+        ] {
+            assert!(normalize_request(&body, true, None).is_err());
+        }
+        let edit = normalize_request(
+            &json!({
+                "prompts": ["replace burger", "change the drink"],
+                "operation": "edit", "referenceImagePath": "/source.png", "count": 2
+            }),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(edit.operation, ImageOperation::Edit);
+        assert_eq!(edit.prompts.len() * edit.count, 4);
     }
 
     #[test]
@@ -4296,6 +4388,7 @@ done
         let job = svg_fixture_job(run_id, &output_path, now);
         let artifacts = run_artifacts(&config.generated_dir, run_id);
         let request = RunRequestRecord {
+            operation: ImageOperation::Generate,
             prompts: vec![PromptRecord {
                 index: 1,
                 prompt: job.prompt.clone(),
@@ -4406,6 +4499,7 @@ done
         let mut timing = JobTiming::queued(now);
         timing.transition("error", now);
         let job = ImageGridJob {
+            operation: ImageOperation::Generate,
             id: "job".to_owned(),
             run_id: "run".to_owned(),
             engine: "app-server-image".to_owned(),
@@ -4952,6 +5046,7 @@ done
         let job = svg_fixture_job(run_id, &run_directory.join("variant-01.svg"), now);
         let artifacts = run_artifacts(&config.generated_dir, run_id);
         let request = RunRequestRecord {
+            operation: ImageOperation::Generate,
             prompts: vec![PromptRecord {
                 index: 1,
                 prompt: job.prompt.clone(),
@@ -5047,6 +5142,7 @@ done
             let artifacts = run_artifacts(&config.generated_dir, run_id);
             let first = &jobs[0];
             let request = RunRequestRecord {
+                operation: ImageOperation::Generate,
                 prompts: vec![PromptRecord {
                     index: 1,
                     prompt: first.prompt.clone(),

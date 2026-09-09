@@ -1556,10 +1556,22 @@ done
 
     #[tokio::test]
     async fn provider_free_run_batch_stages_frozen_inline_reference_once() {
+        reference_operation_round_trip(None).await;
+    }
+
+    #[tokio::test]
+    async fn provider_free_edit_preserves_source_instructions_and_operation_on_restore() {
+        reference_operation_round_trip(Some("edit")).await;
+    }
+
+    async fn reference_operation_round_trip(operation: Option<&str>) {
         let temporary = tempfile::tempdir().expect("temporary directory");
-        let server_root = temporary.path().join("server");
-        let data_dir = temporary.path().join("data");
-        let workspace = temporary.path().join("workspace");
+        // Match main's canonical data-root construction on macOS (/var and
+        // /private/var refer to the same directory but are different paths).
+        let temporary_root = fs::canonicalize(temporary.path()).expect("canonical test root");
+        let server_root = temporary_root.join("server");
+        let data_dir = temporary_root.join("data");
+        let workspace = temporary_root.join("workspace");
         fs::create_dir_all(&server_root).expect("server root");
         fs::create_dir_all(&data_dir).expect("data root");
         fs::create_dir_all(&workspace).expect("workspace");
@@ -1616,35 +1628,37 @@ done
             Some(workspace),
             "server".to_owned(),
         );
-        let app = router_with_launch_config(config, AppServerLaunchConfig::single("fixture", fake));
+        let app = router_with_launch_config(
+            config.clone(),
+            AppServerLaunchConfig::single("fixture", fake),
+        );
         let reference_bytes = [0xff, 0xd8, 0xff, 0xd9];
         let unused_http_path = temporary.path().join("must-not-be-read.png");
+        let mut request_body = json!({
+            "prompts": ["Replace only the hamburger with a strawberry crepe."],
+            "count": 1,
+            "mood": "warm-mascot",
+            "engine": "app-server-image",
+            "aspectRatio": "16:9",
+            "referencePremise": "Character reference: round glasses and blue scarf",
+            "referenceImage": {
+                "dataUrl": format!("data:image/jpeg;base64,{}", BASE64_STANDARD.encode(reference_bytes)),
+                "mimeType": "image/jpeg",
+                "name": "browser-reference.jpeg",
+                "size": reference_bytes.len()
+            },
+            "referenceImagePath": unused_http_path.to_string_lossy()
+        });
+        if let Some(operation) = operation {
+            request_body["operation"] = json!(operation);
+        }
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/run-batch?waitMs=5000")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({
-                            "prompts": ["inline reference fixture"],
-                            "count": 1,
-                            "mood": "warm-mascot",
-                            "engine": "app-server-image",
-                            "aspectRatio": "16:9",
-                            "referenceImage": {
-                                "dataUrl": format!(
-                                    "data:image/jpeg;base64,{}",
-                                    BASE64_STANDARD.encode(reference_bytes)
-                                ),
-                                "mimeType": "image/jpeg",
-                                "name": "browser-reference.jpeg",
-                                "size": reference_bytes.len()
-                            },
-                            "referenceImagePath": unused_http_path.to_string_lossy()
-                        })
-                        .to_string(),
-                    ))
+                    .body(Body::from(request_body.to_string()))
                     .expect("run request"),
             )
             .await
@@ -1679,6 +1693,7 @@ done
             reference_bytes
         );
         for output in [&run["jobs"][0], &run["outputs"][0]] {
+            assert_eq!(output["operation"], operation.unwrap_or("generate"));
             assert_eq!(output["referenceImagePath"], staged_path_display);
             assert_eq!(output["referenceImageUrl"], reference_url);
             assert_eq!(output["outputPath"].as_str().is_some(), true);
@@ -1694,6 +1709,34 @@ done
             .iter()
             .find(|message| message["method"] == "turn/start")
             .expect("turn/start request");
+        let prompt = turn_start["params"]["input"][0]["text"]
+            .as_str()
+            .expect("prompt");
+        assert!(prompt.contains("Replace only the hamburger with a strawberry crepe."));
+        if operation == Some("edit") {
+            assert!(prompt.contains("edit the attached source image"));
+            assert!(prompt.contains("Preserve all other details"));
+            assert!(prompt.contains("Preserve the source aspect ratio"));
+            assert!(prompt.contains("same source"));
+            for generation_directive in [
+                "fresh composition",
+                "thumbnail grid",
+                "vary layout",
+                "Target aspect ratio: 16:9",
+                "round glasses",
+                "warm anime blog mascot",
+            ] {
+                assert!(
+                    !prompt.contains(generation_directive),
+                    "leaked generation instruction: {generation_directive}"
+                );
+            }
+        } else {
+            assert!(prompt.contains("visual identity anchor"));
+            assert!(prompt.contains("fresh composition"));
+            assert!(prompt.contains("recognizable traits"));
+            assert!(prompt.contains("round glasses and blue scarf"));
+        }
         assert_eq!(
             turn_start["params"]["input"][1],
             json!({
@@ -1710,6 +1753,14 @@ done
         let manifest: Value =
             serde_json::from_slice(&fs::read(manifest_path).expect("persisted manifest bytes"))
                 .expect("manifest JSON");
+        assert_eq!(
+            manifest["request"]["operation"],
+            operation.unwrap_or("generate")
+        );
+        assert_eq!(
+            manifest["outputs"][0]["operation"],
+            operation.unwrap_or("generate")
+        );
         assert_eq!(
             manifest["request"]["referenceImage"],
             json!({
@@ -1736,6 +1787,45 @@ done
         assert!(handoff.contains(&format!("- Reference image: {staged_path_display}")));
         assert!(handoff.contains("## Outputs"));
         assert!(!unused_http_path.exists());
+
+        // Existing runs lack operation entirely. They must remain readable as
+        // generation; explicit edits must retain their mode across restart.
+        if operation.is_none() {
+            let mut legacy = manifest;
+            legacy["request"]
+                .as_object_mut()
+                .unwrap()
+                .remove("operation");
+            for output in legacy["outputs"].as_array_mut().unwrap() {
+                output.as_object_mut().unwrap().remove("operation");
+            }
+            fs::write(
+                run["manifestPath"].as_str().unwrap(),
+                serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
+        }
+        let restored = router(config)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runs/{run_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("restored response");
+        assert_eq!(restored.status(), StatusCode::OK);
+        let restored: Value =
+            serde_json::from_slice(&restored.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            restored["outputs"][0]["operation"],
+            operation.unwrap_or("generate")
+        );
+        assert_eq!(
+            restored["outputs"][0]["referenceImagePath"],
+            staged_path_display
+        );
     }
 
     #[tokio::test]
@@ -1924,6 +2014,7 @@ done
 
     fn finder_test_job(job_id: &str, output_path: &Path) -> runtime::ImageGridJob {
         runtime::ImageGridJob {
+            operation: image_grid_core::ImageOperation::Generate,
             id: job_id.to_owned(),
             run_id: "feedface".to_owned(),
             engine: "app-server-image".to_owned(),

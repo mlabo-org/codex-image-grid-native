@@ -101,6 +101,7 @@ struct ImageGridView: View {
     @State private var prompt = ImageGridContract.defaultPrompt
     @State private var promptMode = PromptMode.single
     @State private var batchPrompts = ImageGridContract.defaultBatchPrompts
+    @State private var operation = ImageGridOperation.generate
     @State private var mood = ImageMood.warmMascot
     @State private var engine = ImageEngine.appServerImage
     @State private var count = 1
@@ -284,6 +285,14 @@ struct ImageGridView: View {
 
     private var generationForm: some View {
         VStack(alignment: .leading, spacing: 16) {
+            Picker(strings.operation, selection: $operation) {
+                Text(strings.generate).tag(ImageGridOperation.generate)
+                Text(strings.edit).tag(ImageGridOperation.edit)
+            }
+            .pickerStyle(.segmented)
+            Text(operation == .edit ? strings.editHelp : strings.generateHelp)
+                .appFont(.caption)
+                .foregroundStyle(.secondary)
             LabeledControl(strings.referencePremise) {
                 PlaceholderTextEditor(
                     text: $referencePremise,
@@ -291,6 +300,8 @@ struct ImageGridView: View {
                     minHeight: 78
                 )
             }
+
+            .disabled(operation == .edit)
 
             promptSection
 
@@ -303,6 +314,8 @@ struct ImageGridView: View {
                 .labelsHidden()
                 .frame(maxWidth: .infinity)
             }
+
+            .disabled(operation == .edit)
 
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .top, spacing: 12) {
@@ -323,6 +336,7 @@ struct ImageGridView: View {
             Picker(strings.engine, selection: $engine) {
                 ForEach(ImageEngine.allCases) { value in
                     Text(strings.engineName(value)).tag(value)
+                        .disabled(operation == .edit && value != .appServerImage)
                 }
             }
             .labelsHidden()
@@ -344,7 +358,7 @@ struct ImageGridView: View {
                 }
             }
             .labelsHidden()
-            .disabled(engine == .codexSvg)
+            .disabled(engine == .codexSvg || operation == .edit)
         }
     }
 
@@ -467,7 +481,7 @@ struct ImageGridView: View {
             Text(strings.referenceImage)
                 .appFont(.caption, weight: .semibold)
                 .foregroundStyle(.secondary)
-            Text(strings.referenceImageHelp)
+            Text(operation == .edit ? strings.editReferenceHelp : strings.referenceImageHelp)
                 .appFont(.caption)
                 .foregroundStyle(.secondary)
 
@@ -512,7 +526,7 @@ struct ImageGridView: View {
             Button {
                 submitGeneration()
             } label: {
-                Label(strings.generate, systemImage: "play.fill")
+                Label(operation == .edit ? strings.edit : strings.generate, systemImage: "play.fill")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -536,7 +550,7 @@ struct ImageGridView: View {
             Button(strings.analyze) {
                 analyzeReference()
             }
-            .disabled(referenceImage == nil || referenceIsBusy)
+            .disabled(operation == .edit || referenceImage == nil || referenceIsBusy)
 
             Button(strings.choose) {
                 if let url = NativeFilePicker.chooseImageURL() {
@@ -556,6 +570,7 @@ struct ImageGridView: View {
     }
 
     private var generationIsValid: Bool {
+        guard operation.canSubmit(engine: engine.rawValue, referenceImagePath: referenceImage?.url.path) else { return false }
         if promptMode == .single {
             return !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
@@ -563,6 +578,10 @@ struct ImageGridView: View {
     }
 
     private func submitGeneration() {
+        guard operation.canSubmit(engine: engine.rawValue, referenceImagePath: referenceImage?.url.path) else {
+            formError = strings.editReferenceHelp
+            return
+        }
         let prompts = promptMode == .single
             ? [prompt.trimmingCharacters(in: .whitespacesAndNewlines)].filter { !$0.isEmpty }
             : batchPrompts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -587,7 +606,8 @@ struct ImageGridView: View {
             engine: engine.rawValue,
             count: count,
             aspectRatio: aspectRatio.rawValue,
-            referenceImagePath: referenceImage?.url.path
+            referenceImagePath: referenceImage?.url.path,
+            operation: operation
         )
         Task {
             if await store.generate(request: request, batch: promptMode == .batch) {
@@ -805,7 +825,8 @@ struct ImageGridView: View {
             count: count,
             aspectRatio: aspectRatio.rawValue,
             hasReferenceImage: referenceImage != nil,
-            referenceStatusKey: draftReferenceStatusKey.rawValue
+            referenceStatusKey: draftReferenceStatusKey.rawValue,
+            operation: operation.rawValue
         )
     }
 
@@ -838,6 +859,7 @@ struct ImageGridView: View {
         prompt = state.prompt
         promptMode = state.promptMode
         batchPrompts = state.batchPrompts
+        operation = state.operation
         mood = state.mood
         engine = state.engine
         count = state.count
@@ -1083,6 +1105,17 @@ struct ImageGridStrings {
     var delete: String { localized("削除", "Delete") }
     var batchLimitError: String {
         localized("1回の実行は最大24ジョブです。", "A run is limited to 24 total jobs.")
+    }
+    var operation: String { localized("操作", "Operation") }
+    var edit: String { localized("編集", "Edit") }
+    var generateHelp: String {
+        localized("参照画像のキャラクターの特徴を活かして、新しい画像を生成します。", "Generate new images using character features from the reference image.")
+    }
+    var editHelp: String {
+        localized("変更したい箇所を指示してください。指定しない構図・画風・縦横比は元画像を維持します。雰囲気・縦横比・キャラクター解析の設定は使いません。複数枚は同じ元画像をそれぞれ編集します。", "Describe the changes. Composition, style, and aspect ratio stay as in the source unless requested. Mood, aspect ratio, and character analysis settings are not applied. Each result edits the same source independently.")
+    }
+    var editReferenceHelp: String {
+        localized("編集する元画像を添付し、エンジンに App Server Image を選択してください。", "Attach the source image and select the App Server Image engine.")
     }
     var mood: String { localized("雰囲気", "Mood") }
     var engine: String { localized("エンジン", "Engine") }

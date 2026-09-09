@@ -324,6 +324,7 @@ dependencies = [
 name = "image-grid-core"
 version = "0.2.4"
 dependencies = [
+ "serde",
  "tempfile",
 ]
 

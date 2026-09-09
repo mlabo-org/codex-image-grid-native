@@ -44,9 +44,23 @@ struct ImageGridTimestamp: Codable, Hashable, Sendable {
     }
 }
 
+enum ImageGridOperation: String, Codable, CaseIterable, Identifiable, Sendable {
+    case generate
+    case edit
+
+    var id: String { rawValue }
+
+    func canSubmit(engine: String, referenceImagePath: String?) -> Bool {
+        self == .generate || (engine == "app-server-image"
+            && !(referenceImagePath ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+}
+
 struct ImageGridJob: Codable, Hashable, Identifiable, Sendable {
     let id: String
     var runId: String?
+    var operation: ImageGridOperation?
+    var resolvedOperation: ImageGridOperation { operation ?? .generate }
     var engine: String?
     var model: String?
     var prompt: String?
@@ -102,6 +116,7 @@ struct ImageGridJob: Codable, Hashable, Identifiable, Sendable {
     ) {
         self.id = id
         self.runId = runId
+        operation = nil
         engine = nil
         model = nil
         self.prompt = prompt
@@ -177,7 +192,14 @@ struct ImageGridGenerationRequest: Encodable, Equatable, Sendable {
     let engine: String
     let count: Int
     let aspectRatio: String
-    let referenceImagePath: String?
+    var referenceImagePath: String?
+    var operation: ImageGridOperation = .generate
+
+    func usingReferenceImagePath(_ path: String?) -> Self {
+        var copy = self
+        copy.referenceImagePath = path
+        return copy
+    }
 }
 
 struct ImageGridRunEnvelope: Decodable, Sendable {
@@ -886,19 +908,17 @@ final class ImageGridStore: ObservableObject {
         defer { isSubmitting = false }
 
         do {
+            guard request.operation.canSubmit(
+                engine: request.engine, referenceImagePath: request.referenceImagePath
+            ) else {
+                throw ImageGridAPIError(message: "Image editing requires a source image and the App Server Image engine.")
+            }
             let referenceLease = try Self.makeReferenceOperationLease(
                 referenceImagePath: request.referenceImagePath
             )
             defer { referenceLease?.remove() }
-            let request = ImageGridGenerationRequest(
-                prompt: request.prompt,
-                prompts: request.prompts,
-                referencePremise: request.referencePremise,
-                mood: request.mood,
-                engine: request.engine,
-                count: request.count,
-                aspectRatio: request.aspectRatio,
-                referenceImagePath: referenceLease?.path ?? request.referenceImagePath
+            let request = request.usingReferenceImagePath(
+                referenceLease?.path ?? request.referenceImagePath
             )
             if request.engine == "app-server-image" {
                 runtimeState = .starting

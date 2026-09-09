@@ -19,6 +19,7 @@ enum ImageGridDraftReferenceStatusKey: String, Codable, Equatable, Sendable {
 struct ImageGridDraftMetadata: Codable, Equatable, Sendable {
     static let schemaVersion = 1
 
+    var operation: String?
     var version = Self.schemaVersion
     var referencePremise: String
     var prompt: String
@@ -43,8 +44,10 @@ struct ImageGridDraftMetadata: Codable, Equatable, Sendable {
         aspectRatio: String,
         hasReferenceImage: Bool,
         referenceStatusKey: String,
-        referenceFileName: String? = nil
+        referenceFileName: String? = nil,
+        operation: String? = nil
     ) {
+        self.operation = operation
         self.referencePremise = referencePremise
         self.prompt = prompt
         self.promptMode = promptMode
@@ -94,7 +97,8 @@ struct ImageGridDraftMetadata: Codable, Equatable, Sendable {
             count: ImageGridContract.counts.contains(count) ? count : 1,
             aspectRatio: AspectRatio(rawValue: aspectRatio) ?? .widescreen,
             hasReferenceImage: hasReference,
-            referenceStatusKey: status
+            referenceStatusKey: status,
+            operation: ImageGridOperation(rawValue: operation ?? "generate") ?? .generate
         )
     }
 }
@@ -110,6 +114,7 @@ struct ImageGridDraftState: Equatable, Sendable {
     var aspectRatio: AspectRatio
     var hasReferenceImage: Bool
     var referenceStatusKey: ImageGridDraftReferenceStatusKey
+    var operation: ImageGridOperation = .generate
 
     static var defaults: Self {
         ImageGridDraftMetadata.defaults.validated()
@@ -127,7 +132,8 @@ struct ImageGridDraftState: Equatable, Sendable {
             aspectRatio: aspectRatio.rawValue,
             hasReferenceImage: hasReferenceImage,
             referenceStatusKey: referenceStatusKey.rawValue,
-            referenceFileName: referenceFileName
+            referenceFileName: referenceFileName,
+            operation: operation.rawValue
         )
     }
 

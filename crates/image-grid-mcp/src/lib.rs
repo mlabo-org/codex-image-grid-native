@@ -1,5 +1,5 @@
 use image_grid_core::{
-    BatchValidationError, MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES, MAX_RUN_JOBS,
+    BatchValidationError, ImageOperation, MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES, MAX_RUN_JOBS,
     MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS, validate_batch_shape,
 };
 use serde_json::{Value, json};
@@ -16,11 +16,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const TOOL_NAME: &str = "generate_image_grid";
 
-const TOOL_DESCRIPTION: &str = "Generate project-ready image variants from Prompt Batch input. \
+const TOOL_DESCRIPTION: &str = "Generate images or edit a supplied image, singly or in Prompt Batch. \
+Use operation=generate for new images and reference-character variations; use operation=edit \
+with referenceImagePath for requested changes preserving the rest of the source. \
 Activates the installed native Codex Image Grid app, then returns handoff.md, absolute output \
 paths, display-safe image URLs, and Codex Markdown.";
-const SERVER_INSTRUCTIONS: &str = "Use generate_image_grid when the user needs project-specific \
-thumbnails, visual variants, or Prompt Batch image generation. Return and reuse handoff.md, \
+const SERVER_INSTRUCTIONS: &str = "Use generate_image_grid for image generation, reference-character \
+variations, partial image edits, and Prompt Batch. Select operation=edit with referenceImagePath \
+for changes to an existing image. Return and reuse handoff.md, \
 absolute output paths, imageUrls, and codexMarkdown.";
 const DEFAULT_IMAGE_GRID_URL: &str = "http://127.0.0.1:4322";
 const EXPECTED_APP_IDENTITY: &str = "codex-image-grid";
@@ -122,6 +125,7 @@ fn handle_tool_call(id: Value, params: Option<&Value>) -> Value {
 
 #[derive(Debug, Clone)]
 struct NormalizedArguments {
+    operation: ImageOperation,
     prompts: Vec<String>,
     count: usize,
     mood: String,
@@ -418,6 +422,7 @@ fn submit_generate_image_grid(
     server.health = assert_engine_ready(config, server.health, &arguments.engine)?;
 
     let mut body = serde_json::Map::new();
+    body.insert("operation".to_owned(), json!(arguments.operation));
     body.insert("prompts".to_owned(), json!(arguments.prompts));
     body.insert("count".to_owned(), json!(arguments.count));
     body.insert("mood".to_owned(), json!(arguments.mood));
@@ -486,6 +491,10 @@ fn normalize_tool_arguments(
     reference_image: Option<InlineReferenceImage>,
 ) -> NormalizedArguments {
     NormalizedArguments {
+        operation: arguments
+            .get("operation")
+            .map(|value| serde_json::from_value(value.clone()).expect("validated operation"))
+            .unwrap_or_default(),
         prompts: arguments["prompts"]
             .as_array()
             .expect("validated prompts")
@@ -1514,10 +1523,7 @@ fn render_tool_result(data: &Value, server: &ServerStartup, base_url: &str) -> V
 
     let run_id = string_field(data, "runId").unwrap_or_default();
     let status = string_field(data, "status").unwrap_or("queued");
-    let artifact_error = data
-        .get("artifactError")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let artifact_error = data.get("artifactError").cloned().unwrap_or(Value::Null);
     let status_url = absolute_url(base_url, data.get("statusUrl"));
     let manifest_path = string_field(data, "manifestPath").unwrap_or_default();
     let handoff_path = string_field(data, "handoffPath").unwrap_or_default();
@@ -1965,6 +1971,25 @@ fn validate_tool_arguments(arguments: &Value) -> Result<(), String> {
         return Err("referenceImagePath must be a string".to_owned());
     }
 
+    let operation = arguments
+        .get("operation")
+        .map(|value| serde_json::from_value::<ImageOperation>(value.clone()))
+        .transpose()
+        .map_err(|_| "operation must be one of: generate, edit".to_owned())?
+        .unwrap_or_default();
+    operation
+        .validate(
+            arguments
+                .get("engine")
+                .and_then(Value::as_str)
+                .unwrap_or("app-server-image"),
+            arguments
+                .get("referenceImagePath")
+                .and_then(Value::as_str)
+                .is_some_and(|path| !path.trim().is_empty()),
+        )
+        .map_err(str::to_owned)?;
+
     Ok(())
 }
 
@@ -1990,9 +2015,15 @@ pub fn tool_record() -> Value {
             "type": "object",
             "description": "Prompt count multiplied by variants per prompt must not exceed 24 total jobs.",
             "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["generate", "edit"],
+                    "default": "generate",
+                    "description": "generate creates new images, optionally retaining reference-character traits. edit changes the supplied source image only as requested and preserves other details, style, composition and aspect ratio; requires referenceImagePath and app-server-image. Each batch edit uses the same source independently."
+                },
                 "prompts": {
                     "type": "array",
-                    "description": "Prompt Batch input. Pass project-specific visual directions.",
+                    "description": "Prompt Batch input. Pass visual directions for generate or exact changes for edit.",
                     "minItems": 1,
                     "maxItems": 12,
                     "items": {
@@ -2010,6 +2041,7 @@ pub fn tool_record() -> Value {
                 },
                 "mood": {
                     "type": "string",
+                    "description": "Generation-only mood. Ignored for edit, which preserves source style unless the prompt requests a change.",
                     "enum": [
                         "warm-mascot",
                         "clean-thumbnail",
@@ -2026,16 +2058,17 @@ pub fn tool_record() -> Value {
                 },
                 "aspectRatio": {
                     "type": "string",
+                    "description": "Generation-only target ratio. edit preserves source ratio unless the prompt requests a change.",
                     "enum": ["16:9", "4:3", "1:1", "3:4", "9:16"],
                     "default": "16:9"
                 },
                 "referencePremise": {
                     "type": "string",
-                    "description": "Optional visual identity notes from the current product or reference image."
+                    "description": "Optional visual identity notes for generate. Ignored for edit."
                 },
                 "referenceImagePath": {
                     "type": "string",
-                    "description": "Optional absolute local PNG, JPEG, or WebP path to attach as the visual reference."
+                    "description": "Absolute local PNG, JPEG, or WebP path. Optional character reference for generate; required source image for edit."
                 },
                 "waitMs": {
                     "type": "integer",
@@ -2047,6 +2080,13 @@ pub fn tool_record() -> Value {
             },
             "required": ["prompts"],
             "allOf": [
+                {
+                    "if": {"required": ["operation"], "properties": {"operation": {"const": "edit"}}},
+                    "then": {"required": ["referenceImagePath"], "properties": {
+                        "referenceImagePath": {"minLength": 1, "pattern": "\\S"},
+                        "engine": {"const": "app-server-image"}
+                    }}
+                },
                 conditional_prompt_limit(1, 12),
                 conditional_prompt_limit(2, 12),
                 conditional_prompt_limit(3, 8),
@@ -2574,7 +2614,51 @@ skipped PATH=(none): PATH is unavailable."
     }
 
     #[test]
+    fn edit_contract_is_exposed_and_invalid_edits_fail_before_launch() {
+        let schema = tool_record()["inputSchema"].clone();
+        assert_eq!(
+            schema["properties"]["operation"]["enum"],
+            json!(["generate", "edit"])
+        );
+        assert_eq!(schema["properties"]["operation"]["default"], "generate");
+        assert!(schema["allOf"].as_array().unwrap().iter().any(|rule| {
+            rule["if"]["properties"]["operation"]["const"] == "edit"
+                && rule["then"]["required"] == json!(["referenceImagePath"])
+                && rule["then"]["properties"]["engine"]["const"] == "app-server-image"
+        }));
+        for (arguments, expected) in [
+            (
+                json!({"prompts": ["replace burger"], "operation": "edit"}),
+                "edit requires a reference image",
+            ),
+            (
+                json!({"prompts": ["replace burger"], "operation": "edit", "referenceImagePath": "  "}),
+                "edit requires a reference image",
+            ),
+            (
+                json!({"prompts": ["replace burger"], "operation": "edit", "engine": "codex-svg", "referenceImagePath": "/not/read.png"}),
+                "edit requires the app-server-image engine",
+            ),
+            (
+                json!({"prompts": ["replace burger"], "operation": "edti"}),
+                "operation must be one of: generate, edit",
+            ),
+        ] {
+            assert_eq!(prepare_tool_arguments(&arguments).unwrap_err(), expected);
+        }
+    }
+
+    #[test]
     fn valid_call_sends_frozen_inline_reference_payload() {
+        reference_operation_payload(None);
+    }
+
+    #[test]
+    fn edit_call_sends_operation_and_frozen_source_image() {
+        reference_operation_payload(Some("edit"));
+    }
+
+    fn reference_operation_payload(operation: Option<&str>) {
         let directory = TestDirectory::new("running");
         let root = fs::canonicalize(&directory.path).expect("canonical root");
         let reference_path = root.join("reference.png");
@@ -2589,7 +2673,7 @@ skipped PATH=(none): PATH is unavailable."
             cwd: None,
             environment: Vec::new(),
         });
-        let input = json!({
+        let mut input = json!({
             "prompts": ["project visual"],
             "count": 1,
             "mood": "clean-thumbnail",
@@ -2599,6 +2683,9 @@ skipped PATH=(none): PATH is unavailable."
             "referenceImagePath": reference_path,
             "waitMs": 250
         });
+        if let Some(operation) = operation {
+            input["operation"] = json!(operation);
+        }
 
         let result = call_generate_image_grid_with_config(&input, &config)
             .expect("native generation response");
@@ -2620,6 +2707,7 @@ skipped PATH=(none): PATH is unavailable."
             ]
         );
         let run_body = &requests[2].body;
+        assert_eq!(run_body["operation"], operation.unwrap_or("generate"));
         assert_eq!(
             run_body["referenceImage"],
             json!({
@@ -2694,10 +2782,12 @@ skipped PATH=(none): PATH is unavailable."
                 "message": "manifest write failed"
             })
         );
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .expect("summary")
-            .contains("artifactError: ArtifactWriteFailed: manifest write failed"));
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .expect("summary")
+                .contains("artifactError: ArtifactWriteFailed: manifest write failed")
+        );
     }
 
     #[test]
