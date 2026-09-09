@@ -1,7 +1,7 @@
 {
   "name": "codex-image-grid",
   "version": "0.1.0",
-  "description": "Native macOS image-generation plugin for Codex. It supports Prompt Batch, reference images, thumbnails, and project, article, or video visuals through codex_image_grid/generate_image_grid.",
+  "description": "Native macOS image generation and editing for Codex. Supports Prompt Batch, reference-character generation, partial edits, thumbnails, and project/article/video visuals through codex_image_grid/generate_image_grid.",
   "author": {
     "name": "mlabo-org",
     "url": "https://github.com/mlabo-org"
@@ -9,6 +9,9 @@
   "keywords": [
     "codex",
     "image-generation",
+    "image-editing",
+    "画像編集",
+    "部分修正",
     "prompt-batch",
     "image-grid",
     "画像生成",
@@ -28,18 +31,19 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Image Grid",
-    "shortDescription": "Native Prompt Batch image generation for Codex workflows",
-    "longDescription": "The public Codex Image Grid route for English or Japanese image-generation requests, Prompt Batch work, thumbnails, and project, article, or video visuals. It exposes codex_image_grid/generate_image_grid through MCP, automatically opens the native SwiftUI app, accepts local reference-image paths, and returns the job status, manifest, handoff, image paths, and Codex Markdown contract used by CodexVideo and RelayPress. The separate retired Electron project is not a runtime fallback.",
+    "shortDescription": "Native image generation, editing, and Prompt Batch for Codex",
+    "longDescription": "The public Codex Image Grid route for image generation, editing, Prompt Batch, thumbnails, and project/article/video visuals. Use generate for new images and reference-character variations, or edit to change a supplied image while preserving other details. It exposes codex_image_grid/generate_image_grid through MCP, opens the native SwiftUI app, accepts local source/reference images, and returns job status, manifest, handoff, image paths, and Codex Markdown for CodexVideo and RelayPress. The separate retired Electron project is not a runtime fallback.",
     "developerName": "mlabo-org",
     "category": "Productivity",
     "capabilities": [
       "Image Generation",
+      "Image Editing",
       "Prompt Batch",
       "Native SwiftUI",
       "MCP"
     ],
     "defaultPrompt": [
-      "Generate the requested images with Codex Image Grid",
+      "Generate new images or edit the supplied image with Codex Image Grid",
       "Create a Prompt Batch of thumbnails for this project",
       "Create article or video visuals with Codex Image Grid"
     ]

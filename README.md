@@ -1,12 +1,12 @@
 # Codex Image Grid
 
 A native macOS image-generation workspace for Codex, built with Rust and
-SwiftUI. It provides Prompt Batch generation, reference-image analysis,
+SwiftUI. It provides Prompt Batch generation and editing, reference-image analysis,
 Japanese/English UI, light/dark themes, run history, and artifact handoff
 through the `codex_image_grid/generate_image_grid` MCP tool.
 
 Codex向けのmacOSネイティブ画像生成ワークスペースです。RustとSwiftUIで
-実装され、Prompt Batch、参照画像解析、日英UI、ライト/ダークテーマ、
+実装され、Prompt Batchでの生成・編集、参照画像解析、日英UI、ライト/ダークテーマ、
 生成履歴、成果物の受け渡しに対応しています。
 
 [English](#english) · [日本語](#日本語)
@@ -140,11 +140,32 @@ sends two prompts with two variants each as one batch of four image jobs:
 }
 ```
 
-Only `prompts` is required. A batch may contain up to 12 prompts and 6
+For generation, only `prompts` is required. A batch may contain up to 12 prompts and 6
 variants per prompt, with at most 24 image jobs in total
 (`prompts.length * count`). `referenceImagePath`, when supplied, must be an
 absolute path to a local PNG, JPEG, or WebP file no larger than 100 MiB. Use
 `engine: "codex-svg"` for SVG output. `waitMs` may be from 0 through 120,000.
+
+`operation` defaults to `generate`, preserving existing character-reference
+workflows such as creating different article illustrations featuring one mascot.
+For partial changes to an existing image, use `operation: "edit"` and supply
+the source as `referenceImagePath` with `engine: "app-server-image"`:
+
+```json
+{
+  "operation": "edit",
+  "prompts": ["Replace the hamburger with a strawberry crepe. Preserve everything else."],
+  "referenceImagePath": "/Users/you/Pictures/park.png",
+  "waitMs": 120000
+}
+```
+
+Editing preserves source identity, composition, style, and aspect ratio unless
+the prompt requests a change. `mood`, `aspectRatio`, and `referencePremise`
+are generation settings and are ignored for editing. Each batch edit starts
+from the same supplied source; for a sequential edit, pass the preceding output
+as the next source. The native app offers the same Generate/Edit choice.
+Results and saved runs include `operation`; older runs default to `generate`.
 
 A completed one-image call returns structured fields such as:
 
@@ -339,11 +360,31 @@ MCPから呼び出した場合もネイティブアプリが開き、両方の�
 }
 ```
 
-必須項目は`prompts`だけです。1つのバッチには最大12プロンプト、各プロンプトには最大
+新規生成の必須項目は`prompts`だけです。1つのバッチには最大12プロンプト、各プロンプトには最大
 6バリエーションを指定でき、合計24画像ジョブまでです
 (`prompts.length * count`)。`referenceImagePath`には、100 MiB以下のローカルPNG・JPEG・
 WebPファイルの絶対パスを指定します。SVGが必要な場合は`engine: "codex-svg"`を使用します。
 `waitMs`には0から120,000までを指定できます。
+
+`operation`を省略すると従来どおり`generate`になります。じぴこのベース画像から
+特徴を引き継いで各H2の新しい場面を作る、といった参照生成はそのまま使えます。
+元画像の一部を変更する場合は`operation: "edit"`にし、`referenceImagePath`に元画像を指定します。
+編集のエンジンは`app-server-image`です。
+
+```json
+{
+  "operation": "edit",
+  "prompts": ["ハンバーガーだけをいちごクレープに変更して。他の部分は維持して。"],
+  "referenceImagePath": "/Users/you/Pictures/park.png",
+  "waitMs": 120000
+}
+```
+
+編集では、指示された変更を除き人物・構図・画風・縦横比を維持します。
+生成用の`mood`・`aspectRatio`・`referencePremise`は編集時には適用しません。
+バッチの各編集は同じ元画像から独立して実行します。続けて編集する場合は、前の出力を
+次の元画像として渡してください。ネイティブ画面でも「生成／編集」を選択できます。
+結果と保存済み実行には`operation`が記録され、古い履歴は`generate`として読み込まれます。
 
 1枚の生成が完了したときは、次のような構造化フィールドが返ります。
 

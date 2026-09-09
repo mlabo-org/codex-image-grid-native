@@ -18,6 +18,37 @@ pub const MAX_REFERENCE_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_WAIT_MS: u64 = 120_000;
 pub const DEFAULT_NATIVE_BIND: &str = "127.0.0.1:4322";
 
+/// How the supplied image participates in a run. Missing operation fields in
+/// existing requests and saved runs retain the original generation behavior.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageOperation {
+    #[default]
+    Generate,
+    Edit,
+}
+
+impl ImageOperation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generate => "generate",
+            Self::Edit => "edit",
+        }
+    }
+
+    pub fn validate(self, engine: &str, has_reference: bool) -> Result<(), &'static str> {
+        if self == Self::Edit {
+            if engine != "app-server-image" {
+                return Err("edit requires the app-server-image engine");
+            }
+            if !has_reference {
+                return Err("edit requires a reference image");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Engine {
     AppServerImage,

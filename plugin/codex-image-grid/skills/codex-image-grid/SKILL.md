@@ -1,6 +1,6 @@
 ---
 name: codex-image-grid
-description: "Route image generation/画像生成 to Codex Image Grid via codex_image_grid/generate_image_grid. Use for Prompt Batch, thumbnails/サムネイル, project, article, or video visuals, including CodexVideo and RelayPress. Native SwiftUI auto-opens; not for image editing or the separate retired Electron project."
+description: "Image generation/画像生成 and image editing/画像編集 via codex_image_grid/generate_image_grid: Prompt Batch, character references, 部分修正, thumbnails/サムネイル, project/article/video visuals for CodexVideo and RelayPress. Native SwiftUI auto-opens."
 ---
 
 # Codex Image Grid
@@ -11,12 +11,28 @@ instructions as binding within this skill's scope.
 
 ## Primary route
 
-Call `codex_image_grid/generate_image_grid` as the primary generation route.
+Call `codex_image_grid/generate_image_grid` for generation and image editing.
 Preserve the user's requested prompts, batch intent, generation options, and
 reference-image inputs when they are supported by the current tool schema.
 Treat that schema and the MCP result as authoritative for accepted inputs,
 limits, defaults, output fields, and artifact validity; do not duplicate or
 override those rules in this skill.
+
+Choose `operation` from the user's request:
+
+- New images, including a character reference used in a new scene: `generate`
+  (the default). Pass the reference through `referenceImagePath` and supplied
+  identity notes through `referencePremise`.
+- Changes to an existing image, such as "ハンバーガーをクレープに変更して",
+  "ここだけ修正", or "edit this image": `edit`. Pass the source image's absolute
+  path as `referenceImagePath` and the requested changes as `prompts`. Use the
+  intended image from the current conversation when its local path is known;
+  ask for the source only when it cannot be identified or accessed.
+
+The runtime owns reference-image requirements and the separate generation/edit
+instructions. For edits, the tool schema documents which generation settings
+are ignored. Preserve batch intent: each prompt and variant edits the supplied
+source independently. To edit a preceding result, supply that result's path.
 
 For CodexVideo, RelayPress, or another parent workflow, return the tool's
 generated paths and handoff to the caller that requested the visuals. The
