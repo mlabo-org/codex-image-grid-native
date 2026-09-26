@@ -1,7 +1,0 @@
-interface:
-  display_name: "Codex Image Grid"
-  short_description: "Native image generation, editing, and Prompt Batch"
-  default_prompt: "Use $codex-image-grid to generate new images or edit the supplied image in the native app."
-
-policy:
-  allow_implicit_invocation: true
