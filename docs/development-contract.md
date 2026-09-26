@@ -3,7 +3,7 @@
 This repository is the source of truth for the public `codex-image-grid`
 plugin's native implementation. Its installable plugin package is rooted at
 `plugin/codex-image-grid/`, where the folder and manifest identity match. The
-repository-scoped `AGENTS.md` applies to Codex work in a clone.
+repository-scoped `CLAUDE.md` applies to Claude Code work in a clone.
 
 The frozen behavior target is recorded in
 `docs/frozen-baseline-spec.md`. That file is an evidence-backed contract
