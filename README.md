@@ -1,11 +1,11 @@
 # Codex Image Grid
 
-A native macOS image-generation workspace for Claude Code, built with Rust and
+A native macOS image-generation workspace for Codex and Claude Code, built with Rust and
 SwiftUI. It provides Prompt Batch generation and editing, reference-image analysis,
 Japanese/English UI, light/dark themes, run history, and artifact handoff
 through the `codex_image_grid/generate_image_grid` MCP tool.
 
-Claude Code向けのmacOSネイティブ画像生成ワークスペースです。RustとSwiftUIで
+Codex・Claude Code向けのmacOSネイティブ画像生成ワークスペースです。RustとSwiftUIで
 実装され、Prompt Batchでの生成・編集、参照画像解析、日英UI、ライト/ダークテーマ、
 生成履歴、成果物の受け渡しに対応しています。
 
@@ -42,28 +42,70 @@ Claude Code向けのmacOSネイティブ画像生成ワークスペースです�
 The generated-image route uses `codex app-server`, so the active Codex account
 must have access to image generation.
 
+### Automatic setup when opened in Codex
+
+Clone this repository and open the clone as a Codex workspace. On the first
+setup, build, test, run, or source task, the repository-scoped `AGENTS.md`
+instructs Codex to run:
+
+```bash
+scripts/bootstrap-codex.sh
+```
+
+The idempotent bootstrap:
+
+1. checks the macOS toolchain;
+2. builds the locked Rust workspace and release SwiftUI app;
+3. installs the signed app at
+   `~/Applications/Codex Image Grid Native.app`;
+4. registers this clone as the `codex-image-grid-native` local marketplace;
+5. installs the `codex-image-grid` plugin; and
+6. records a source fingerprint under the ignored `.run/` directory so an
+   unchanged clone is not rebuilt.
+
+Passive cloning alone does not execute repository code. Codex performs the
+bootstrap when it starts an applicable task in the imported workspace. The
+script stops without replacing anything if another source already owns the
+same plugin or marketplace identity.
+
+Preview the setup without changing the machine:
+
+```bash
+scripts/bootstrap-codex.sh --dry-run
+```
+
+Rebuild and refresh a plugin installed by this repository's marketplace after
+an intentional source change:
+
+```bash
+scripts/bootstrap-codex.sh --force
+```
+
+Start a new Codex task after first-time plugin installation so the newly
+installed MCP route is discovered.
+
 ### Claude Code plugin
 
-The Claude Code plugin is `plugin/codex-image-grid/`, loaded from the
+The same `plugin/codex-image-grid/` package is loaded in Claude Code from the
 `suzuki-local-plugins` marketplace. Apply a plugin source change with
 `claude-plugin-refresh codex-image-grid --execute`, then start a new session.
-The plugin's MCP runs the shared app at
-`~/Applications/Codex Image Grid Native.app`; this checkout does not build or
-install that app.
+Claude Code uses the same
+`~/Applications/Codex Image Grid Native.app`; build or reinstall it with
+`scripts/install-native-app.sh --execute` when native source changes.
 
 ### Quick Start and MCP usage
 
 #### Generate your first image
 
-In a Claude Code session with the plugin loaded, ask:
+After setup, start a new Codex task or Claude Code session and ask:
 
 > Use `codex_image_grid/generate_image_grid` with `waitMs: 120000` to generate
 > one 16:9 `clean-thumbnail` image: "A polished product hero for a native
 > macOS image-generation app, graphite background, blue accent, no text."
 
-Claude Code turns the natural-language request into an MCP call, so you do not need
+The host agent (Codex or Claude Code) turns the natural-language request into an MCP call, so you do not need
 to write JSON yourself. The native SwiftUI app opens or becomes active
-automatically. When generation completes, Claude Code receives display-safe image
+automatically. When generation completes, the host agent receives display-safe image
 URLs, absolute output paths, `codexMarkdown` image links, and artifact handoff information.
 
 To submit multiple prompts and image jobs together, ask for a Prompt Batch:
@@ -76,12 +118,12 @@ Multiple prompts are submitted in one `prompts` array. `count` sets the number
 of variants for every prompt, so two prompts with two variants create four
 image jobs in the same run.
 
-#### Native UI or Claude Code/MCP?
+#### Native UI or agent/MCP?
 
 | Route | Best for |
 | --- | --- |
 | Native SwiftUI app | Editing Prompt Batches interactively, choosing a reference image with the macOS file picker, and watching progress or run history. |
-| Claude Code/MCP | Generating from a Claude Code session, passing project-specific prompts or local reference files, and handing absolute artifact paths to another workflow. |
+| Codex or Claude Code/MCP | Generating from a Codex task or Claude Code session, passing project-specific prompts or local reference files, and handing absolute artifact paths to another workflow. |
 
 Calling the MCP tool also opens the native app, so both routes use the same
 local runtime and artifact history.
@@ -190,6 +232,13 @@ scripts/install-native-app.sh --dry-run
 scripts/install-native-app.sh --execute
 ```
 
+Register the plugin manually from the repository root:
+
+```bash
+codex plugin marketplace add .
+codex plugin add codex-image-grid@codex-image-grid-native
+```
+
 ### Repository layout
 
 - `crates/image-grid-core/` — validation, job state, retry policy, and artifact
@@ -199,7 +248,8 @@ scripts/install-native-app.sh --execute
 - `crates/image-grid-mcp/` — stdio MCP server for
   `generate_image_grid`.
 - `macos/` — native SwiftUI application.
-- `plugin/codex-image-grid/` — Claude Code plugin package.
+- `plugin/codex-image-grid/` — installable plugin package for Codex and Claude Code.
+- `.agents/plugins/marketplace.json` — local marketplace metadata for Codex.
 
 Runtime files and generated images are stored outside the repository at
 `~/Library/Application Support/codex-image-grid`. The local HTTP runtime binds
@@ -223,28 +273,69 @@ MIT. See [LICENSE](LICENSE).
 画像生成は`codex app-server`を使用します。利用中のCodexアカウントで画像生成が
 使える必要があります。
 
+### Codexに取り込んだときの自動セットアップ
+
+このリポジトリをcloneし、そのcloneをCodexのワークスペースとして開いてください。
+初回のセットアップ・ビルド・テスト・実行・ソース変更タスクで、リポジトリ内の
+`AGENTS.md`に従い、Codexが次を実行します。
+
+```bash
+scripts/bootstrap-codex.sh
+```
+
+このスクリプトは一度の実行で次を行います。
+
+1. macOSのビルド環境を確認
+2. lock済みRustワークスペースとSwiftUIリリースアプリをビルド
+3. `~/Applications/Codex Image Grid Native.app`へ署名・配置
+4. このcloneを`codex-image-grid-native`ローカルマーケットプレイスとして登録
+5. `codex-image-grid`プラグインをインストール
+6. 無視対象の`.run/`へソース指紋を保存し、変更がなければ次回ビルドを省略
+
+cloneしただけではリポジトリ内のコードは実行されません。Codexが取り込んだ
+ワークスペースで対象タスクを開始した時点でセットアップされます。同名の
+プラグインまたはマーケットプレイスを別ソースが所有している場合は、上書きせず
+停止します。
+
+マシンを変更せず内容だけ確認する場合:
+
+```bash
+scripts/bootstrap-codex.sh --dry-run
+```
+
+意図的なソース変更後、このリポジトリのマーケットプレイスから入れたプラグインを
+再ビルド・再反映する場合:
+
+```bash
+scripts/bootstrap-codex.sh --force
+```
+
+初回プラグインインストール後は、新しいCodexタスクを開始すると追加されたMCPが
+検出されます。
+
 ### Claude Codeプラグイン
 
-Claude Code用プラグインは`plugin/codex-image-grid/`で、`suzuki-local-plugins`
+同じ`plugin/codex-image-grid/`を、Claude Codeでは`suzuki-local-plugins`
 マーケットプレイスから読み込みます。プラグインのソース変更は
 `claude-plugin-refresh codex-image-grid --execute`で反映し、新しいセッションで
-有効になります。MCPは共有アプリ`~/Applications/Codex Image Grid Native.app`を
-実行し、このcheckoutからはアプリをビルド・配置しません。
+有効になります。Claude Codeも同じ`~/Applications/Codex Image Grid Native.app`を
+使います。ネイティブのソースを変えたときは`scripts/install-native-app.sh --execute`で
+再ビルド・再配置します。
 
 ### Quick StartとMCP利用
 
 #### 最初の1枚を生成
 
-プラグインを読み込んだClaude Codeのセッションで次のように依頼します。
+セットアップ完了後、新しいCodexタスクまたはClaude Codeセッションで次のように依頼します。
 
 > `codex_image_grid/generate_image_grid`を使い、「macOSネイティブ画像生成アプリを
 > 紹介する、グラファイト背景と青いアクセントの洗練された製品ビジュアル、
 > 文字なし」を、`clean-thumbnail`、16:9で1枚生成してください。完了を最大120秒
 > 待ってください。
 
-Claude Codeが自然言語の依頼からMCPを呼び出すため、JSONを手書きする必要はありません。
+ホストエージェント（CodexまたはClaude Code）が自然言語の依頼からMCPを呼び出すため、JSONを手書きする必要はありません。
 ネイティブSwiftUIアプリが自動的に開くか、前面へ移動します。生成完了後は、
-表示用画像URL、絶対パス、`codexMarkdown`の画像リンク、成果物の受け渡し情報がClaude Codeへ返ります。
+表示用画像URL、絶対パス、`codexMarkdown`の画像リンク、成果物の受け渡し情報がホストエージェントへ返ります。
 
 複数のプロンプトや画像ジョブをまとめて依頼する場合は、Prompt Batchとして依頼します。
 
@@ -256,12 +347,12 @@ Claude Codeが自然言語の依頼からMCPを呼び出すため、JSONを手�
 バリエーション数を指定するため、2プロンプトで各2枚を指定すると、同じ実行内で
 4つの画像ジョブが作成されます。
 
-#### ネイティブUIとClaude Code/MCPの使い分け
+#### ネイティブUIとエージェント/MCPの使い分け
 
 | 利用方法 | 適している場面 |
 | --- | --- |
 | ネイティブSwiftUIアプリ | Prompt Batchを画面で調整する、macOSのファイル選択から参照画像を指定する、進行状況や生成履歴を確認する場合 |
-| Claude Code/MCP | Claude Codeセッションの文脈から生成する、プロジェクト固有のプロンプトやローカル参照ファイルを渡す、絶対パス付きの成果物を別工程へ引き渡す場合 |
+| Codex・Claude Code/MCP | CodexタスクやClaude Codeセッションの文脈から生成する、プロジェクト固有のプロンプトやローカル参照ファイルを渡す、絶対パス付きの成果物を別工程へ引き渡す場合 |
 
 MCPから呼び出した場合もネイティブアプリが開き、両方の経路が同じローカルランタイムと
 成果物履歴を使用します。
@@ -367,13 +458,21 @@ scripts/install-native-app.sh --dry-run
 scripts/install-native-app.sh --execute
 ```
 
+リポジトリルートからプラグインを手動登録:
+
+```bash
+codex plugin marketplace add .
+codex plugin add codex-image-grid@codex-image-grid-native
+```
+
 ### リポジトリ構成
 
 - `crates/image-grid-core/` — 入力検証、ジョブ状態、再試行、成果物契約
 - `crates/image-grid-server/` — loopback限定HTTP/SSEとCodex App Server接続
 - `crates/image-grid-mcp/` — `generate_image_grid`用stdio MCPサーバー
 - `macos/` — SwiftUIネイティブアプリ
-- `plugin/codex-image-grid/` — Claude Codeプラグイン一式
+- `plugin/codex-image-grid/` — Codex・Claude Codeで使うプラグイン一式
+- `.agents/plugins/marketplace.json` — Codex用ローカルマーケットプレイス定義
 
 実行データと生成画像はリポジトリ外の
 `~/Library/Application Support/codex-image-grid`へ保存されます。ローカルHTTP
