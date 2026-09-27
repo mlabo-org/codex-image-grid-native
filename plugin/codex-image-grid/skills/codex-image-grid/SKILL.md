@@ -6,7 +6,7 @@ description: "Image generation/画像生成 and image editing/画像編集 via c
 # Codex Image Grid
 
 This `SKILL.md` is the local execution contract for this skill when the skill
-is selected. Claude Code must treat its routing, workflow, tool, file, and handoff
+is selected. The host agent (Codex or Claude Code) must treat its routing, workflow, tool, file, and handoff
 instructions as binding within this skill's scope.
 
 ## Primary route
@@ -44,14 +44,16 @@ or fall back to the separate retired Electron project.
 - Public plugin source authority is this plugin directory under
   `plugin/codex-image-grid/` in the source repository.
 - Its Rust and Swift implementation source is the repository root.
-- Claude Code plugin cache is generated runtime state, not an edit target.
+- Codex and Claude Code plugin caches are generated runtime state, not edit
+  targets.
 - An installed plugin or cached copy is an activation surface, not source.
   Never repair source behavior by patching it in place.
 - Build, installation, and active-session pickup are separate actions. Apply
-  a plugin source change with `claude-plugin-refresh` only when activation is
-  authorized; do not claim that a source edit activated the plugin. The shared
-  `~/Applications/Codex Image Grid Native.app` is not built or installed from
-  this checkout.
+  them only when repository setup or activation is authorized, and do not
+  claim that a source edit activated the plugin. In Codex, use
+  `scripts/bootstrap-codex.sh` in a source checkout; in Claude Code, refresh
+  the plugin with `claude-plugin-refresh codex-image-grid --execute`. Both
+  hosts share `~/Applications/Codex Image Grid Native.app`.
 
 ## Stop conditions
 

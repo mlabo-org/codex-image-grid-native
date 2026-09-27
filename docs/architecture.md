@@ -8,7 +8,7 @@ contract established by the frozen baseline.
 
 The browser UI is not the primary product surface. The primary surface is the
 SwiftUI macOS app. The local Rust runtime remains a compatibility boundary for
-the Claude Code plugin and an optional browser client.
+the plugin used by Codex and Claude Code and an optional browser client.
 
 ## Public and isolation identities
 

@@ -3,7 +3,8 @@
 This repository is the source of truth for the public `codex-image-grid`
 plugin's native implementation. Its installable plugin package is rooted at
 `plugin/codex-image-grid/`, where the folder and manifest identity match. The
-repository-scoped `CLAUDE.md` applies to Claude Code work in a clone.
+repository-scoped `AGENTS.md` applies to Codex and Claude Code work in a clone;
+`CLAUDE.md` only points to it.
 
 The frozen behavior target is recorded in
 `docs/frozen-baseline-spec.md`. That file is an evidence-backed contract
@@ -18,7 +19,7 @@ index; executable Rust/Swift tests and protocol fixtures remain the validators.
 - The separate retired Electron project's source is archived. Its observed
   behavior is preserved in `docs/frozen-baseline-spec.md`, not consumed from a
   live source path or treated as this repository's Git history.
-- Claude Code plugin cache, generated images, run manifests, logs, and build output
+- Codex and Claude Code plugin caches, generated images, run manifests, logs, and build output
   are not source.
 - No runtime state is stored in this repository.
 

@@ -886,7 +886,7 @@ fn classify_package_root(path: &Path) -> &'static str {
     } else if path.join("Cargo.toml").is_file()
         && path.join("crates/image-grid-server/Cargo.toml").is_file()
         && path
-            .join("plugin/codex-image-grid/.mcp.json")
+            .join("plugin/codex-image-grid/.codex-plugin/plugin.json")
             .is_file()
     {
         "source"
@@ -949,8 +949,8 @@ mod tests {
         let source_root = temporary.path().join("renamed-checkout");
         fs::create_dir_all(source_root.join("crates/image-grid-server"))
             .expect("server crate directory");
-        fs::create_dir_all(source_root.join("plugin/codex-image-grid"))
-            .expect("plugin root directory");
+        fs::create_dir_all(source_root.join("plugin/codex-image-grid/.codex-plugin"))
+            .expect("plugin manifest directory");
         fs::write(source_root.join("Cargo.toml"), "[workspace]\n").expect("workspace manifest");
         fs::write(
             source_root.join("crates/image-grid-server/Cargo.toml"),
@@ -958,10 +958,10 @@ mod tests {
         )
         .expect("server manifest");
         fs::write(
-            source_root.join("plugin/codex-image-grid/.mcp.json"),
+            source_root.join("plugin/codex-image-grid/.codex-plugin/plugin.json"),
             "{}\n",
         )
-        .expect("plugin MCP config");
+        .expect("plugin manifest");
         let config = RuntimeConfig::new(
             source_root,
             temporary.path().join("data"),
