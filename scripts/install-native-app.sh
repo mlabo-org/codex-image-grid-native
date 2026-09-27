@@ -178,6 +178,7 @@ if [[ -n "$PREVIOUS_APP" && -d "$PREVIOUS_APP" ]]; then
     echo "previousInstallMovedTo: $TRASH_TARGET"
 fi
 
+/bin/rmdir "$STAGE_ROOT"
 STAGE_ROOT=""
 INSTALLED_NEW=0
 trap - EXIT
