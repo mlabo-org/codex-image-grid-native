@@ -1,11 +1,11 @@
 # Codex Image Grid
 
-A native macOS image-generation workspace for Codex, built with Rust and
+A native macOS image-generation workspace for Claude Code, built with Rust and
 SwiftUI. It provides Prompt Batch generation and editing, reference-image analysis,
 Japanese/English UI, light/dark themes, run history, and artifact handoff
 through the `codex_image_grid/generate_image_grid` MCP tool.
 
-Codex向けのmacOSネイティブ画像生成ワークスペースです。RustとSwiftUIで
+Claude Code向けのmacOSネイティブ画像生成ワークスペースです。RustとSwiftUIで
 実装され、Prompt Batchでの生成・編集、参照画像解析、日英UI、ライト/ダークテーマ、
 生成履歴、成果物の受け渡しに対応しています。
 
@@ -64,7 +64,7 @@ In a Claude Code session with the plugin loaded, ask:
 Claude Code turns the natural-language request into an MCP call, so you do not need
 to write JSON yourself. The native SwiftUI app opens or becomes active
 automatically. When generation completes, Claude Code receives display-safe image
-URLs, absolute output paths, Codex Markdown, and artifact handoff information.
+URLs, absolute output paths, `codexMarkdown` image links, and artifact handoff information.
 
 To submit multiple prompts and image jobs together, ask for a Prompt Batch:
 
@@ -190,13 +190,6 @@ scripts/install-native-app.sh --dry-run
 scripts/install-native-app.sh --execute
 ```
 
-Register the plugin manually from the repository root:
-
-```bash
-codex plugin marketplace add .
-codex plugin add codex-image-grid@codex-image-grid-native
-```
-
 ### Repository layout
 
 - `crates/image-grid-core/` — validation, job state, retry policy, and artifact
@@ -251,7 +244,7 @@ Claude Code用プラグインは`plugin/codex-image-grid/`で、`suzuki-local-pl
 
 Claude Codeが自然言語の依頼からMCPを呼び出すため、JSONを手書きする必要はありません。
 ネイティブSwiftUIアプリが自動的に開くか、前面へ移動します。生成完了後は、
-表示用画像URL、絶対パス、Codex Markdown、成果物の受け渡し情報がClaude Codeへ返ります。
+表示用画像URL、絶対パス、`codexMarkdown`の画像リンク、成果物の受け渡し情報がClaude Codeへ返ります。
 
 複数のプロンプトや画像ジョブをまとめて依頼する場合は、Prompt Batchとして依頼します。
 
@@ -372,13 +365,6 @@ CargoとSwiftの中間物を置きます。既存のCargo出力先を使う場�
 ```bash
 scripts/install-native-app.sh --dry-run
 scripts/install-native-app.sh --execute
-```
-
-リポジトリルートからプラグインを手動登録:
-
-```bash
-codex plugin marketplace add .
-codex plugin add codex-image-grid@codex-image-grid-native
 ```
 
 ### リポジトリ構成

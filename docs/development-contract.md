@@ -18,7 +18,7 @@ index; executable Rust/Swift tests and protocol fixtures remain the validators.
 - The separate retired Electron project's source is archived. Its observed
   behavior is preserved in `docs/frozen-baseline-spec.md`, not consumed from a
   live source path or treated as this repository's Git history.
-- Codex plugin cache, generated images, run manifests, logs, and build output
+- Claude Code plugin cache, generated images, run manifests, logs, and build output
   are not source.
 - No runtime state is stored in this repository.
 
