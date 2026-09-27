@@ -876,7 +876,10 @@ fn display_path(path: &Path) -> String {
 
 fn classify_package_root(path: &Path) -> &'static str {
     let normalized = path.to_string_lossy().replace('\\', "/");
-    if normalized.contains("/.codex/plugins/cache/") {
+    // Codex and Claude Code plugin caches are both installed copies, not sources.
+    if normalized.contains("/.codex/plugins/cache/")
+        || normalized.contains("/.claude/plugins/cache/")
+    {
         "cache"
     } else if normalized.ends_with(".app") || normalized.contains(".app/Contents/Resources/") {
         "packaged"
@@ -985,6 +988,16 @@ mod tests {
             SchedulerSnapshot::default()
         );
         assert_eq!(health.identity_fields, health.identity);
+    }
+
+    #[test]
+    fn codex_and_claude_code_plugin_caches_are_classified_as_cache() {
+        for root in [
+            "/Users/example/.codex/plugins/cache/local/codex-image-grid/0.2.4",
+            "/Users/example/.claude/plugins/cache/local/codex-image-grid/0.2.4",
+        ] {
+            assert_eq!(classify_package_root(Path::new(root)), "cache");
+        }
     }
 
     #[test]

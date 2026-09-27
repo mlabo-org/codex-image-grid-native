@@ -16,15 +16,49 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const TOOL_NAME: &str = "generate_image_grid";
 
-const TOOL_DESCRIPTION: &str = "Generate images or edit a supplied image, singly or in Prompt Batch. \
+mod host;
+
+pub use host::AgentHost;
+
+fn tool_description(host: AgentHost) -> &'static str {
+    match host {
+        AgentHost::Codex => {
+            "Generate images or edit a supplied image, singly or in Prompt Batch. \
 Use operation=generate for new images and reference-character variations; use operation=edit \
 with referenceImagePath for requested changes preserving the rest of the source. \
 Activates the installed native Codex Image Grid app, then returns handoff.md, absolute output \
-paths, display-safe image URLs, and Codex Markdown.";
-const SERVER_INSTRUCTIONS: &str = "Use generate_image_grid for image generation, reference-character \
+paths, display-safe image URLs, and Codex Markdown."
+        }
+        AgentHost::ClaudeCode => {
+            "Generate images or edit a supplied image, singly or in Prompt Batch. \
+Use operation=generate for new images and reference-character variations; use operation=edit \
+with referenceImagePath for requested changes preserving the rest of the source. \
+Activates the installed native Codex Image Grid app (generation runs through the Codex App Server \
+and its Codex account), then returns handoff.md, absolute output paths, display-safe image URLs, \
+and Markdown image links in the codexMarkdown field for Claude Code."
+        }
+    }
+}
+
+fn server_instructions(host: AgentHost) -> &'static str {
+    match host {
+        AgentHost::Codex => {
+            "Use generate_image_grid for image generation, reference-character \
 variations, partial image edits, and Prompt Batch. Select operation=edit with referenceImagePath \
 for changes to an existing image. Return and reuse handoff.md, \
-absolute output paths, imageUrls, and codexMarkdown.";
+absolute output paths, imageUrls, and codexMarkdown."
+        }
+        AgentHost::ClaudeCode => {
+            "Use generate_image_grid for image generation, reference-character \
+variations, partial image edits, and Prompt Batch. Select operation=edit with referenceImagePath \
+for changes to an existing image. Return and reuse handoff.md, absolute output paths, imageUrls, \
+and the Markdown image links in codexMarkdown. To show results in Claude Code, read the absolute \
+output paths or open imageUrls in the Claude Code browser pane \
+(mcp__Claude_Browser__preview_start or mcp__Claude_Browser__navigate)."
+        }
+    }
+}
+
 const DEFAULT_IMAGE_GRID_URL: &str = "http://127.0.0.1:4322";
 const EXPECTED_APP_IDENTITY: &str = "codex-image-grid";
 const NATIVE_APP_EXECUTABLE_NAME: &str = "CodexImageGridNative";
@@ -99,7 +133,7 @@ fn initialize_result(params: Option<&Value>) -> Value {
             "title": "Codex Image Grid Native",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": SERVER_INSTRUCTIONS
+        "instructions": server_instructions(AgentHost::current())
     })
 }
 
@@ -1045,7 +1079,9 @@ fn validate_strict_runtime_identity(
 
 fn package_root_kind_for(path: &Path) -> &'static str {
     let normalized = path.to_string_lossy().replace('\\', "/");
-    if normalized.contains("/.codex/plugins/cache/") {
+    if normalized.contains("/.codex/plugins/cache/")
+        || normalized.contains("/.claude/plugins/cache/")
+    {
         "cache"
     } else if normalized.ends_with(".app") || normalized.contains(".app/Contents/Resources/") {
         "packaged"
@@ -2010,7 +2046,7 @@ pub fn tool_record() -> Value {
     json!({
         "name": TOOL_NAME,
         "title": "Generate Image Grid",
-        "description": TOOL_DESCRIPTION,
+        "description": tool_description(AgentHost::current()),
         "inputSchema": {
             "type": "object",
             "description": "Prompt count multiplied by variants per prompt must not exceed 24 total jobs.",
@@ -2196,6 +2232,31 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn agent_facing_wording_follows_resolved_host() {
+        assert!(tool_description(AgentHost::Codex).contains("Codex Markdown"));
+        assert!(server_instructions(AgentHost::Codex).ends_with("imageUrls, and codexMarkdown."));
+        assert!(
+            tool_description(AgentHost::ClaudeCode).contains("codexMarkdown field for Claude Code")
+        );
+        assert!(!tool_description(AgentHost::ClaudeCode).contains("Codex Markdown"));
+        assert!(
+            server_instructions(AgentHost::ClaudeCode).contains("mcp__Claude_Browser__navigate")
+        );
+    }
+
+    #[test]
+    fn codex_and_claude_code_plugin_caches_are_cache_roots() {
+        assert_eq!(
+            package_root_kind_for(Path::new("/u/.codex/plugins/cache/m/codex-image-grid/1")),
+            "cache"
+        );
+        assert_eq!(
+            package_root_kind_for(Path::new("/u/.claude/plugins/cache/m/codex-image-grid/1")),
+            "cache"
+        );
+    }
 
     #[derive(Debug)]
     struct TestRequest {
