@@ -109,7 +109,7 @@ impl AppServerLaunchConfig {
         candidates.push(CandidateSpec {
             source: "chatgpt-bundled".to_owned(),
             command: Some(PathBuf::from(
-                "/Applications/ChatGPT.app/Contents/Resources/codex",
+                "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
             )),
             absent_reason: None,
         });
