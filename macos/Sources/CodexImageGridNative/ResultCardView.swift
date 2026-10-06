@@ -306,7 +306,7 @@ struct ResultCardView: View {
             Text(strings.generationFailed)
                 .appFont(.body, weight: .semibold)
             if let errorMessage = job.errorMessage, !errorMessage.isEmpty {
-                Text(errorMessage)
+                LocalizedErrorText(message: errorMessage)
                     .appFont(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
@@ -339,7 +339,15 @@ struct ResultCardView: View {
                 Text(title)
                     .appFont(.headline)
                     .lineLimit(2)
-                Label(displayStatusText, systemImage: statusSymbol)
+                Label {
+                    if job.status == "error" {
+                        LocalizedErrorText(message: displayStatusText)
+                    } else {
+                        Text(displayStatusText)
+                    }
+                } icon: {
+                    Image(systemName: statusSymbol)
+                }
                     .appFont(.caption, weight: .semibold)
                     .foregroundStyle(statusColor)
             }
@@ -430,7 +438,15 @@ struct ResultCardView: View {
     }
 
     private var displayStatusText: String {
-        job.isActive ? activeStatusText : (job.statusText ?? job.status)
+        if job.isActive {
+            return activeStatusText
+        }
+        if job.status == "error",
+           let title = ImageGridErrorCodeTitles.title(for: job.errorCode, language: language)
+        {
+            return title
+        }
+        return job.statusText ?? job.status
     }
 
     private var statusSymbol: String {
