@@ -14,7 +14,9 @@ both hosts; `CLAUDE.md` only points here.
   of the task, run `scripts/bootstrap-codex.sh --force` once.
 - In Claude Code, the plugin `plugin/codex-image-grid/` is loaded from the
   `suzuki-local-plugins` marketplace. Apply plugin source changes with
-  `claude-plugin-refresh codex-image-grid --execute` only when activation is
+  the `refresh-claude-plugin` skill
+  (`~/.claude/local-plugins/bin/claude-plugin-refresh codex-image-grid --execute`)
+  only when activation is
   part of the task. Do not run `scripts/bootstrap-codex.sh`; it registers the
   Codex marketplace.
 - Both hosts use the same `~/Applications/Codex Image Grid Native.app`. Build

@@ -1,6 +1,6 @@
 ---
 name: codex-image-grid
-description: "Image generation/画像生成 and image editing/画像編集 via codex_image_grid/generate_image_grid: Prompt Batch, character references, 部分修正, thumbnails/サムネイル, project/article/video visuals for CodexVideo and RelayPress. Native SwiftUI auto-opens."
+description: "Image generation/画像生成 and image editing/画像編集 via codex_image_grid/generate_image_grid: Prompt Batch, character references, 部分修正, thumbnails/サムネイル, single visuals; article image sets start at relaypress-image-builder. Native app opens."
 ---
 
 # Codex Image Grid
@@ -52,7 +52,8 @@ or fall back to the separate retired Electron project.
   them only when repository setup or activation is authorized, and do not
   claim that a source edit activated the plugin. In Codex, use
   `scripts/bootstrap-codex.sh` in a source checkout; in Claude Code, refresh
-  the plugin with `claude-plugin-refresh codex-image-grid --execute`. Both
+  the plugin with the `refresh-claude-plugin` skill
+  (`~/.claude/local-plugins/bin/claude-plugin-refresh codex-image-grid --execute`). Both
   hosts share `~/Applications/Codex Image Grid Native.app`.
 
 ## Stop conditions
