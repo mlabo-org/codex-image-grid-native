@@ -32,6 +32,11 @@ const APP_SERVER_IMAGE_RETRY_BASE: Duration = Duration::from_secs(4);
 const APP_SERVER_IMAGE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(45);
 const APP_SERVER_IMAGE_RATE_LIMIT_COOLDOWN_MAX: Duration = Duration::from_secs(180);
 const CODEX_SVG_CONCURRENCY: usize = 1;
+const GROK_IMAGINE_CONCURRENCY: usize = 4;
+const GROK_IMAGINE_MAX_TURNS: &str = "4";
+const ENGINES: [&str; 3] = ["app-server-image", "codex-svg", "grok-imagine"];
+const RATE_LIMIT_GROK_HINT: &str = "Codex image generation is rate-limited. Grok can draw these \
+prompts instead: rerun them with engine grok-imagine if the user wants Grok (lower quality).";
 
 const MOODS: [&str; 5] = [
     "warm-mascot",
@@ -467,6 +472,7 @@ struct RuntimeInner {
     events: broadcast::Sender<RuntimeEvent>,
     image_slots: Arc<Semaphore>,
     svg_slots: Arc<Semaphore>,
+    grok_slots: Arc<Semaphore>,
     queued_jobs: AtomicUsize,
     artifact_write: Mutex<()>,
     recovery: RecoveryConfig,
@@ -513,6 +519,7 @@ impl GenerationRuntime {
                 events,
                 image_slots: Arc::new(Semaphore::new(MAX_RUN_JOBS)),
                 svg_slots: Arc::new(Semaphore::new(CODEX_SVG_CONCURRENCY)),
+                grok_slots: Arc::new(Semaphore::new(GROK_IMAGINE_CONCURRENCY)),
                 queued_jobs: AtomicUsize::new(0),
                 artifact_write: Mutex::new(()),
                 recovery,
@@ -823,10 +830,10 @@ impl GenerationRuntime {
             };
 
             let artifacts = run_artifacts(&self.inner.config.generated_dir, &run_id);
-            let model = if request.engine == "app-server-image" {
-                "app-server-image"
-            } else {
-                "codex-app-server"
+            let model = match request.engine.as_str() {
+                "app-server-image" => "app-server-image",
+                "grok-imagine" => "grok-imagine",
+                _ => "codex-app-server",
             }
             .to_owned();
             let request_record = RunRequestRecord {
@@ -854,11 +861,7 @@ impl GenerationRuntime {
             let mut created = Vec::with_capacity(request.prompts.len() * request.count);
             for (prompt_index, prompt) in request.prompts.iter().enumerate() {
                 for variant_index in 0..request.count {
-                    let extension = if request.engine == "codex-svg" {
-                        "svg"
-                    } else {
-                        "png"
-                    };
+                    let extension = output_extension(&request.engine);
                     let prompt_part = if request.prompts.len() > 1 {
                         format!("prompt-{:02}-", prompt_index + 1)
                     } else {
@@ -956,6 +959,7 @@ impl GenerationRuntime {
 
         for job in &created {
             let is_svg = job.engine == "codex-svg";
+            let is_grok = job.engine == "grok-imagine";
             if !is_svg {
                 self.inner.queued_jobs.fetch_add(1, Ordering::Relaxed);
             }
@@ -969,6 +973,8 @@ impl GenerationRuntime {
                     permit = async {
                         if is_svg {
                             runtime.inner.svg_slots.clone().acquire_owned().await
+                        } else if is_grok {
+                            runtime.inner.grok_slots.clone().acquire_owned().await
                         } else {
                             runtime.inner.image_slots.clone().acquire_owned().await
                         }
@@ -1244,11 +1250,11 @@ impl GenerationRuntime {
         let Some(job) = self.job(job_id).await else {
             return;
         };
-        if job.engine == "codex-svg" {
-            self.run_codex_svg_job(job_id).await;
-            return;
+        match job.engine.as_str() {
+            "codex-svg" => self.run_codex_svg_job(job_id).await,
+            "grok-imagine" => self.run_grok_imagine_job(job_id).await,
+            _ => self.run_app_server_image_job_with_retries(job_id).await,
         }
-        self.run_app_server_image_job_with_retries(job_id).await;
     }
 
     async fn run_app_server_image_job_with_retries(&self, job_id: &str) {
@@ -1337,6 +1343,17 @@ impl GenerationRuntime {
             }
 
             self.finalize_attempt_failure(job_id, &attempt_id).await;
+            if retry_reason == Some(RetryReason::RateLimit) {
+                self.update_job_for_attempt(job_id, &attempt_id, |job, _| {
+                    let message = job
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "Upstream image generation failed".to_owned());
+                    job.error_message = Some(format!("{message}. {RATE_LIMIT_GROK_HINT}"));
+                    job.status_text = format!("{}. {RATE_LIMIT_GROK_HINT}", job.status_text);
+                })
+                .await;
+            }
             self.retire_attempt(job_id, &attempt_id).await;
             return;
         }
@@ -1613,6 +1630,142 @@ impl GenerationRuntime {
                 _ => {}
             }
         }
+    }
+
+    async fn run_grok_imagine_job(&self, job_id: &str) {
+        let Some(job) = self.job(job_id).await else {
+            return;
+        };
+        let Some(grok) = resolve_grok_command() else {
+            self.fail_job(
+                job_id,
+                "GrokCliUnavailable",
+                "Grok CLI was not found (IMAGE_GRID_GROK_BIN, ~/.local/bin/grok, ~/.grok/bin/grok, PATH)",
+            )
+            .await;
+            return;
+        };
+        let session_id = Uuid::new_v4().to_string();
+        self.update_job(job_id, |job, now| {
+            job.status = "running".to_owned();
+            job.status_text = "Waiting for Grok Imagine...".to_owned();
+            job.thread_id = Some(session_id.clone());
+            job.timing.transition("running", now);
+        })
+        .await;
+
+        let mut command = tokio::process::Command::new(&grok);
+        command
+            .arg("--single")
+            .arg(build_grok_imagine_request(&job))
+            .args(["--always-approve", "--disable-web-search", "--no-subagents"])
+            .args(["--max-turns", GROK_IMAGINE_MAX_TURNS])
+            .args(["--output-format", "json"])
+            .arg("--session-id")
+            .arg(&session_id)
+            .arg("--cwd")
+            .arg(&self.inner.config.workspace_dir)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let deadline = Instant::now() + self.inner.recovery.job_timeout;
+        let mut shutdown = self.shutdown_receiver();
+        let output = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => return,
+            output = timeout_at(deadline, command.output()) => output,
+        };
+        let output = match output {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                self.fail_job(
+                    job_id,
+                    "GrokCliFailed",
+                    &format!("could not run {}: {error}", grok.display()),
+                )
+                .await;
+                return;
+            }
+            Err(_) => {
+                self.fail_job(
+                    job_id,
+                    "ImageGenerationTimeout",
+                    &format!(
+                        "Timed out waiting for Grok Imagine after {}ms",
+                        self.inner.recovery.job_timeout.as_millis()
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let reply = serde_json::from_slice::<Value>(&output.stdout)
+            .ok()
+            .and_then(|value| value.get("text").and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_else(|| String::from_utf8_lossy(&output.stderr).trim().to_owned());
+
+        let image = match find_grok_session_image(&session_id).await {
+            Some(image) => image,
+            None => {
+                let reason = if output.status.success() {
+                    "Grok finished without saving an image"
+                } else {
+                    "Grok CLI exited with an error"
+                };
+                self.fail_job(
+                    job_id,
+                    "ImageOutputMissing",
+                    &format!("{reason}: {}", truncate_chars(&reply, 400)),
+                )
+                .await;
+                return;
+            }
+        };
+        let bytes = match fs::read(&image).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.fail_job(
+                    job_id,
+                    "ImageWriteFailed",
+                    &format!("could not read Grok image {}: {error}", image.display()),
+                )
+                .await;
+                return;
+            }
+        };
+        if let Err(error) = validate_generated_image_bytes(&bytes, &job.output_format) {
+            self.fail_job(job_id, "ImageWriteFailed", &error.error).await;
+            return;
+        }
+        let output_path = PathBuf::from(&job.output_path);
+        let temporary_path =
+            output_path.with_extension(format!("{}.{}.tmp", job.output_format, Uuid::new_v4()));
+        let installed = async {
+            fs::write(&temporary_path, &bytes).await?;
+            fs::rename(&temporary_path, &output_path).await
+        }
+        .await;
+        if let Err(error) = installed {
+            let _ = fs::remove_file(&temporary_path).await;
+            self.fail_job(
+                job_id,
+                "ImageWriteFailed",
+                &format!("could not install image: {error}"),
+            )
+            .await;
+            return;
+        }
+        let image_url = format!("/generated/{}/{}", job.run_id, job.filename);
+        let source = display_path(&image);
+        self.update_job(job_id, |job, now| {
+            job.status = "done".to_owned();
+            job.status_text = "Generated".to_owned();
+            job.image_url = Some(image_url);
+            job.error_code = None;
+            job.error_message = None;
+            append_job_diagnostic(job, format!("[grok-imagine] source={source}"));
+            job.timing.transition("done", now);
+        })
+        .await;
     }
 
     async fn run_codex_svg_job(&self, job_id: &str) {
@@ -2509,6 +2662,7 @@ impl GenerationRuntime {
         let _admission_guard = self.inner.admission_gate.write().await;
         self.inner.image_slots.close();
         self.inner.svg_slots.close();
+        self.inner.grok_slots.close();
         let _ = self.inner.shutdown_signal.send(true);
         self.inner.queued_jobs.store(0, Ordering::Release);
         self.inner.attempts.write().await.clear();
@@ -2742,7 +2896,7 @@ fn validate_restored_request(
             .len()
             .checked_mul(request.variants_per_prompt)?
             > MAX_RUN_JOBS
-        || !matches!(request.engine.as_str(), "app-server-image" | "codex-svg")
+        || !ENGINES.contains(&request.engine.as_str())
         || request.model.is_empty()
         || !MOODS.contains(&request.mood.as_str())
         || !ASPECT_RATIOS.contains(&request.aspect_ratio.as_str())
@@ -2834,10 +2988,10 @@ fn restore_persisted_output(
     let extension = Path::new(filename)
         .extension()
         .and_then(|extension| extension.to_str())?;
-    let extension_matches_engine = if output.engine == "codex-svg" {
-        extension == "svg"
-    } else {
-        matches!(extension, "png" | "jpg" | "jpeg" | "webp")
+    let extension_matches_engine = match output.engine.as_str() {
+        "codex-svg" => extension == "svg",
+        "grok-imagine" => extension == "jpg",
+        _ => matches!(extension, "png" | "jpg" | "jpeg" | "webp"),
     };
     if !extension_matches_engine || output.output_format != extension {
         return None;
@@ -3099,12 +3253,12 @@ fn normalize_request(
         .filter(|value| MOODS.contains(value))
         .unwrap_or("warm-mascot")
         .to_owned();
-    let engine = if body.get("engine").and_then(Value::as_str) == Some("codex-svg") {
-        "codex-svg"
-    } else {
-        "app-server-image"
-    }
-    .to_owned();
+    let engine = body
+        .get("engine")
+        .and_then(Value::as_str)
+        .filter(|value| ENGINES.contains(value))
+        .unwrap_or("app-server-image")
+        .to_owned();
     let aspect_ratio = body
         .get("aspectRatio")
         .and_then(Value::as_str)
@@ -3589,6 +3743,119 @@ Composition requirements:\n\
 - Do not ask follow-up questions.\n",
         job.prompt, job.aspect_ratio
     )
+}
+
+fn output_extension(engine: &str) -> &'static str {
+    match engine {
+        "codex-svg" => "svg",
+        "grok-imagine" => "jpg",
+        _ => "png",
+    }
+}
+
+/// The instruction handed to the Grok CLI agent. It asks for exactly one
+/// Imagine tool call and carries the image prompt verbatim.
+fn build_grok_imagine_request(job: &ImageGridJob) -> String {
+    let tool_call = match &job.reference_image_path {
+        Some(reference) => format!(
+            "Call the image_edit tool exactly once with image = [{}] and aspect_ratio = \"{}\".",
+            json!(reference),
+            job.aspect_ratio
+        ),
+        None => format!(
+            "Call the image_gen tool exactly once with aspect_ratio = \"{}\".",
+            job.aspect_ratio
+        ),
+    };
+    format!(
+        "{tool_call} Pass the prompt below as the tool's prompt verbatim, without rewriting, \
+translating, shortening, or adding to it. Do not load skills, search, or call any other tool. \
+After the call, reply with the saved image path only.\n\nPrompt:\n{}",
+        build_grok_image_prompt(job)
+    )
+}
+
+fn build_grok_image_prompt(job: &ImageGridJob) -> String {
+    if job.operation == ImageOperation::Edit {
+        return format!(
+            "{}\n\nApply only this change to the source image. Keep everything else the same: \
+character identity, face, pose, clothing, objects, background, composition, framing, lighting, \
+colors, and art style.",
+            job.prompt.trim()
+        );
+    }
+    let mut sections = Vec::new();
+    if !job.reference_premise.is_empty() {
+        sections.push(job.reference_premise.trim().to_owned());
+    }
+    sections.push(job.prompt.trim().to_owned());
+    sections.push(format!("Overall mood: {}", mood_direction(&job.mood)));
+    if job.reference_image_path.is_some() {
+        sections.push(
+            "Keep the character from the reference image recognizable while creating a fresh composition."
+                .to_owned(),
+        );
+    }
+    sections.join("\n\n")
+}
+
+fn resolve_grok_command() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("IMAGE_GRID_GROK_BIN") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".local/bin/grok"));
+        candidates.push(home.join(".grok/bin/grok"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|directory| directory.join("grok")));
+    }
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+/// Grok saves Imagine output under `~/.grok/sessions/<cwd>/<session id>/images/`.
+/// The session id is chosen by this job, so the newest image there is its output.
+async fn find_grok_session_image(session_id: &str) -> Option<PathBuf> {
+    let sessions = PathBuf::from(std::env::var_os("HOME")?).join(".grok/sessions");
+    let mut workspaces = fs::read_dir(&sessions).await.ok()?;
+    while let Ok(Some(workspace)) = workspaces.next_entry().await {
+        let images = workspace.path().join(session_id).join("images");
+        let Ok(mut entries) = fs::read_dir(&images).await else {
+            continue;
+        };
+        let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let is_image = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "jpg" | "jpeg" | "png" | "webp"));
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+            if !is_image || !metadata.is_file() {
+                continue;
+            }
+            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+            if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
+                newest = Some((modified, path));
+            }
+        }
+        if let Some((_, path)) = newest {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let mut truncated = text.chars().take(limit).collect::<String>();
+    if text.chars().count() > limit {
+        truncated.push('…');
+    }
+    truncated
 }
 
 fn build_svg_prompt(job: &ImageGridJob) -> String {
@@ -4294,6 +4561,43 @@ mod tests {
         .unwrap();
         assert_eq!(edit.operation, ImageOperation::Edit);
         assert_eq!(edit.prompts.len() * edit.count, 4);
+    }
+
+    #[test]
+    fn grok_imagine_requests_carry_the_prompt_and_reference_verbatim() {
+        let request = normalize_request(
+            &json!({"prompts": ["A mascot on a sofa"], "engine": "grok-imagine"}),
+            true,
+            None,
+        )
+        .expect("normalized grok request");
+        assert_eq!(request.engine, "grok-imagine");
+        assert_eq!(output_extension("grok-imagine"), "jpg");
+
+        let mut job = svg_fixture_job("feedface", Path::new("/tmp/variant-01.jpg"), now_millis());
+        job.engine = "grok-imagine".to_owned();
+        let generate = build_grok_imagine_request(&job);
+        assert!(generate.starts_with(
+            "Call the image_gen tool exactly once with aspect_ratio = \"16:9\"."
+        ));
+        assert!(generate.contains(
+            "Prompt:\nKeep the round glasses and blue scarf.\n\nA calm SVG mascot\n\nOverall mood: "
+        ));
+
+        job.reference_image_path = Some("/tmp/run/reference.png".to_owned());
+        let with_reference = build_grok_imagine_request(&job);
+        assert!(with_reference.starts_with(
+            "Call the image_edit tool exactly once with image = [\"/tmp/run/reference.png\"] and aspect_ratio = \"16:9\"."
+        ));
+        assert!(with_reference.ends_with(
+            "Keep the character from the reference image recognizable while creating a fresh composition."
+        ));
+
+        job.operation = ImageOperation::Edit;
+        job.prompt = "Replace the burger with a crepe.".to_owned();
+        assert!(build_grok_image_prompt(&job).starts_with(
+            "Replace the burger with a crepe.\n\nApply only this change to the source image."
+        ));
     }
 
     #[test]

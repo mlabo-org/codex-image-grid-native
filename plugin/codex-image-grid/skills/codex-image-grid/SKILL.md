@@ -34,6 +34,12 @@ instructions. For edits, the tool schema documents which generation settings
 are ignored. Preserve batch intent: each prompt and variant edits the supplied
 source independently. To edit a preceding result, supply that result's path.
 
+Leave `engine` at its default unless the user names one. Use `grok-imagine`
+only when the user asks for Grok: it draws through the local Grok CLI and its
+quality is lower. When a result reports that Codex image generation is
+rate-limited, tell the user and offer Grok; do not rerun with `grok-imagine`
+until the user says so.
+
 For CodexVideo, RelayPress, or another parent workflow, return the tool's
 generated paths and handoff to the caller that requested the visuals. The
 native SwiftUI app opens automatically through this route. Do not start, call,

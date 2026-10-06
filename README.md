@@ -153,12 +153,17 @@ For generation, only `prompts` is required. A batch may contain up to 12 prompts
 variants per prompt, with at most 24 image jobs in total
 (`prompts.length * count`). `referenceImagePath`, when supplied, must be an
 absolute path to a local PNG, JPEG, or WebP file no larger than 100 MiB. Use
-`engine: "codex-svg"` for SVG output. `waitMs` may be from 0 through 120,000.
+`engine: "codex-svg"` for SVG output. `engine: "grok-imagine"` draws through the
+local Grok CLI (`grok`, signed in) with its Imagine tools and writes JPEG; its
+quality is lower, so use it only when Grok is wanted, for example while Codex
+image generation is rate-limited. A rate-limited `app-server-image` failure says
+so in its error message. `waitMs` may be from 0 through 120,000.
 
 `operation` defaults to `generate`, preserving existing character-reference
 workflows such as creating different article illustrations featuring one mascot.
 For partial changes to an existing image, use `operation: "edit"` and supply
-the source as `referenceImagePath` with `engine: "app-server-image"`:
+the source as `referenceImagePath` with `engine: "app-server-image"` (or
+`"grok-imagine"`):
 
 ```json
 {
@@ -382,12 +387,15 @@ MCPから呼び出した場合もネイティブアプリが開き、両方の�
 6バリエーションを指定でき、合計24画像ジョブまでです
 (`prompts.length * count`)。`referenceImagePath`には、100 MiB以下のローカルPNG・JPEG・
 WebPファイルの絶対パスを指定します。SVGが必要な場合は`engine: "codex-svg"`を使用します。
+`engine: "grok-imagine"`は、ログイン済みのGrok CLI（`grok`）のImagineで描いてJPEGを書き出します。
+品質は下がるので、Codexの画像生成が上限に当たったときなど、Grokを使いたいときだけ選びます。
+`app-server-image`が上限で失敗したときは、エラーメッセージにその旨が出ます。
 `waitMs`には0から120,000までを指定できます。
 
 `operation`を省略すると従来どおり`generate`になります。じぴこのベース画像から
 特徴を引き継いで各H2の新しい場面を作る、といった参照生成はそのまま使えます。
 元画像の一部を変更する場合は`operation: "edit"`にし、`referenceImagePath`に元画像を指定します。
-編集のエンジンは`app-server-image`です。
+編集のエンジンは`app-server-image`か`grok-imagine`です。
 
 ```json
 {
