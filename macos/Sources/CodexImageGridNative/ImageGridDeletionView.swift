@@ -73,7 +73,11 @@ struct ImageGridDeletionView: View {
             deletionControls
 
             if let message = store.deletionMessage {
-                Label(message, systemImage: "exclamationmark.triangle.fill")
+                Label {
+                    LocalizedErrorText(message: message)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
                     .appFont(.caption, weight: .semibold)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)

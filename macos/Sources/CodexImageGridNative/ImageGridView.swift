@@ -486,7 +486,13 @@ struct ImageGridView: View {
                 .appFont(.caption)
                 .foregroundStyle(.secondary)
 
-            Text(referenceStatusText)
+            Group {
+                if referenceStatusIsError {
+                    LocalizedErrorText(message: referenceStatusText)
+                } else {
+                    Text(referenceStatusText)
+                }
+            }
                 .appFont(.caption, weight: .semibold)
                 .foregroundStyle(referenceStatusIsError ? Color.red : Color.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -518,7 +524,7 @@ struct ImageGridView: View {
             }
 
             if let message = formError ?? store.generationMessage {
-                Text(message)
+                LocalizedErrorText(message: message)
                     .appFont(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
