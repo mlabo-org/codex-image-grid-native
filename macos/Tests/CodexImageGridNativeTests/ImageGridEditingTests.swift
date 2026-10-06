@@ -31,6 +31,7 @@ import Testing
     #expect(!ImageGridOperation.edit.canSubmit(engine: "app-server-image", referenceImagePath: nil))
     #expect(!ImageGridOperation.edit.canSubmit(engine: "app-server-image", referenceImagePath: "  "))
     #expect(!ImageGridOperation.edit.canSubmit(engine: "codex-svg", referenceImagePath: "/tmp/source.png"))
+    #expect(ImageGridOperation.edit.canSubmit(engine: "grok-imagine", referenceImagePath: "/tmp/source.png"))
     #expect(ImageGridOperation.generate.canSubmit(engine: "codex-svg", referenceImagePath: nil))
 }
 

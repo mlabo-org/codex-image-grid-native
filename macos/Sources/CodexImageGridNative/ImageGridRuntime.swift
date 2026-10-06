@@ -51,7 +51,7 @@ enum ImageGridOperation: String, Codable, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
 
     func canSubmit(engine: String, referenceImagePath: String?) -> Bool {
-        self == .generate || (engine == "app-server-image"
+        self == .generate || (["app-server-image", "grok-imagine"].contains(engine)
             && !(referenceImagePath ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 }
@@ -911,7 +911,7 @@ final class ImageGridStore: ObservableObject {
             guard request.operation.canSubmit(
                 engine: request.engine, referenceImagePath: request.referenceImagePath
             ) else {
-                throw ImageGridAPIError(message: "Image editing requires a source image and the App Server Image engine.")
+                throw ImageGridAPIError(message: "Image editing requires a source image and the App Server Image or Grok Imagine engine.")
             }
             let referenceLease = try Self.makeReferenceOperationLease(
                 referenceImagePath: request.referenceImagePath

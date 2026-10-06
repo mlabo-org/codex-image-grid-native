@@ -125,7 +125,9 @@ The following are public behavior and must remain stable at cutover:
 - `/api/run`, `/api/run-batch`, `/api/runs`, `/api/health`, preflight, and
   artifact routes;
 - SSE event names and payload meaning;
-- `app-server-image` and `codex-svg` engines;
+- `app-server-image` and `codex-svg` engines (`grok-imagine` was added later
+  as an opt-in engine that runs the local Grok CLI's Imagine tools and saves
+  JPEG output);
 - maximums: 12 prompts, 6 variants per prompt, 24 total jobs;
 - retry, timeout, rate-limit, missing-output, and diagnostic semantics;
 - manifest, handoff, generated image paths, and display-safe URLs.

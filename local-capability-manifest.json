@@ -34,7 +34,7 @@
         },
         {
           "authority": "image.generate",
-          "reason": "Conditionally requests image generation when engine is app-server-image; codex-svg remains a local deterministic image-output route."
+          "reason": "Conditionally requests image generation when engine is app-server-image (Codex App Server) or grok-imagine (local Grok CLI); codex-svg remains a local deterministic image-output route."
         }
       ],
       "artifactRoots": [],

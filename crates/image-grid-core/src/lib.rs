@@ -38,8 +38,8 @@ impl ImageOperation {
 
     pub fn validate(self, engine: &str, has_reference: bool) -> Result<(), &'static str> {
         if self == Self::Edit {
-            if engine != "app-server-image" {
-                return Err("edit requires the app-server-image engine");
+            if !matches!(engine, "app-server-image" | "grok-imagine") {
+                return Err("edit requires the app-server-image or grok-imagine engine");
             }
             if !has_reference {
                 return Err("edit requires a reference image");
@@ -53,6 +53,7 @@ impl ImageOperation {
 pub enum Engine {
     AppServerImage,
     CodexSvg,
+    GrokImagine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

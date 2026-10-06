@@ -1978,7 +1978,11 @@ fn validate_tool_arguments(arguments: &Value) -> Result<(), String> {
             "minimal-product",
         ],
     )?;
-    validate_enum(arguments, "engine", &["app-server-image", "codex-svg"])?;
+    validate_enum(
+        arguments,
+        "engine",
+        &["app-server-image", "codex-svg", "grok-imagine"],
+    )?;
     validate_enum(
         arguments,
         "aspectRatio",
@@ -2055,7 +2059,7 @@ pub fn tool_record() -> Value {
                     "type": "string",
                     "enum": ["generate", "edit"],
                     "default": "generate",
-                    "description": "generate creates new images, optionally retaining reference-character traits. edit changes the supplied source image only as requested and preserves other details, style, composition and aspect ratio; requires referenceImagePath and app-server-image. Each batch edit uses the same source independently."
+                    "description": "generate creates new images, optionally retaining reference-character traits. edit changes the supplied source image only as requested and preserves other details, style, composition and aspect ratio; requires referenceImagePath and app-server-image or grok-imagine. Each batch edit uses the same source independently."
                 },
                 "prompts": {
                     "type": "array",
@@ -2089,8 +2093,9 @@ pub fn tool_record() -> Value {
                 },
                 "engine": {
                     "type": "string",
-                    "enum": ["app-server-image", "codex-svg"],
-                    "default": "app-server-image"
+                    "enum": ["app-server-image", "codex-svg", "grok-imagine"],
+                    "default": "app-server-image",
+                    "description": "app-server-image draws with Codex image generation. codex-svg writes SVG. grok-imagine draws with the local Grok CLI's Imagine tools and is lower quality; use it only when the user asks for Grok."
                 },
                 "aspectRatio": {
                     "type": "string",
@@ -2120,7 +2125,7 @@ pub fn tool_record() -> Value {
                     "if": {"required": ["operation"], "properties": {"operation": {"const": "edit"}}},
                     "then": {"required": ["referenceImagePath"], "properties": {
                         "referenceImagePath": {"minLength": 1, "pattern": "\\S"},
-                        "engine": {"const": "app-server-image"}
+                        "engine": {"enum": ["app-server-image", "grok-imagine"]}
                     }}
                 },
                 conditional_prompt_limit(1, 12),
@@ -2685,7 +2690,8 @@ skipped PATH=(none): PATH is unavailable."
         assert!(schema["allOf"].as_array().unwrap().iter().any(|rule| {
             rule["if"]["properties"]["operation"]["const"] == "edit"
                 && rule["then"]["required"] == json!(["referenceImagePath"])
-                && rule["then"]["properties"]["engine"]["const"] == "app-server-image"
+                && rule["then"]["properties"]["engine"]["enum"]
+                    == json!(["app-server-image", "grok-imagine"])
         }));
         for (arguments, expected) in [
             (
@@ -2698,7 +2704,7 @@ skipped PATH=(none): PATH is unavailable."
             ),
             (
                 json!({"prompts": ["replace burger"], "operation": "edit", "engine": "codex-svg", "referenceImagePath": "/not/read.png"}),
-                "edit requires the app-server-image engine",
+                "edit requires the app-server-image or grok-imagine engine",
             ),
             (
                 json!({"prompts": ["replace burger"], "operation": "edti"}),

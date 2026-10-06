@@ -46,6 +46,7 @@ enum ImageMood: String, CaseIterable, Identifiable {
 enum ImageEngine: String, CaseIterable, Identifiable {
     case appServerImage = "app-server-image"
     case codexSvg = "codex-svg"
+    case grokImagine = "grok-imagine"
 
     var id: String { rawValue }
 }
@@ -336,7 +337,7 @@ struct ImageGridView: View {
             Picker(strings.engine, selection: $engine) {
                 ForEach(ImageEngine.allCases) { value in
                     Text(strings.engineName(value)).tag(value)
-                        .disabled(operation == .edit && value != .appServerImage)
+                        .disabled(operation == .edit && value == .codexSvg)
                 }
             }
             .labelsHidden()
@@ -1115,7 +1116,7 @@ struct ImageGridStrings {
         localized("変更したい箇所を指示してください。指定しない構図・画風・縦横比は元画像を維持します。雰囲気・縦横比・キャラクター解析の設定は使いません。複数枚は同じ元画像をそれぞれ編集します。", "Describe the changes. Composition, style, and aspect ratio stay as in the source unless requested. Mood, aspect ratio, and character analysis settings are not applied. Each result edits the same source independently.")
     }
     var editReferenceHelp: String {
-        localized("編集する元画像を添付し、エンジンに App Server Image を選択してください。", "Attach the source image and select the App Server Image engine.")
+        localized("編集する元画像を添付し、エンジンに App Server Image か Grok Imagine を選択してください。", "Attach the source image and select the App Server Image or Grok Imagine engine.")
     }
     var mood: String { localized("雰囲気", "Mood") }
     var engine: String { localized("エンジン", "Engine") }
@@ -1318,6 +1319,8 @@ struct ImageGridStrings {
             "App Server Image"
         case .codexSvg:
             "Codex SVG"
+        case .grokImagine:
+            "Grok Imagine"
         }
     }
 
@@ -1344,6 +1347,12 @@ struct ImageGridStrings {
     }
 
     func readyMessage(engine: ImageEngine) -> String {
+        if engine == .grokImagine {
+            return localized(
+                "Grok CLIのImagineで画像を生成できます（App Server Imageより品質は下がります）。",
+                "Ready to generate images with Grok CLI Imagine (lower quality than App Server Image)."
+            )
+        }
         if engine == .codexSvg {
             return localized(
                 "Codex App Server経由でSVGサムネイルを並列生成できます。",
