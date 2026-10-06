@@ -34,6 +34,7 @@ const APP_SERVER_IMAGE_RATE_LIMIT_COOLDOWN_MAX: Duration = Duration::from_secs(1
 const CODEX_SVG_CONCURRENCY: usize = 1;
 const GROK_IMAGINE_CONCURRENCY: usize = 4;
 const GROK_IMAGINE_MAX_TURNS: &str = "4";
+const GROK_IMAGINE_ATTEMPTS: u32 = 2;
 const ENGINES: [&str; 3] = ["app-server-image", "codex-svg", "grok-imagine"];
 const RATE_LIMIT_GROK_HINT: &str = "Codex image generation is rate-limited. Grok can draw these \
 prompts instead: rerun them with engine grok-imagine if the user wants Grok (lower quality).";
@@ -1645,80 +1646,114 @@ impl GenerationRuntime {
             .await;
             return;
         };
-        let session_id = Uuid::new_v4().to_string();
-        self.update_job(job_id, |job, now| {
-            job.status = "running".to_owned();
-            job.status_text = "Waiting for Grok Imagine...".to_owned();
-            job.thread_id = Some(session_id.clone());
-            job.timing.transition("running", now);
-        })
-        .await;
+        let mut attempt = 0;
+        let image = loop {
+            attempt += 1;
+            let session_id = Uuid::new_v4().to_string();
+            self.update_job(job_id, |job, now| {
+                job.status = "running".to_owned();
+                job.status_text = "Waiting for Grok Imagine...".to_owned();
+                job.thread_id = Some(session_id.clone());
+                job.timing.transition("running", now);
+            })
+            .await;
 
-        let mut command = tokio::process::Command::new(&grok);
-        command
-            .arg("--single")
-            .arg(build_grok_imagine_request(&job))
-            .args(["--always-approve", "--disable-web-search", "--no-subagents"])
-            .args(["--max-turns", GROK_IMAGINE_MAX_TURNS])
-            .args(["--output-format", "json"])
-            .arg("--session-id")
-            .arg(&session_id)
-            .arg("--cwd")
-            .arg(&self.inner.config.workspace_dir)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let deadline = Instant::now() + self.inner.recovery.job_timeout;
-        let mut shutdown = self.shutdown_receiver();
-        let output = tokio::select! {
-            biased;
-            _ = wait_for_shutdown(&mut shutdown) => return,
-            output = timeout_at(deadline, command.output()) => output,
-        };
-        let output = match output {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => {
-                self.fail_job(
-                    job_id,
-                    "GrokCliFailed",
-                    &format!("could not run {}: {error}", grok.display()),
-                )
-                .await;
-                return;
+            let mut command = tokio::process::Command::new(&grok);
+            command
+                .arg("--single")
+                .arg(build_grok_imagine_request(&job))
+                .args(["--always-approve", "--disable-web-search", "--no-subagents"])
+                .args(["--max-turns", GROK_IMAGINE_MAX_TURNS])
+                .args(["--output-format", "json"])
+                .arg("--session-id")
+                .arg(&session_id)
+                .arg("--cwd")
+                .arg(&self.inner.config.workspace_dir)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            let deadline = Instant::now() + self.inner.recovery.job_timeout;
+            let mut shutdown = self.shutdown_receiver();
+            let output = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => return,
+                output = timeout_at(deadline, command.output()) => output,
+            };
+            let output = match output {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => {
+                    self.fail_job(
+                        job_id,
+                        "GrokCliFailed",
+                        &format!("could not run {}: {error}", grok.display()),
+                    )
+                    .await;
+                    return;
+                }
+                Err(_) => {
+                    self.fail_job(
+                        job_id,
+                        "ImageGenerationTimeout",
+                        &format!(
+                            "Timed out waiting for Grok Imagine after {}ms",
+                            self.inner.recovery.job_timeout.as_millis()
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let result = parse_grok_result(&output.stdout);
+            if let Some(image) = find_grok_session_image(&session_id).await {
+                break image;
             }
-            Err(_) => {
+
+            if output.status.success() && result.as_ref().is_some_and(GrokResult::skipped_tool_call)
+            {
+                // Grok sometimes writes the Imagine call out as text instead of
+                // running it. That is a model slip, not a refusal, so a fresh
+                // session gets one more chance.
+                let reply = result.map(|result| result.text).unwrap_or_default();
+                if attempt < GROK_IMAGINE_ATTEMPTS {
+                    self.update_job(job_id, |job, _| {
+                        append_job_diagnostic(
+                            job,
+                            format!(
+                                "[grok-imagine] attempt={attempt} no tool call; retrying: {}",
+                                truncate_chars(&reply, 200)
+                            ),
+                        );
+                    })
+                    .await;
+                    continue;
+                }
                 self.fail_job(
                     job_id,
-                    "ImageGenerationTimeout",
+                    "ImageOutputMissing",
                     &format!(
-                        "Timed out waiting for Grok Imagine after {}ms",
-                        self.inner.recovery.job_timeout.as_millis()
+                        "Grok did not run the Imagine tool after {attempt} attempts \
+(it wrote the call as text): {}",
+                        truncate_chars(&reply, 200)
                     ),
                 )
                 .await;
                 return;
             }
-        };
-        let reply = serde_json::from_slice::<Value>(&output.stdout)
-            .ok()
-            .and_then(|value| value.get("text").and_then(Value::as_str).map(str::to_owned))
-            .unwrap_or_else(|| String::from_utf8_lossy(&output.stderr).trim().to_owned());
 
-        let image = match find_grok_session_image(&session_id).await {
-            Some(image) => image,
-            None => {
-                let reason = if output.status.success() {
-                    "Grok finished without saving an image"
-                } else {
-                    "Grok CLI exited with an error"
-                };
-                self.fail_job(
-                    job_id,
-                    "ImageOutputMissing",
-                    &format!("{reason}: {}", truncate_chars(&reply, 400)),
-                )
-                .await;
-                return;
-            }
+            let reply = result
+                .map(|result| result.text)
+                .unwrap_or_else(|| String::from_utf8_lossy(&output.stderr).trim().to_owned());
+            let reason = if output.status.success() {
+                "Grok finished without saving an image"
+            } else {
+                "Grok CLI exited with an error"
+            };
+            self.fail_job(
+                job_id,
+                "ImageOutputMissing",
+                &format!("{reason}: {}", truncate_chars(&reply, 400)),
+            )
+            .await;
+            return;
         };
         let bytes = match fs::read(&image).await {
             Ok(bytes) => bytes,
@@ -1733,7 +1768,8 @@ impl GenerationRuntime {
             }
         };
         if let Err(error) = validate_generated_image_bytes(&bytes, &job.output_format) {
-            self.fail_job(job_id, "ImageWriteFailed", &error.error).await;
+            self.fail_job(job_id, "ImageWriteFailed", &error.error)
+                .await;
             return;
         }
         let output_path = PathBuf::from(&job.output_path);
@@ -3799,6 +3835,29 @@ colors, and art style.",
     sections.join("\n\n")
 }
 
+/// The parts of `grok --output-format json` this engine reads.
+#[derive(Debug, PartialEq)]
+struct GrokResult {
+    text: String,
+    num_turns: Option<u64>,
+}
+
+impl GrokResult {
+    /// One model turn means Grok answered in text without calling any tool;
+    /// a tool call (including a moderated one) always takes a second turn.
+    fn skipped_tool_call(&self) -> bool {
+        self.num_turns == Some(1)
+    }
+}
+
+fn parse_grok_result(stdout: &[u8]) -> Option<GrokResult> {
+    let value = serde_json::from_slice::<Value>(stdout).ok()?;
+    Some(GrokResult {
+        text: value.get("text").and_then(Value::as_str)?.to_owned(),
+        num_turns: value.get("num_turns").and_then(Value::as_u64),
+    })
+}
+
 fn resolve_grok_command() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = std::env::var_os("IMAGE_GRID_GROK_BIN") {
@@ -4564,6 +4623,24 @@ mod tests {
     }
 
     #[test]
+    fn grok_text_only_reply_is_told_apart_from_a_tool_call() {
+        let text_only = parse_grok_result(
+            br#"{"text":"{\"aspect_ratio\":\"16:9\",\"prompt\":\"x\"}","num_turns":1}"#,
+        )
+        .expect("text-only result");
+        assert!(text_only.skipped_tool_call());
+
+        let called = parse_grok_result(br#"{"text":"images/1.jpg","num_turns":2}"#)
+            .expect("tool-call result");
+        assert!(!called.skipped_tool_call());
+        assert_eq!(called.text, "images/1.jpg");
+
+        let unknown = parse_grok_result(br#"{"text":"done"}"#).expect("result without turns");
+        assert!(!unknown.skipped_tool_call());
+        assert_eq!(parse_grok_result(b"not json"), None);
+    }
+
+    #[test]
     fn grok_imagine_requests_carry_the_prompt_and_reference_verbatim() {
         let request = normalize_request(
             &json!({"prompts": ["A mascot on a sofa"], "engine": "grok-imagine"}),
@@ -4577,9 +4654,10 @@ mod tests {
         let mut job = svg_fixture_job("feedface", Path::new("/tmp/variant-01.jpg"), now_millis());
         job.engine = "grok-imagine".to_owned();
         let generate = build_grok_imagine_request(&job);
-        assert!(generate.starts_with(
-            "Call the image_gen tool exactly once with aspect_ratio = \"16:9\"."
-        ));
+        assert!(
+            generate
+                .starts_with("Call the image_gen tool exactly once with aspect_ratio = \"16:9\".")
+        );
         assert!(generate.contains(
             "Prompt:\nKeep the round glasses and blue scarf.\n\nA calm SVG mascot\n\nOverall mood: "
         ));
