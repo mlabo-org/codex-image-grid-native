@@ -88,7 +88,7 @@ installed MCP route is discovered.
 
 The same `plugin/codex-image-grid/` package is loaded in Claude Code from the
 `suzuki-local-plugins` marketplace. Apply a plugin source change with
-`claude-plugin-refresh codex-image-grid --execute`, then start a new session.
+`~/.claude/local-plugins/bin/claude-plugin-refresh codex-image-grid --execute`, then start a new session.
 Claude Code uses the same
 `~/Applications/Codex Image Grid Native.app`; build or reinstall it with
 `scripts/install-native-app.sh --execute` when native source changes.
@@ -317,7 +317,7 @@ scripts/bootstrap-codex.sh --force
 
 同じ`plugin/codex-image-grid/`を、Claude Codeでは`suzuki-local-plugins`
 マーケットプレイスから読み込みます。プラグインのソース変更は
-`claude-plugin-refresh codex-image-grid --execute`で反映し、新しいセッションで
+`~/.claude/local-plugins/bin/claude-plugin-refresh codex-image-grid --execute`で反映し、新しいセッションで
 有効になります。Claude Codeも同じ`~/Applications/Codex Image Grid Native.app`を
 使います。ネイティブのソースを変えたときは`scripts/install-native-app.sh --execute`で
 再ビルド・再配置します。
