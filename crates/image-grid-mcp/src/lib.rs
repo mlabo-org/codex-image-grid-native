@@ -27,14 +27,16 @@ fn tool_description(host: AgentHost) -> &'static str {
 Use operation=generate for new images and reference-character variations; use operation=edit \
 with referenceImagePath for requested changes preserving the rest of the source. \
 Activates the installed native Codex Image Grid app, then returns handoff.md, absolute output \
-paths, display-safe image URLs, and Codex Markdown."
+paths, webpPaths for the lossy WebP copy saved beside each PNG or JPEG for web upload, \
+display-safe image URLs, and Codex Markdown."
         }
         AgentHost::ClaudeCode => {
             "Generate images or edit a supplied image, singly or in Prompt Batch. \
 Use operation=generate for new images and reference-character variations; use operation=edit \
 with referenceImagePath for requested changes preserving the rest of the source. \
 Activates the installed native Codex Image Grid app (generation runs through the Codex App Server \
-and its Codex account), then returns handoff.md, absolute output paths, display-safe image URLs, \
+and its Codex account), then returns handoff.md, absolute output paths, webpPaths for the lossy \
+WebP copy saved beside each PNG or JPEG for web upload, display-safe image URLs, \
 and Markdown image links in the codexMarkdown field for Claude Code."
         }
     }
@@ -1526,6 +1528,11 @@ fn render_tool_result(data: &Value, server: &ServerStartup, base_url: &str) -> V
         .filter_map(|output| output.get("outputPath").and_then(Value::as_str))
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let webp_paths = output_source
+        .iter()
+        .filter_map(|output| output.get("webpPath").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let image_urls = outputs
         .iter()
         .filter_map(|output| output_image_url(output, base_url))
@@ -1593,6 +1600,12 @@ fn render_tool_result(data: &Value, server: &ServerStartup, base_url: &str) -> V
             .iter()
             .map(|output_path| format!("- {output_path}")),
     );
+    summary.push("webpPaths:".to_owned());
+    if webp_paths.is_empty() {
+        summary.push("- none yet; each PNG or JPEG output gets a WebP copy when it finishes".to_owned());
+    } else {
+        summary.extend(webp_paths.iter().map(|webp_path| format!("- {webp_path}")));
+    }
     summary.push("imageUrls:".to_owned());
     if image_urls.is_empty() {
         summary.push("- none yet; check statusUrl or handoffPath after completion".to_owned());
@@ -1691,6 +1704,7 @@ fn render_tool_result(data: &Value, server: &ServerStartup, base_url: &str) -> V
             data.get("handoffPath").cloned().unwrap_or(Value::Null),
         ),
         ("outputPaths", json!(output_paths)),
+        ("webpPaths", json!(webp_paths)),
         ("imageUrls", json!(image_urls)),
         ("codexMarkdown", Value::String(codex_markdown)),
         ("outputs", Value::Array(structured_outputs)),

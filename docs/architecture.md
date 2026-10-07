@@ -130,7 +130,8 @@ The following are public behavior and must remain stable at cutover:
   JPEG output);
 - maximums: 12 prompts, 6 variants per prompt, 24 total jobs;
 - retry, timeout, rate-limit, missing-output, and diagnostic semantics;
-- manifest, handoff, generated image paths, and display-safe URLs.
+- manifest, handoff, generated image paths, and display-safe URLs (a lossy
+  WebP copy beside each PNG or JPEG output was added later for web upload).
 
 The exact image bytes are not a parity target because the upstream provider is
 stochastic. Parity means equivalent accepted inputs, state transitions,

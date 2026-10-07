@@ -139,6 +139,7 @@ pub struct ImageGridJob {
     pub total: usize,
     pub filename: String,
     pub output_path: String,
+    pub webp_path: Option<String>,
     pub aspect_ratio: String,
     pub reference_image_path: Option<String>,
     pub reference_image_url: Option<String>,
@@ -885,6 +886,7 @@ impl GenerationRuntime {
                         total: request.count,
                         filename: filename.clone(),
                         output_path: display_path(&run_directory.join(&filename)),
+                        webp_path: None,
                         aspect_ratio: request.aspect_ratio.clone(),
                         reference_image_path: reference.as_ref().map(|value| value.path.clone()),
                         reference_image_url: reference.as_ref().map(|value| value.url.clone()),
@@ -1267,7 +1269,11 @@ impl GenerationRuntime {
             if attempt_index > 0
                 && let Some(job) = self.job(job_id).await
             {
-                let _ = fs::remove_file(&job.output_path).await;
+                let output_path = Path::new(&job.output_path);
+                let _ = fs::remove_file(output_path).await;
+                if let Some(webp_path) = webp_copy_path(output_path, &job.output_format) {
+                    let _ = fs::remove_file(webp_path).await;
+                }
             }
 
             let Some(attempt_id) = self.begin_attempt(job_id, attempt_index).await else {
@@ -1767,12 +1773,33 @@ impl GenerationRuntime {
                 return;
             }
         };
-        if let Err(error) = validate_generated_image_bytes(&bytes, &job.output_format) {
-            self.fail_job(job_id, "ImageWriteFailed", &error.error)
-                .await;
-            return;
-        }
         let output_path = PathBuf::from(&job.output_path);
+        let webp_path = webp_copy_path(&output_path, &job.output_format);
+        let output_format = job.output_format.clone();
+        let wants_webp = webp_path.is_some();
+        let (bytes, webp_bytes) = match tokio::task::spawn_blocking(move || {
+            let image = decode_generated_image(&bytes, &output_format)?;
+            let webp_bytes = wants_webp.then(|| encode_webp_copy(&image));
+            Ok::<_, RunApiError>((bytes, webp_bytes))
+        })
+        .await
+        {
+            Ok(Ok(decoded)) => decoded,
+            Ok(Err(error)) => {
+                self.fail_job(job_id, "ImageWriteFailed", &error.error)
+                    .await;
+                return;
+            }
+            Err(error) => {
+                self.fail_job(
+                    job_id,
+                    "ImageWriteFailed",
+                    &format!("image decoding failed: {error}"),
+                )
+                .await;
+                return;
+            }
+        };
         let temporary_path =
             output_path.with_extension(format!("{}.{}.tmp", job.output_format, Uuid::new_v4()));
         let installed = async {
@@ -1790,6 +1817,10 @@ impl GenerationRuntime {
             .await;
             return;
         }
+        let webp = match (webp_path, webp_bytes) {
+            (Some(path), Some(encoded)) => Some(install_webp_copy(&path, encoded).await),
+            _ => None,
+        };
         let image_url = format!("/generated/{}/{}", job.run_id, job.filename);
         let source = display_path(&image);
         self.update_job(job_id, |job, now| {
@@ -1799,6 +1830,7 @@ impl GenerationRuntime {
             job.error_code = None;
             job.error_message = None;
             append_job_diagnostic(job, format!("[grok-imagine] source={source}"));
+            record_webp_copy(job, webp);
             job.timing.transition("done", now);
         })
         .await;
@@ -2112,6 +2144,7 @@ impl GenerationRuntime {
             job.status = "error".to_owned();
             job.status_text = format!("{error_message}; No output file was written");
             job.image_url = None;
+            job.webp_path = None;
             job.turn_id = turn_id;
             job.error_code = Some(error_code.to_owned());
             job.error_message = Some(error_message.to_owned());
@@ -2155,6 +2188,7 @@ impl GenerationRuntime {
             job.thread_id = None;
             job.turn_id = None;
             job.image_url = None;
+            job.webp_path = None;
             job.timing.completed_at = None;
             job.timing.execution_ms = None;
             job.timing.total_ms = None;
@@ -2406,6 +2440,7 @@ impl GenerationRuntime {
                     .unwrap_or("UpstreamImageGenerationFailed")
             ));
             job.image_url = None;
+            job.webp_path = None;
             job.timing.transition("error", now);
         })
         .await;
@@ -2471,14 +2506,17 @@ impl GenerationRuntime {
         let bytes = BASE64_STANDARD
             .decode(encoded)
             .map_err(|error| RunApiError::message(format!("invalid image result: {error}")))?;
+        let output_path = PathBuf::from(&job.output_path);
+        let webp_path = webp_copy_path(&output_path, &job.output_format);
         let output_format = job.output_format.clone();
-        let bytes = tokio::task::spawn_blocking(move || {
-            validate_generated_image_bytes(&bytes, &output_format)?;
-            Ok::<_, RunApiError>(bytes)
+        let wants_webp = webp_path.is_some();
+        let (bytes, webp_bytes) = tokio::task::spawn_blocking(move || {
+            let image = decode_generated_image(&bytes, &output_format)?;
+            let webp_bytes = wants_webp.then(|| encode_webp_copy(&image));
+            Ok::<_, RunApiError>((bytes, webp_bytes))
         })
         .await
         .map_err(|error| RunApiError::message(format!("image decoding failed: {error}")))??;
-        let output_path = PathBuf::from(&job.output_path);
         let temporary_path =
             output_path.with_extension(format!("{}.{}.tmp", job.output_format, Uuid::new_v4()));
         fs::write(&temporary_path, bytes)
@@ -2491,10 +2529,15 @@ impl GenerationRuntime {
         fs::rename(&temporary_path, &output_path)
             .await
             .map_err(|error| RunApiError::message(format!("could not install image: {error}")))?;
+        let webp = match (webp_path, webp_bytes) {
+            (Some(path), Some(encoded)) => Some(install_webp_copy(&path, encoded).await),
+            _ => None,
+        };
         let image_url = format!("/generated/{}/{}", job.run_id, job.filename);
         self.update_job_for_attempt(job_id, attempt_id, |job, _| {
             job.image_url = Some(image_url);
             job.status_text = "Image generated; waiting for turn completion...".to_owned();
+            record_webp_copy(job, webp);
         })
         .await;
         Ok(())
@@ -2716,6 +2759,7 @@ impl GenerationRuntime {
                 job.error_message
                     .get_or_insert_with(|| RUNTIME_CLOSED_MESSAGE.to_owned());
                 job.image_url = None;
+                job.webp_path = None;
                 append_job_diagnostic(job, format!("RuntimeClosed: {RUNTIME_CLOSED_MESSAGE}"));
                 job.timing.transition("error", now);
                 job.updated_at = now;
@@ -2754,19 +2798,78 @@ impl GenerationRuntime {
     }
 }
 
-fn validate_generated_image_bytes(bytes: &[u8], output_format: &str) -> Result<(), RunApiError> {
+fn decode_generated_image(
+    bytes: &[u8],
+    output_format: &str,
+) -> Result<image::DynamicImage, RunApiError> {
     let format = match output_format {
         "png" => Some(image::ImageFormat::Png),
         "jpg" | "jpeg" => Some(image::ImageFormat::Jpeg),
         "webp" => Some(image::ImageFormat::WebP),
         _ => None,
     };
-    if format.is_some_and(|format| image::load_from_memory_with_format(bytes, format).is_ok()) {
-        Ok(())
+    format
+        .and_then(|format| image::load_from_memory_with_format(bytes, format).ok())
+        .ok_or_else(|| {
+            RunApiError::message(format!(
+                "invalid image result: decoded data is not a valid {output_format} image"
+            ))
+        })
+}
+
+/// Quality of the lossy WebP copy written beside every PNG or JPEG output.
+const WEBP_COPY_QUALITY: f32 = 80.0;
+
+/// The WebP copy sits beside the original with the same stem
+/// (`variant-01.png` -> `variant-01.webp`). The original stays the job's
+/// output; outputs that are already WebP or SVG get no copy.
+fn webp_copy_path(output_path: &Path, output_format: &str) -> Option<PathBuf> {
+    matches!(output_format, "png" | "jpg" | "jpeg").then(|| output_path.with_extension("webp"))
+}
+
+fn encode_webp_copy(image: &image::DynamicImage) -> Result<Vec<u8>, String> {
+    let encoded = if image.color().has_alpha() {
+        let rgba = image.to_rgba8();
+        webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+            .encode_simple(false, WEBP_COPY_QUALITY)
     } else {
-        Err(RunApiError::message(format!(
-            "invalid image result: decoded data is not a valid {output_format} image"
-        )))
+        let rgb = image.to_rgb8();
+        webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height())
+            .encode_simple(false, WEBP_COPY_QUALITY)
+    };
+    encoded
+        .map(|memory| memory.to_vec())
+        .map_err(|error| format!("WebP encoding failed: {error:?}"))
+}
+
+async fn install_webp_copy(
+    path: &Path,
+    encoded: Result<Vec<u8>, String>,
+) -> Result<PathBuf, String> {
+    let bytes = encoded?;
+    let temporary_path = path.with_extension(format!("webp.{}.tmp", Uuid::new_v4()));
+    let installed = async {
+        fs::write(&temporary_path, &bytes).await?;
+        fs::rename(&temporary_path, path).await
+    }
+    .await;
+    if let Err(error) = installed {
+        let _ = fs::remove_file(&temporary_path).await;
+        return Err(format!("could not install WebP copy: {error}"));
+    }
+    Ok(path.to_path_buf())
+}
+
+/// A failed WebP copy leaves the original output done and is reported in the
+/// job's diagnostic log.
+fn record_webp_copy(job: &mut ImageGridJob, webp: Option<Result<PathBuf, String>>) {
+    match webp {
+        Some(Ok(path)) => job.webp_path = Some(display_path(&path)),
+        Some(Err(error)) => {
+            job.webp_path = None;
+            append_job_diagnostic(job, format!("[webp-copy] {error}"));
+        }
+        None => job.webp_path = None,
     }
 }
 
@@ -3110,6 +3213,11 @@ fn restore_persisted_output(
         image_url = None;
         normalized = true;
     }
+    let webp_path = webp_copy_path(&expected_output_path, &output.output_format)
+        .filter(|path| {
+            status == "done" && matches!(expected_file_state(path), ExpectedFileState::Regular)
+        })
+        .map(|path| display_path(&path));
 
     Some((
         ImageGridJob {
@@ -3127,6 +3235,7 @@ fn restore_persisted_output(
             total: output.total,
             filename: filename.to_owned(),
             output_path: display_path(&expected_output_path),
+            webp_path,
             aspect_ratio: output.aspect_ratio,
             reference_image_path: expected_reference_path.map(str::to_owned),
             reference_image_url: expected_reference_url.map(str::to_owned),
@@ -3545,6 +3654,7 @@ fn output_value(job: &ImageGridJob) -> Value {
         "filename": job.filename,
         "outputFormat": job.output_format,
         "outputPath": job.output_path,
+        "webpPath": job.webp_path,
         "imageUrl": job.image_url,
         "referenceImagePath": job.reference_image_path,
         "referenceImageUrl": job.reference_image_url,
@@ -3674,6 +3784,12 @@ fn build_handoff(run: &RunRecord, jobs: &[ImageGridJob], updated_at: i64) -> Str
                 output.image_url.as_deref().unwrap_or("not written yet")
             ),
         ]);
+        if webp_copy_path(Path::new(&output.output_path), &output.output_format).is_some() {
+            lines.push(format!(
+                "- WebP: {}",
+                output.webp_path.as_deref().unwrap_or("not written")
+            ));
+        }
         if let Some(code) = &output.error_code {
             lines.push(format!("- Error code: {code}"));
         }
@@ -4459,13 +4575,30 @@ mod tests {
 
     #[test]
     fn generated_png_requires_decodable_pixels_not_only_a_signature() {
-        assert!(validate_generated_image_bytes(b"\x89PNG\r\n\x1a\n", "png").is_err());
+        assert!(decode_generated_image(b"\x89PNG\r\n\x1a\n", "png").is_err());
         // Use the same complete PNG produced by the provider-free primary route.
         let png = BASE64_STANDARD.decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
         ).expect("PNG fixture");
-        assert!(validate_generated_image_bytes(&png[..33], "png").is_err());
-        validate_generated_image_bytes(&png, "png").expect("complete PNG");
+        assert!(decode_generated_image(&png[..33], "png").is_err());
+        decode_generated_image(&png, "png").expect("complete PNG");
+    }
+
+    #[test]
+    fn only_png_and_jpeg_outputs_get_a_webp_copy() {
+        let base = Path::new("/tmp/run/variant-01");
+        for (format, copy) in [
+            ("png", Some("/tmp/run/variant-01.webp")),
+            ("jpg", Some("/tmp/run/variant-01.webp")),
+            ("webp", None),
+            ("svg", None),
+        ] {
+            assert_eq!(
+                webp_copy_path(&base.with_extension(format), format),
+                copy.map(PathBuf::from),
+                "{format}"
+            );
+        }
     }
 
     fn svg_fixture_job(run_id: &str, output_path: &Path, now: i64) -> ImageGridJob {
@@ -4486,6 +4619,7 @@ mod tests {
             total: 2,
             filename: "variant-01.svg".to_owned(),
             output_path: display_path(output_path),
+            webp_path: None,
             aspect_ratio: "16:9".to_owned(),
             reference_image_path: None,
             reference_image_url: None,
@@ -4565,6 +4699,7 @@ mod tests {
             total: 2,
             filename: "variant-01.png".to_owned(),
             output_path: "/tmp/variant-01.png".to_owned(),
+            webp_path: None,
             aspect_ratio: "16:9".to_owned(),
             reference_image_path: None,
             reference_image_url: None,
@@ -4895,6 +5030,7 @@ done
             total: 1,
             filename: "variant-01.png".to_owned(),
             output_path: "/tmp/variant-01.png".to_owned(),
+            webp_path: None,
             aspect_ratio: "16:9".to_owned(),
             reference_image_path: None,
             reference_image_url: None,
@@ -4996,6 +5132,11 @@ done
         );
         assert!(
             output["outputPath"]
+                .as_str()
+                .is_some_and(|path| Path::new(path).is_file())
+        );
+        assert!(
+            output["webpPath"]
                 .as_str()
                 .is_some_and(|path| Path::new(path).is_file())
         );
@@ -5380,6 +5521,7 @@ done
             assert_eq!(job.error_code.as_deref(), Some("RuntimeClosed"));
             assert_eq!(job.error_message.as_deref(), Some(RUNTIME_CLOSED_MESSAGE));
             assert!(!Path::new(&job.output_path).exists());
+            assert!(!Path::new(&job.output_path).with_extension("webp").exists());
 
             let manifest_path = runtime
                 .inner
