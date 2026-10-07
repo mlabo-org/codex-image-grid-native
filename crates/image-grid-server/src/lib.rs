@@ -1790,6 +1790,17 @@ done
             manifest["outputs"][0]["outputPath"],
             run["outputs"][0]["outputPath"]
         );
+        // Every PNG output gets a lossy WebP copy beside it; the PNG stays the
+        // job's output.
+        let output_path = run["outputs"][0]["outputPath"].as_str().expect("PNG path");
+        let webp_path = run["outputs"][0]["webpPath"].as_str().expect("WebP path");
+        assert!(output_path.ends_with(".png"));
+        assert_eq!(webp_path, &format!("{}.webp", output_path.trim_end_matches(".png")));
+        assert_eq!(
+            image::guess_format(&fs::read(webp_path).expect("WebP copy bytes")).expect("format"),
+            image::ImageFormat::WebP
+        );
+        assert_eq!(manifest["outputs"][0]["webpPath"], webp_path);
 
         let handoff = fs::read_to_string(
             run["handoffPath"]
@@ -1799,6 +1810,7 @@ done
         .expect("persisted handoff");
         assert!(handoff.contains(&format!("- Reference image: {staged_path_display}")));
         assert!(handoff.contains("## Outputs"));
+        assert!(handoff.contains(&format!("- WebP: {webp_path}")));
         assert!(!unused_http_path.exists());
 
         // Existing runs lack operation entirely. They must remain readable as
@@ -1839,6 +1851,7 @@ done
             restored["outputs"][0]["referenceImagePath"],
             staged_path_display
         );
+        assert_eq!(restored["outputs"][0]["webpPath"], webp_path);
     }
 
     #[tokio::test]
@@ -2041,6 +2054,7 @@ done
             total: 1,
             filename: "variant-01.png".to_owned(),
             output_path: display_path(output_path),
+            webp_path: None,
             aspect_ratio: "16:9".to_owned(),
             reference_image_path: None,
             reference_image_url: None,

@@ -173,6 +173,7 @@
         "filename": { "type": "string" },
         "outputFormat": { "type": "string" },
         "outputPath": { "type": "string" },
+        "webpPath": { "$ref": "#/$defs/nullableString" },
         "imageUrl": { "$ref": "#/$defs/nullableString" },
         "referenceImagePath": { "$ref": "#/$defs/nullableString" },
         "referenceImageUrl": { "$ref": "#/$defs/nullableString" },

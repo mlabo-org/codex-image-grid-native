@@ -14,7 +14,7 @@
         "required": ["id", "promptIndex", "variant", "status", "outputPath", "imageUrl", "absoluteImageUrl", "codexMarkdown"],
         "properties": {
           "id": { "type": "string" }, "promptIndex": { "type": "integer" }, "variant": { "type": "integer" }, "status": { "const": "done" },
-          "outputPath": { "type": "string" }, "imageUrl": { "type": "string" }, "absoluteImageUrl": { "type": "string" }, "codexMarkdown": { "type": "string" }
+          "outputPath": { "type": "string" }, "webpPath": { "type": ["string", "null"] }, "imageUrl": { "type": "string" }, "absoluteImageUrl": { "type": "string" }, "codexMarkdown": { "type": "string" }
         }
       }
     }

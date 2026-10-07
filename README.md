@@ -191,6 +191,9 @@ A completed one-image call returns structured fields such as:
   "outputPaths": [
     "/Users/you/Library/Application Support/codex-image-grid/generated/<runId>/variant-01.png"
   ],
+  "webpPaths": [
+    "/Users/you/Library/Application Support/codex-image-grid/generated/<runId>/variant-01.webp"
+  ],
   "imageUrls": [
     "http://127.0.0.1:4322/generated/<runId>/variant-01.png"
   ],
@@ -205,6 +208,14 @@ Each run is saved under
 the generated files, `manifest.json`, `handoff.md`, and a staged reference
 image when one was supplied. If generation is still running when `waitMs`
 expires, use the returned `statusUrl` or `handoffPath` to follow the run.
+
+Every PNG or JPEG output also gets a lossy WebP copy (quality 80) beside it
+with the same name, for example `variant-01.webp`, for uploading to a web site.
+The PNG or JPEG stays the original: the app shows it, and `outputPaths` and
+`imageUrls` point to it. The copies are listed in `webpPaths`, in each output's
+`webpPath`, and in `handoff.md`. SVG output gets no copy. If a copy cannot be
+written, the original still completes and the failure appears in that output's
+`diagnosticLog`.
 
 ### Build and install manually
 
@@ -422,6 +433,9 @@ WebPファイルの絶対パスを指定します。SVGが必要な場合は`eng
   "outputPaths": [
     "/Users/you/Library/Application Support/codex-image-grid/generated/<runId>/variant-01.png"
   ],
+  "webpPaths": [
+    "/Users/you/Library/Application Support/codex-image-grid/generated/<runId>/variant-01.webp"
+  ],
   "imageUrls": [
     "http://127.0.0.1:4322/generated/<runId>/variant-01.png"
   ],
@@ -436,6 +450,12 @@ WebPファイルの絶対パスを指定します。SVGが必要な場合は`eng
 生成ファイル、`manifest.json`、`handoff.md`に加え、指定時は参照画像のコピーも含まれます。
 `waitMs`内に完了しなかった場合は、返された`statusUrl`または`handoffPath`から進行状況を
 確認できます。
+
+PNGやJPEGの出力には、Webサイトへのアップロード用に、同じ名前の非可逆WebP（画質80）が
+隣に保存されます（例：`variant-01.webp`）。原本はPNGやJPEGのままで、アプリの表示、
+`outputPaths`、`imageUrls`は原本を指します。WebPは`webpPaths`、各出力の`webpPath`、
+`handoff.md`に載ります。SVGの出力にはWebPを作りません。WebPを書き出せなかった場合も
+原本は完了扱いになり、失敗はその出力の`diagnosticLog`に記録されます。
 
 ### 手動ビルド・インストール
 

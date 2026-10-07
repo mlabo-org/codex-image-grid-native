@@ -73,5 +73,6 @@ choose an ad hoc image generator.
 ## Handoff
 
 Return the MCP result, generated paths, and handoff fields needed by the user
-or parent workflow. Report any tool or activation blocker without inventing a
+or parent workflow. Each PNG or JPEG output has a lossy WebP copy beside it for
+web upload, listed in `webpPaths`; the PNG or JPEG stays the original. Report any tool or activation blocker without inventing a
 replacement output contract.
