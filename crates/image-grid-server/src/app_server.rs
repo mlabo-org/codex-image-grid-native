@@ -468,6 +468,11 @@ impl AppServerClient {
             // runtime's MCP tool recursively instead of producing an image item.
             .arg("--disable")
             .arg("plugins")
+            // The user's Codex hooks serve interactive prompts, not this child's
+            // generated ones. A hook command the app may not open (a path under
+            // a privacy-protected folder) stalls every turn until it times out.
+            .arg("--disable")
+            .arg("hooks")
             .current_dir(workspace_dir)
             .env("NO_COLOR", "1")
             .stdin(Stdio::piped())
@@ -1233,6 +1238,8 @@ mod tests {
              test \"$1\" = \"app-server\" || exit 2\n\
              test \"$2\" = \"--disable\" || exit 3\n\
              test \"$3\" = \"plugins\" || exit 4\n\
+             test \"$4\" = \"--disable\" || exit 5\n\
+             test \"$5\" = \"hooks\" || exit 6\n\
              marker=\"{}\"\n\
              trap 'printf TERM > \"$marker\"; exit 0' TERM\n\
              printf READY > \"$marker\"\n\
