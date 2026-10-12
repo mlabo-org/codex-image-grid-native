@@ -1,4 +1,4 @@
-use crate::app_server::{AppServerBridge, RUNTIME_CLOSED_MESSAGE};
+use crate::app_server::{AppServerBridge, AppServerClient, RUNTIME_CLOSED_MESSAGE};
 use crate::{RuntimeConfig, RuntimeIdentity, SchedulerSnapshot};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -1418,6 +1418,21 @@ impl GenerationRuntime {
             .await;
             return AttemptOutcome::Failed;
         };
+        let outcome = self
+            .run_app_server_image_turn(job_id, attempt_id, &client, &thread_id)
+            .await;
+        client.unsubscribe_thread(&thread_id).await;
+        outcome
+    }
+
+    async fn run_app_server_image_turn(
+        &self,
+        job_id: &str,
+        attempt_id: &str,
+        client: &Arc<AppServerClient>,
+        thread_id: &str,
+    ) -> AttemptOutcome {
+        let thread_id = thread_id.to_owned();
         let mut notifications = client.subscribe_thread(&thread_id);
         if !self
             .update_job_for_attempt(job_id, attempt_id, |job, now| {
@@ -1891,6 +1906,17 @@ impl GenerationRuntime {
             .await;
             return;
         };
+        self.run_codex_svg_turn(job_id, &client, &thread_id).await;
+        client.unsubscribe_thread(&thread_id).await;
+    }
+
+    async fn run_codex_svg_turn(
+        &self,
+        job_id: &str,
+        client: &Arc<AppServerClient>,
+        thread_id: &str,
+    ) {
+        let thread_id = thread_id.to_owned();
         let mut notifications = client.subscribe_thread(&thread_id);
         self.update_job(job_id, |job, now| {
             job.thread_id = Some(thread_id.clone());
@@ -2453,11 +2479,14 @@ impl GenerationRuntime {
         let Some(job) = self.job(job_id).await else {
             return;
         };
-        let (Some(thread_id), Some(turn_id), Some(client)) = (
-            job.thread_id,
-            job.turn_id,
-            self.inner.app_server.current_client().await,
-        ) else {
+        let (Some(thread_id), Some(client)) =
+            (job.thread_id, self.inner.app_server.current_client().await)
+        else {
+            return;
+        };
+        // The timeout dropped the attempt future, so this path owns the release.
+        let Some(turn_id) = job.turn_id else {
+            client.unsubscribe_thread(&thread_id).await;
             return;
         };
         let result = client
@@ -2467,6 +2496,7 @@ impl GenerationRuntime {
                 Duration::from_secs(5),
             )
             .await;
+        client.unsubscribe_thread(&thread_id).await;
         self.update_job_for_attempt(job_id, attempt_id, move |job, _| match result {
             Ok(_) => append_job_diagnostic(job, "[turn/interrupt] app-server-image timeout"),
             Err(error) => append_job_diagnostic(
@@ -4873,6 +4903,10 @@ while IFS= read -r line; do
       ;;
     *'"method":"initialized"'*)
       ;;
+    *'"method":"thread/unsubscribe"'*)
+      id=${line#*'"id":'}
+      printf '{"id":%s,"result":{"status":"unsubscribed"}}\n' "${id%%,*}"
+      ;;
     *'"method":"thread/start"'*)
       printf '%s\n' '{"id":2,"result":{"thread":{"id":"svg-thread"}}}'
       ;;
@@ -5075,12 +5109,16 @@ while IFS= read -r line; do
       ;;
     *'"method":"initialized"'*)
       ;;
+    *'"method":"thread/unsubscribe"'*)
+      id=${line#*'"id":'}
+      printf '{"id":%s,"result":{"status":"unsubscribed"}}\n' "${id%%,*}"
+      ;;
     *'"method":"thread/start"'*)
       attempt=$((attempt + 1))
       if [ "$attempt" -eq 1 ]; then
         printf '%s\n' '{"id":2,"result":{"thread":{"id":"missing-thread-1"}}}'
       else
-        printf '%s\n' '{"id":4,"result":{"thread":{"id":"missing-thread-2"}}}'
+        printf '%s\n' '{"id":5,"result":{"thread":{"id":"missing-thread-2"}}}'
       fi
       ;;
     *'"method":"turn/start"'*)
@@ -5088,7 +5126,7 @@ while IFS= read -r line; do
         printf '%s\n' '{"id":3,"result":{"turn":{"id":"missing-turn-1"}}}'
         printf '%s\n' '{"method":"turn/completed","params":{"threadId":"missing-thread-1","turn":{"id":"missing-turn-1","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'
       else
-        printf '%s\n' '{"id":5,"result":{"turn":{"id":"missing-turn-2"}}}'
+        printf '%s\n' '{"id":6,"result":{"turn":{"id":"missing-turn-2"}}}'
         printf '%s\n' '{"method":"item/completed","params":{"threadId":"missing-thread-2","turnId":"missing-turn-2","completedAtMs":1,"item":{"type":"imageGeneration","id":"image-2","status":"completed","revisedPrompt":null,"result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}}'
         printf '%s\n' '{"method":"turn/completed","params":{"threadId":"missing-thread-2","turn":{"id":"missing-turn-2","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'
       fi
@@ -5154,6 +5192,10 @@ while IFS= read -r line; do
       ;;
     *'"method":"initialized"'*)
       ;;
+    *'"method":"thread/unsubscribe"'*)
+      id=${line#*'"id":'}
+      printf '{"id":%s,"result":{"status":"unsubscribed"}}\n' "${id%%,*}"
+      ;;
     *'"method":"thread/start"'*)
       printf '%s\n' '{"id":2,"result":{"thread":{"id":"empty-image-thread"}}}'
       ;;
@@ -5217,12 +5259,16 @@ while IFS= read -r line; do
       ;;
     *'"method":"initialized"'*)
       ;;
+    *'"method":"thread/unsubscribe"'*)
+      id=${line#*'"id":'}
+      printf '{"id":%s,"result":{"status":"unsubscribed"}}\n' "${id%%,*}"
+      ;;
     *'"method":"thread/start"'*)
       attempt=$((attempt + 1))
       if [ "$attempt" -eq 1 ]; then
         printf '%s\n' '{"id":2,"result":{"thread":{"id":"rate-thread-1"}}}'
       else
-        printf '%s\n' '{"id":4,"result":{"thread":{"id":"rate-thread-2"}}}'
+        printf '%s\n' '{"id":5,"result":{"thread":{"id":"rate-thread-2"}}}'
       fi
       ;;
     *'"method":"turn/start"'*)
@@ -5230,7 +5276,7 @@ while IFS= read -r line; do
         printf '%s\n' '{"id":3,"result":{"turn":{"id":"rate-turn-1"}}}'
         printf '%s\n' '{"method":"error","params":{"error":{"message":"Too many requests for image generation (429)","codexErrorInfo":{"responseTooManyFailedAttempts":{"httpStatusCode":429}},"additionalDetails":null},"willRetry":false,"threadId":"rate-thread-1","turnId":"rate-turn-1"}}'
       else
-        printf '%s\n' '{"id":5,"result":{"turn":{"id":"rate-turn-2"}}}'
+        printf '%s\n' '{"id":6,"result":{"turn":{"id":"rate-turn-2"}}}'
         printf '%s\n' '{"method":"item/completed","params":{"threadId":"rate-thread-2","turnId":"rate-turn-2","completedAtMs":1,"item":{"type":"imageGeneration","id":"image-2","status":"completed","revisedPrompt":null,"result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}}'
         printf '%s\n' '{"method":"turn/completed","params":{"threadId":"rate-thread-2","turn":{"id":"rate-turn-2","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":null,"completedAt":null,"durationMs":1}}}'
       fi
@@ -5290,6 +5336,10 @@ while IFS= read -r line; do
       ;;
     *'"method":"initialized"'*)
       ;;
+    *'"method":"thread/unsubscribe"'*)
+      id=${line#*'"id":'}
+      printf '{"id":%s,"result":{"status":"unsubscribed"}}\n' "${id%%,*}"
+      ;;
     *'"method":"thread/start"'*)
       printf '%s\n' '{"id":2,"result":{"thread":{"id":"timeout-thread"}}}'
       ;;
@@ -5341,6 +5391,10 @@ done
             "diagnostic={diagnostic:?}; requests={requests:?}"
         );
         assert!(requests.contains("\"method\":\"turn/interrupt\""));
+        assert_eq!(
+            requests.matches("\"method\":\"thread/unsubscribe\"").count(),
+            requests.matches("\"method\":\"thread/start\"").count()
+        );
         assert_eq!(runtime.scheduler_snapshot().active, 0);
     }
 
@@ -5358,6 +5412,10 @@ while IFS= read -r line; do
       printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
       ;;
     *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/unsubscribe"'*)
+      id=${line#*'"id":'}
+      printf '{"id":%s,"result":{"status":"unsubscribed"}}\n' "${id%%,*}"
       ;;
     *'"method":"thread/start"'*)
       printf '%s\n' '{"id":2,"result":{"thread":{"id":"shutdown-thread"}}}'

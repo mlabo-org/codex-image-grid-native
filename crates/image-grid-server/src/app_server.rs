@@ -17,6 +17,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 pub const APP_SERVER_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
+const THREAD_UNSUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const RUNTIME_CLOSED_MESSAGE: &str = "Codex Image Grid runtime closed";
 
 #[derive(Debug, Clone)]
@@ -594,6 +595,19 @@ impl AppServerClient {
             message["params"] = params;
         }
         self.write_message(&message).await
+    }
+
+    /// Releases a thread this client started. The App Server keeps a thread
+    /// loaded, together with the MCP server processes it started for that
+    /// thread, for as long as the thread has a subscriber.
+    pub(crate) async fn unsubscribe_thread(&self, thread_id: &str) {
+        let _ = self
+            .request(
+                "thread/unsubscribe",
+                json!({ "threadId": thread_id }),
+                THREAD_UNSUBSCRIBE_TIMEOUT,
+            )
+            .await;
     }
 
     pub(crate) fn subscribe_thread(&self, thread_id: &str) -> AppServerThreadNotifications {

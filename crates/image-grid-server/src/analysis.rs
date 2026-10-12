@@ -1,6 +1,7 @@
 use crate::RuntimeConfig;
 use crate::app_server::{
-    AppServerBridge, AppServerDiagnostics, AppServerThreadNotifications, RUNTIME_CLOSED_MESSAGE,
+    AppServerBridge, AppServerClient, AppServerDiagnostics, AppServerThreadNotifications,
+    RUNTIME_CLOSED_MESSAGE,
 };
 use axum::Json;
 use axum::http::StatusCode;
@@ -118,9 +119,22 @@ impl ReferenceAnalysisRuntime {
             .ok_or_else(|| AnalysisError::new("thread/start returned no thread id"))?
             .to_owned();
 
-        let mut notifications = client.subscribe_thread(&thread_id);
+        let result = self
+            .run_app_server_analysis_turn(&client, &thread_id, staged_path)
+            .await;
+        client.unsubscribe_thread(&thread_id).await;
+        result
+    }
+
+    async fn run_app_server_analysis_turn(
+        &self,
+        client: &Arc<AppServerClient>,
+        thread_id: &str,
+        staged_path: &Path,
+    ) -> Result<String, AnalysisError> {
+        let mut notifications = client.subscribe_thread(thread_id);
         let turn_client = client.clone();
-        let turn_thread_id = thread_id.clone();
+        let turn_thread_id = thread_id.to_owned();
         let turn_workspace = display_path(&self.config.workspace_dir);
         let local_image_path = display_path(staged_path);
         let mut turn_start = tokio::spawn(async move {

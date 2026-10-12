@@ -1120,6 +1120,10 @@ while IFS= read -r line; do
       ;;
     *'"method":"initialized"'*)
       ;;
+    *'"method":"thread/unsubscribe"'*)
+      id=${line#*'"id":'}
+      printf '{"id":%s,"result":{"status":"unsubscribed"}}\n' "${id%%,*}"
+      ;;
     *'"method":"thread/start"'*)
       printf '%s\n' '{"id":2,"result":{"thread":{"id":"fixture-thread"}}}'
       ;;
@@ -1310,6 +1314,10 @@ while IFS= read -r line; do
       printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
       ;;
     *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/unsubscribe"'*)
+      id=${line#*'"id":'}
+      printf '{"id":%s,"result":{"status":"unsubscribed"}}\n' "${id%%,*}"
       ;;
     *'"method":"thread/start"'*)
       printf '%s\n' '{"id":2,"result":{"thread":{"id":"fixture-thread"}}}'
@@ -1606,6 +1614,10 @@ while IFS= read -r line; do
       ;;
     *'"method":"initialized"'*)
       ;;
+    *'"method":"thread/unsubscribe"'*)
+      id=${line#*'"id":'}
+      printf '{"id":%s,"result":{"status":"unsubscribed"}}\n' "${id%%,*}"
+      ;;
     *'"method":"thread/start"'*)
       printf '%s\n' '{"id":2,"result":{"thread":{"id":"fixture-thread"}}}'
       ;;
@@ -1884,6 +1896,10 @@ while IFS= read -r line; do
       printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
       ;;
     *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/unsubscribe"'*)
+      id=${line#*'"id":'}
+      printf '{"id":%s,"result":{"status":"unsubscribed"}}\n' "${id%%,*}"
       ;;
     *'"method":"thread/start"'*)
       printf '%s\n' '{"id":2,"result":{"thread":{"id":"analysis-thread"}}}'
