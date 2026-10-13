@@ -76,6 +76,8 @@ The server owns the local runtime boundary:
 - SSE event stream for the web compatibility client;
 - health and preflight identity;
 - runtime data directory and graceful shutdown;
+- exit when the process that started the server has gone away, so a server
+  whose app crashed or was killed does not stay up with no owner;
 - optional Unix-domain-socket/native transport when that reduces UI coupling.
 
 ### Rust MCP
