@@ -53,6 +53,10 @@ printf '%s\n' \
   '      ;;' \
   '    *'"'"'"method":"initialized"'"'"'*)' \
   '      ;;' \
+  '    *'"'"'"method":"thread/unsubscribe"'"'"'*)' \
+  '      request_id="$(printf "%s" "$line" | jq --raw-output ".id")"' \
+  '      printf '"'"'{"id":%s,"result":{"status":"unsubscribed"}}\n'"'"' "$request_id"' \
+  '      ;;' \
   '    *'"'"'"method":"thread/start"'"'"'*)' \
   '      request_id="$(printf "%s" "$line" | jq --raw-output ".id")"' \
   '      service_name="$(printf "%s" "$line" | jq --raw-output ".params.serviceName // empty")"' \
