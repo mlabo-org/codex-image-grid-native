@@ -40,7 +40,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let signal_shutdown = shutdown.clone();
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = shutdown_signal().await;
+            if shutdown_signal().await == ShutdownSignal::ParentExited {
+                eprintln!("stopping: the process that started this server has exited");
+            }
             signal_shutdown.shutdown().await;
         })
         .await;
@@ -63,6 +65,25 @@ fn validate_loopback_bind(bind: SocketAddr) -> Result<(), String> {
 enum ShutdownSignal {
     Sigint,
     Sigterm,
+    ParentExited,
+}
+
+/// How often the server checks that the process that started it is still alive.
+const PARENT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Resolves once the process that started this server has exited, so a server
+/// whose app crashed or was killed does not stay up with no owner. A server
+/// started without a parent to follow (already adopted by launchd) never
+/// resolves here and keeps stopping only on signals.
+#[cfg(unix)]
+async fn parent_exited() {
+    let parent = std::os::unix::process::parent_id();
+    if parent == 1 {
+        return std::future::pending().await;
+    }
+    while std::os::unix::process::parent_id() == parent {
+        tokio::time::sleep(PARENT_CHECK_INTERVAL).await;
+    }
 }
 
 async fn shutdown_signal() -> ShutdownSignal {
@@ -79,6 +100,7 @@ async fn shutdown_signal() -> ShutdownSignal {
                     async {
                         let _ = terminate.recv().await;
                     },
+                    parent_exited(),
                 )
                 .await;
             }
@@ -96,14 +118,16 @@ async fn shutdown_signal() -> ShutdownSignal {
     }
 }
 
-async fn select_shutdown_signal<C, T>(ctrl_c: C, terminate: T) -> ShutdownSignal
+async fn select_shutdown_signal<C, T, P>(ctrl_c: C, terminate: T, parent_exited: P) -> ShutdownSignal
 where
     C: std::future::Future<Output = ()>,
     T: std::future::Future<Output = ()>,
+    P: std::future::Future<Output = ()>,
 {
     tokio::select! {
         _ = ctrl_c => ShutdownSignal::Sigint,
         _ = terminate => ShutdownSignal::Sigterm,
+        _ = parent_exited => ShutdownSignal::ParentExited,
     }
 }
 
@@ -244,12 +268,16 @@ mod tests {
     #[tokio::test]
     async fn shutdown_contract_maps_sigint_and_sigterm_to_the_same_runtime_boundary() {
         assert_eq!(
-            select_shutdown_signal(ready(()), pending()).await,
+            select_shutdown_signal(ready(()), pending(), pending()).await,
             ShutdownSignal::Sigint
         );
         assert_eq!(
-            select_shutdown_signal(pending(), ready(())).await,
+            select_shutdown_signal(pending(), ready(()), pending()).await,
             ShutdownSignal::Sigterm
+        );
+        assert_eq!(
+            select_shutdown_signal(pending(), pending(), ready(())).await,
+            ShutdownSignal::ParentExited
         );
     }
 
