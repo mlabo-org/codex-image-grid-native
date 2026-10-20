@@ -3967,17 +3967,21 @@ colors, and art style.",
         );
     }
     let mut sections = Vec::new();
+    // Grok draws with a reference through image_edit, which keeps the source
+    // figure unless told up front that only identity and outfit carry over.
+    if job.reference_image_path.is_some() {
+        sections.push(
+            "Use the reference image only for the character's identity (face, hair, makeup, \
+distinguishing marks) and outfit. Draw a completely new pose, camera angle, and composition as \
+described below; do not reuse the reference image's pose, framing, or background."
+                .to_owned(),
+        );
+    }
     if !job.reference_premise.is_empty() {
         sections.push(job.reference_premise.trim().to_owned());
     }
     sections.push(job.prompt.trim().to_owned());
     sections.push(format!("Overall mood: {}", mood_direction(&job.mood)));
-    if job.reference_image_path.is_some() {
-        sections.push(
-            "Keep the character from the reference image recognizable while creating a fresh composition."
-                .to_owned(),
-        );
-    }
     sections.join("\n\n")
 }
 
@@ -4832,8 +4836,11 @@ mod tests {
         assert!(with_reference.starts_with(
             "Call the image_edit tool exactly once with image = [\"/tmp/run/reference.png\"] and aspect_ratio = \"16:9\"."
         ));
-        assert!(with_reference.ends_with(
-            "Keep the character from the reference image recognizable while creating a fresh composition."
+        assert!(with_reference.contains(
+            "Prompt:\nUse the reference image only for the character's identity (face, hair, makeup, \
+distinguishing marks) and outfit. Draw a completely new pose, camera angle, and composition as \
+described below; do not reuse the reference image's pose, framing, or background.\n\n\
+Keep the round glasses and blue scarf.\n\nA calm SVG mascot"
         ));
 
         job.operation = ImageOperation::Edit;

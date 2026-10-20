@@ -40,6 +40,12 @@ quality is lower. When a result reports that Codex image generation is
 rate-limited, tell the user and offer Grok; do not rerun with `grok-imagine`
 until the user says so.
 
+With `grok-imagine`, a `generate` prompt whose pose matches the reference
+image's pose gets the reference figure back with only the background redrawn,
+so a camera-angle change alone does not take effect. To change the angle,
+describe a clearly different pose in the same prompt. Check hands and small
+facial marks on Grok output before handing it over.
+
 For CodexVideo, RelayPress, or another parent workflow, return the tool's
 generated paths and handoff to the caller that requested the visuals. The
 native SwiftUI app opens automatically through this route. Do not start, call,
