@@ -69,6 +69,12 @@ final class CodexImageGridApplicationDelegate: NSObject, NSApplicationDelegate {
         runtimeLifecycle.start()
     }
 
+    func applicationShouldTerminateAfterLastWindowClosed(
+        _ sender: NSApplication
+    ) -> Bool {
+        true
+    }
+
     func applicationShouldTerminate(
         _ sender: NSApplication
     ) -> NSApplication.TerminateReply {
