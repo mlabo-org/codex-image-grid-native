@@ -37,7 +37,7 @@ Codex・Claude Code向けのmacOSネイティブ画像生成ワークスペー�
 
 - macOS 14 or later
 - Apple Swift 6.3 toolchain
-- Rust 1.95 (selected automatically by `rust-toolchain.toml`)
+- Rust 1.99.1 (selected automatically by `rust-toolchain.toml`)
 - Codex CLI installed and signed in
 - `jq`, `rg`, `curl`, Xcode command-line tools, and internet access for the
   first dependency build
@@ -310,7 +310,7 @@ MIT. See [LICENSE](LICENSE).
 
 - macOS 14以降
 - Apple Swift 6.3ツールチェーン
-- Rust 1.95（`rust-toolchain.toml`で自動選択）
+- Rust 1.99.1（`rust-toolchain.toml`で自動選択）
 - インストール・サインイン済みのCodex CLI
 - `jq`、`rg`、`curl`、Xcode Command Line Tools
 - 初回の依存関係取得に使うインターネット接続
