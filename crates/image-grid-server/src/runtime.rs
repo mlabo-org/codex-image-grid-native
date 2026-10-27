@@ -3961,6 +3961,15 @@ fn output_extension(engine: &str) -> &'static str {
 /// Imagine tool call and carries the image prompt verbatim.
 fn build_grok_imagine_request(job: &ImageGridJob) -> String {
     let tool_call = match &job.reference_image_path {
+        // The Grok CLI's image_edit ignores aspect_ratio when given one image
+        // and honors it from two on, so a reference-guided generation lists
+        // its one reference twice. An edit keeps the single source, whose
+        // ratio it should preserve.
+        Some(reference) if job.operation == ImageOperation::Generate => format!(
+            "Call the image_edit tool exactly once with image = [{reference}, {reference}] and aspect_ratio = \"{}\".",
+            job.aspect_ratio,
+            reference = json!(reference)
+        ),
         Some(reference) => format!(
             "Call the image_edit tool exactly once with image = [{}] and aspect_ratio = \"{}\".",
             json!(reference),
@@ -4887,7 +4896,7 @@ mod tests {
         job.reference_image_path = Some("/tmp/run/reference.png".to_owned());
         let with_reference = build_grok_imagine_request(&job);
         assert!(with_reference.starts_with(
-            "Call the image_edit tool exactly once with image = [\"/tmp/run/reference.png\"] and aspect_ratio = \"16:9\"."
+            "Call the image_edit tool exactly once with image = [\"/tmp/run/reference.png\", \"/tmp/run/reference.png\"] and aspect_ratio = \"16:9\"."
         ));
         assert!(with_reference.contains(
             "Prompt:\nUse the reference image only for the character's identity (face, hair, makeup, \
@@ -4898,6 +4907,9 @@ Keep the round glasses and blue scarf.\n\nA calm SVG mascot"
 
         job.operation = ImageOperation::Edit;
         job.prompt = "Replace the burger with a crepe.".to_owned();
+        assert!(build_grok_imagine_request(&job).starts_with(
+            "Call the image_edit tool exactly once with image = [\"/tmp/run/reference.png\"] and aspect_ratio = \"16:9\"."
+        ));
         assert!(build_grok_image_prompt(&job).starts_with(
             "Replace the burger with a crepe.\n\nApply only this change to the source image."
         ));

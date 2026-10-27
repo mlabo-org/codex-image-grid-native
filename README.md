@@ -210,7 +210,9 @@ automatically.
 - Output is JPEG (`variant-01.jpg`), with the same WebP copy as other engines.
 - Without a reference image Grok uses `image_gen`; with one it uses
   `image_edit`. `aspectRatio`, `mood`, and `referencePremise` are passed to
-  Grok for generation.
+  Grok for generation. The CLI's `image_edit` ignores the aspect ratio when it
+  gets one image, so generation with a reference lists that image twice; an
+  edit sends its source once and keeps the source's ratio.
 - For generation with a reference, the reference supplies only the character's
   identity (face, hair, makeup, distinguishing marks) and outfit; Grok is asked
   to draw a new pose, camera angle, and composition. In practice, a prompt whose
@@ -484,7 +486,9 @@ Grokを使いたいときに選びます。`app-server-image`のジョブが上�
   探します。見つからない場合、ジョブは`GrokCliUnavailable`で失敗します。
 - 出力はJPEG（`variant-01.jpg`）で、ほかのエンジンと同じくWebPのコピーも作ります。
 - 参照画像がなければ`image_gen`、あれば`image_edit`で描きます。新規生成では
-  `aspectRatio`・`mood`・`referencePremise`もGrokに渡します。
+  `aspectRatio`・`mood`・`referencePremise`もGrokに渡します。CLIの`image_edit`は画像が
+  1枚だと縦横比の指定を無視するため、参照画像付きの新規生成では同じ参照画像を2枚として渡します。
+  編集では元画像を1枚だけ渡し、元画像の縦横比を保ちます。
 - 参照画像付きの新規生成では、参照画像から引き継ぐのは人物の特徴（顔・髪・化粧・目立つ印）と
   服装だけで、ポーズ・カメラの角度・構図は新しく描くようGrokに指示します。ただし実際には、
   プロンプトのポーズが参照画像のポーズと近いと、参照画像の人物がそのまま返り、背景だけが
