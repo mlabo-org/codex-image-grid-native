@@ -2079,7 +2079,7 @@ pub fn tool_record() -> Value {
                     "type": "string",
                     "enum": ["generate", "edit"],
                     "default": "generate",
-                    "description": "generate creates new images, optionally retaining reference-character traits. edit changes the supplied source image only as requested and preserves other details, style, composition and aspect ratio; requires referenceImagePath and app-server-image or grok-imagine. Each batch edit uses the same source independently."
+                    "description": "generate creates new images, optionally retaining reference-character traits. edit changes the supplied source image only as requested and preserves other details, style, composition and aspect ratio; requires referenceImagePath and app-server-image, grok-imagine-2, or grok-imagine. Each batch edit uses the same source independently."
                 },
                 "prompts": {
                     "type": "array",
