@@ -129,7 +129,8 @@ The following are public behavior and must remain stable at cutover:
 - SSE event names and payload meaning;
 - `app-server-image` and `codex-svg` engines (`grok-imagine` was added later
   as an opt-in engine that runs the local Grok CLI's Imagine tools and saves
-  JPEG output);
+  JPEG output; `grok-imagine-2` was added after that, the same route with the
+  CLI told to draw with Grok Imagine 2.0);
 - maximums: 12 prompts, 6 variants per prompt, 24 total jobs;
 - retry, timeout, rate-limit, missing-output, and diagnostic semantics;
 - manifest, handoff, generated image paths, and display-safe URLs (a lossy

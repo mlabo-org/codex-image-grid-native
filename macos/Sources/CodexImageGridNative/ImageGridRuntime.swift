@@ -51,7 +51,7 @@ enum ImageGridOperation: String, Codable, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
 
     func canSubmit(engine: String, referenceImagePath: String?) -> Bool {
-        self == .generate || (["app-server-image", "grok-imagine"].contains(engine)
+        self == .generate || (["app-server-image", "grok-imagine-2", "grok-imagine"].contains(engine)
             && !(referenceImagePath ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 }

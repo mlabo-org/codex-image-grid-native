@@ -35,16 +35,26 @@ const CODEX_SVG_CONCURRENCY: usize = 1;
 const GROK_IMAGINE_CONCURRENCY: usize = 4;
 const GROK_IMAGINE_MAX_TURNS: &str = "4";
 const GROK_IMAGINE_ATTEMPTS: u32 = 2;
-const ENGINES: [&str; 3] = ["app-server-image", "codex-svg", "grok-imagine"];
+/// The Imagine model the grok-imagine-2 engine asks the Grok CLI for. The CLI's
+/// own default (grok-imagine-image-quality) is what grok-imagine draws with.
+const GROK_IMAGINE_2_MODEL: &str = "grok-imagine-image-2.0";
+const ENGINES: [&str; 4] = [
+    "app-server-image",
+    "codex-svg",
+    "grok-imagine-2",
+    "grok-imagine",
+];
 const RATE_LIMIT_GROK_HINT: &str = "Codex image generation is rate-limited. Grok can draw these \
-prompts instead: rerun them with engine grok-imagine if the user wants Grok (lower quality).";
+prompts instead: rerun them with engine grok-imagine-2 (Grok Imagine 2.0) or grok-imagine (the \
+older Grok model) if the user wants Grok.";
 
-const MOODS: [&str; 5] = [
+const MOODS: [&str; 6] = [
     "warm-mascot",
     "clean-thumbnail",
     "editorial-soft",
     "cinematic",
     "minimal-product",
+    "none",
 ];
 const ASPECT_RATIOS: [&str; 5] = ["16:9", "4:3", "1:1", "3:4", "9:16"];
 
@@ -835,6 +845,7 @@ impl GenerationRuntime {
             let model = match request.engine.as_str() {
                 "app-server-image" => "app-server-image",
                 "grok-imagine" => "grok-imagine",
+                "grok-imagine-2" => GROK_IMAGINE_2_MODEL,
                 _ => "codex-app-server",
             }
             .to_owned();
@@ -962,7 +973,7 @@ impl GenerationRuntime {
 
         for job in &created {
             let is_svg = job.engine == "codex-svg";
-            let is_grok = job.engine == "grok-imagine";
+            let is_grok = is_grok_engine(&job.engine);
             if !is_svg {
                 self.inner.queued_jobs.fetch_add(1, Ordering::Relaxed);
             }
@@ -1255,7 +1266,7 @@ impl GenerationRuntime {
         };
         match job.engine.as_str() {
             "codex-svg" => self.run_codex_svg_job(job_id).await,
-            "grok-imagine" => self.run_grok_imagine_job(job_id).await,
+            "grok-imagine" | "grok-imagine-2" => self.run_grok_imagine_job(job_id).await,
             _ => self.run_app_server_image_job_with_retries(job_id).await,
         }
     }
@@ -1680,6 +1691,11 @@ impl GenerationRuntime {
             .await;
 
             let mut command = tokio::process::Command::new(&grok);
+            if job.engine == "grok-imagine-2" {
+                command
+                    .env("GROK_IMAGE_GEN_MODEL_OVERRIDE", GROK_IMAGINE_2_MODEL)
+                    .env("GROK_IMAGE_EDIT_MODEL_OVERRIDE", GROK_IMAGINE_2_MODEL);
+            }
             command
                 .arg("--single")
                 .arg(build_grok_imagine_request(&job))
@@ -3159,7 +3175,7 @@ fn restore_persisted_output(
         .and_then(|extension| extension.to_str())?;
     let extension_matches_engine = match output.engine.as_str() {
         "codex-svg" => extension == "svg",
-        "grok-imagine" => extension == "jpg",
+        "grok-imagine" | "grok-imagine-2" => extension == "jpg",
         _ => matches!(extension, "png" | "jpg" | "jpeg" | "webp"),
     };
     if !extension_matches_engine || output.output_format != extension {
@@ -3888,7 +3904,9 @@ Editing requirements:\n\
             job.prompt
         );
     }
-    let mood = mood_direction(&job.mood);
+    let mood = mood_direction(&job.mood)
+        .map(|mood| format!("Overall mood:\n{mood}\n\n"))
+        .unwrap_or_default();
     let reference = if job.reference_image_path.is_some() {
         "Use the attached local reference image as the visual identity anchor for the character, while creating a fresh composition."
     } else {
@@ -3911,7 +3929,7 @@ Editing requirements:\n\
         "Use the image generation tool to create exactly one polished thumbnail image.\n\n\
 Reference premise:\n{premise}\n\n\
 User concept:\n{}\n\n\
-Overall mood:\n{mood}\n\n\
+{mood}\
 Reference image:\n{reference}\n\n\
 Batch position:\n{prompt_label}\n\n\
 Composition requirements:\n\
@@ -3927,10 +3945,14 @@ Composition requirements:\n\
     )
 }
 
+fn is_grok_engine(engine: &str) -> bool {
+    matches!(engine, "grok-imagine" | "grok-imagine-2")
+}
+
 fn output_extension(engine: &str) -> &'static str {
     match engine {
         "codex-svg" => "svg",
-        "grok-imagine" => "jpg",
+        "grok-imagine" | "grok-imagine-2" => "jpg",
         _ => "png",
     }
 }
@@ -3981,7 +4003,9 @@ described below; do not reuse the reference image's pose, framing, or background
         sections.push(job.reference_premise.trim().to_owned());
     }
     sections.push(job.prompt.trim().to_owned());
-    sections.push(format!("Overall mood: {}", mood_direction(&job.mood)));
+    if let Some(mood) = mood_direction(&job.mood) {
+        sections.push(format!("Overall mood: {mood}"));
+    }
     sections.join("\n\n")
 }
 
@@ -4068,7 +4092,9 @@ fn truncate_chars(text: &str, limit: usize) -> String {
 }
 
 fn build_svg_prompt(job: &ImageGridJob) -> String {
-    let mood = mood_direction(&job.mood);
+    let mood = mood_direction(&job.mood)
+        .map(|mood| format!("Style direction:\n{mood}\n\n"))
+        .unwrap_or_default();
     let premise = if job.reference_premise.is_empty() {
         "No analyzed reference premise is provided."
     } else {
@@ -4087,7 +4113,7 @@ fn build_svg_prompt(job: &ImageGridJob) -> String {
 Write the SVG to this exact absolute path:\n{}\n\n\
 User concept:\n{}\n\n\
 Reference premise:\n{premise}\n\n\
-Style direction:\n{mood}\n\n\
+{mood}\
 Batch position:\n{prompt_label}\n\n\
 Hard requirements:\n\
 - Create exactly one valid SVG file at the path above.\n\
@@ -4102,8 +4128,10 @@ Hard requirements:\n\
     )
 }
 
-fn mood_direction(mood: &str) -> &'static str {
-    match mood {
+/// The style line for a mood; `none` adds no style line to the prompt.
+fn mood_direction(mood: &str) -> Option<&'static str> {
+    let direction = match mood {
+        "none" => return None,
         "clean-thumbnail" => {
             "clean Japanese thumbnail, crisp focal subject, readable composition, bright but restrained accents, creator-friendly polish"
         }
@@ -4119,7 +4147,8 @@ fn mood_direction(mood: &str) -> &'static str {
         _ => {
             "warm anime blog mascot portrait, soft desk lighting, charming and wholesome, gentle expression, polished illustration"
         }
-    }
+    };
+    Some(direction)
 }
 
 fn append_job_diagnostic(job: &mut ImageGridJob, entry: impl Into<String>) {
@@ -4763,9 +4792,17 @@ mod tests {
         assert!(prompt.starts_with(
             "Use the image generation tool to create exactly one polished thumbnail image."
         ));
+        assert!(prompt.contains("Overall mood:\nwarm anime blog mascot portrait"));
         assert!(prompt.contains("Batch position:\nVariant 1 of 2"));
         assert!(prompt.contains("Target aspect ratio: 16:9."));
         assert!(prompt.ends_with("- Do not ask follow-up questions.\n"));
+
+        let mut without_mood = job;
+        without_mood.mood = "none".to_owned();
+        let prompt = build_image_prompt(&without_mood);
+        assert!(!prompt.contains("Overall mood"));
+        assert!(prompt.contains("User concept:\nA calm mascot\n\nReference image:"));
+        assert!(!build_svg_prompt(&without_mood).contains("Style direction"));
     }
 
     #[test]
@@ -4830,6 +4867,22 @@ mod tests {
         assert!(generate.contains(
             "Prompt:\nKeep the round glasses and blue scarf.\n\nA calm SVG mascot\n\nOverall mood: "
         ));
+
+        let grok_2 = normalize_request(
+            &json!({"prompts": ["A mascot on a sofa"], "engine": "grok-imagine-2", "mood": "none"}),
+            true,
+            None,
+        )
+        .expect("normalized grok 2.0 request");
+        assert_eq!(grok_2.engine, "grok-imagine-2");
+        assert_eq!(grok_2.mood, "none");
+        assert_eq!(output_extension("grok-imagine-2"), "jpg");
+        job.mood = "none".to_owned();
+        assert!(
+            build_grok_imagine_request(&job)
+                .ends_with("Prompt:\nKeep the round glasses and blue scarf.\n\nA calm SVG mascot")
+        );
+        job.mood = "warm-mascot".to_owned();
 
         job.reference_image_path = Some("/tmp/run/reference.png".to_owned());
         let with_reference = build_grok_imagine_request(&job);

@@ -10,6 +10,13 @@ import Foundation
         "editorial-soft",
         "cinematic",
         "minimal-product",
+        "none",
+    ])
+    #expect(ImageEngine.allCases.map(\.rawValue) == [
+        "app-server-image",
+        "codex-svg",
+        "grok-imagine-2",
+        "grok-imagine",
     ])
     #expect(AspectRatio.allCases.map(\.rawValue) == ["16:9", "4:3", "1:1", "3:4", "9:16"])
     #expect(ResultLimit.allCases.map(\.rawValue) == ["6", "12", "24", "48", "96", "all"])

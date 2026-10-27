@@ -1990,12 +1990,18 @@ fn validate_tool_arguments(arguments: &Value) -> Result<(), String> {
             "editorial-soft",
             "cinematic",
             "minimal-product",
+            "none",
         ],
     )?;
     validate_enum(
         arguments,
         "engine",
-        &["app-server-image", "codex-svg", "grok-imagine"],
+        &[
+            "app-server-image",
+            "codex-svg",
+            "grok-imagine-2",
+            "grok-imagine",
+        ],
     )?;
     validate_enum(
         arguments,
@@ -2095,21 +2101,22 @@ pub fn tool_record() -> Value {
                 },
                 "mood": {
                     "type": "string",
-                    "description": "Generation-only mood. Ignored for edit, which preserves source style unless the prompt requests a change.",
+                    "description": "Generation-only mood. none adds no style direction, so the prompt alone sets the look. Ignored for edit, which preserves source style unless the prompt requests a change.",
                     "enum": [
                         "warm-mascot",
                         "clean-thumbnail",
                         "editorial-soft",
                         "cinematic",
-                        "minimal-product"
+                        "minimal-product",
+                        "none"
                     ],
                     "default": "warm-mascot"
                 },
                 "engine": {
                     "type": "string",
-                    "enum": ["app-server-image", "codex-svg", "grok-imagine"],
+                    "enum": ["app-server-image", "codex-svg", "grok-imagine-2", "grok-imagine"],
                     "default": "app-server-image",
-                    "description": "app-server-image draws with Codex image generation. codex-svg writes SVG. grok-imagine draws with the local Grok CLI's Imagine tools and is lower quality; use it only when the user asks for Grok."
+                    "description": "app-server-image draws with Codex image generation. codex-svg writes SVG. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style. Use a Grok engine only when the user asks for Grok; prefer grok-imagine-2 unless they ask for the older model."
                 },
                 "aspectRatio": {
                     "type": "string",
@@ -2139,7 +2146,7 @@ pub fn tool_record() -> Value {
                     "if": {"required": ["operation"], "properties": {"operation": {"const": "edit"}}},
                     "then": {"required": ["referenceImagePath"], "properties": {
                         "referenceImagePath": {"minLength": 1, "pattern": "\\S"},
-                        "engine": {"enum": ["app-server-image", "grok-imagine"]}
+                        "engine": {"enum": ["app-server-image", "grok-imagine-2", "grok-imagine"]}
                     }}
                 },
                 conditional_prompt_limit(1, 12),
@@ -2705,7 +2712,7 @@ skipped PATH=(none): PATH is unavailable."
             rule["if"]["properties"]["operation"]["const"] == "edit"
                 && rule["then"]["required"] == json!(["referenceImagePath"])
                 && rule["then"]["properties"]["engine"]["enum"]
-                    == json!(["app-server-image", "grok-imagine"])
+                    == json!(["app-server-image", "grok-imagine-2", "grok-imagine"])
         }));
         for (arguments, expected) in [
             (
@@ -2718,7 +2725,7 @@ skipped PATH=(none): PATH is unavailable."
             ),
             (
                 json!({"prompts": ["replace burger"], "operation": "edit", "engine": "codex-svg", "referenceImagePath": "/not/read.png"}),
-                "edit requires the app-server-image or grok-imagine engine",
+                "edit requires the app-server-image, grok-imagine-2, or grok-imagine engine",
             ),
             (
                 json!({"prompts": ["replace burger"], "operation": "edti"}),

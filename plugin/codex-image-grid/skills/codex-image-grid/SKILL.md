@@ -34,13 +34,15 @@ instructions. For edits, the tool schema documents which generation settings
 are ignored. Preserve batch intent: each prompt and variant edits the supplied
 source independently. To edit a preceding result, supply that result's path.
 
-Leave `engine` at its default unless the user names one. Use `grok-imagine`
-only when the user asks for Grok: it draws through the local Grok CLI and its
-quality is lower. When a result reports that Codex image generation is
-rate-limited, tell the user and offer Grok; do not rerun with `grok-imagine`
-until the user says so.
+Leave `engine` at its default unless the user names one. Use a Grok engine
+only when the user asks for Grok; both draw through the local Grok CLI.
+`grok-imagine-2` draws with Grok Imagine 2.0, the web version's style, and is
+the one to use when the user just says Grok. `grok-imagine` is the CLI's older
+default model; use it only when the user asks for the older model. When a
+result reports that Codex image generation is rate-limited, tell the user and
+offer Grok; do not rerun with a Grok engine until the user says so.
 
-With `grok-imagine`, a `generate` prompt whose pose matches the reference
+With a Grok engine, a `generate` prompt whose pose matches the reference
 image's pose gets the reference figure back with only the background redrawn,
 so a camera-angle change alone does not take effect. To change the angle,
 describe a clearly different pose in the same prompt. Check hands and small

@@ -21,12 +21,12 @@
     },
     "mood": {
       "type": "string",
-      "enum": ["warm-mascot", "clean-thumbnail", "editorial-soft", "cinematic", "minimal-product"],
+      "enum": ["warm-mascot", "clean-thumbnail", "editorial-soft", "cinematic", "minimal-product", "none"],
       "default": "warm-mascot"
     },
     "engine": {
       "type": "string",
-      "enum": ["app-server-image", "codex-svg", "grok-imagine"],
+      "enum": ["app-server-image", "codex-svg", "grok-imagine-2", "grok-imagine"],
       "default": "app-server-image"
     },
     "aspectRatio": {

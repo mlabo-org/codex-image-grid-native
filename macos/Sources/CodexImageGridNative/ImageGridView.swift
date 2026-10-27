@@ -39,6 +39,7 @@ enum ImageMood: String, CaseIterable, Identifiable {
     case editorialSoft = "editorial-soft"
     case cinematic
     case minimalProduct = "minimal-product"
+    case noMood = "none"
 
     var id: String { rawValue }
 }
@@ -46,6 +47,7 @@ enum ImageMood: String, CaseIterable, Identifiable {
 enum ImageEngine: String, CaseIterable, Identifiable {
     case appServerImage = "app-server-image"
     case codexSvg = "codex-svg"
+    case grokImagine2 = "grok-imagine-2"
     case grokImagine = "grok-imagine"
 
     var id: String { rawValue }
@@ -1122,7 +1124,7 @@ struct ImageGridStrings {
         localized("変更したい箇所を指示してください。指定しない構図・画風・縦横比は元画像を維持します。雰囲気・縦横比・キャラクター解析の設定は使いません。複数枚は同じ元画像をそれぞれ編集します。", "Describe the changes. Composition, style, and aspect ratio stay as in the source unless requested. Mood, aspect ratio, and character analysis settings are not applied. Each result edits the same source independently.")
     }
     var editReferenceHelp: String {
-        localized("編集する元画像を添付し、エンジンに App Server Image か Grok Imagine を選択してください。", "Attach the source image and select the App Server Image or Grok Imagine engine.")
+        localized("編集する元画像を添付し、エンジンに App Server Image か Grok Imagine（2.0・旧モデル）を選択してください。", "Attach the source image and select the App Server Image or a Grok Imagine engine (2.0 or older model).")
     }
     var mood: String { localized("雰囲気", "Mood") }
     var engine: String { localized("エンジン", "Engine") }
@@ -1316,6 +1318,8 @@ struct ImageGridStrings {
             localized("シネマ調", "Cinematic")
         case .minimalProduct:
             localized("ミニマルな商品写真風", "Minimal product")
+        case .noMood:
+            localized("なし", "None")
         }
     }
 
@@ -1325,8 +1329,10 @@ struct ImageGridStrings {
             "App Server Image"
         case .codexSvg:
             "Codex SVG"
+        case .grokImagine2:
+            "Grok Imagine 2.0"
         case .grokImagine:
-            "Grok Imagine"
+            localized("Grok Imagine（旧モデル）", "Grok Imagine (older model)")
         }
     }
 
@@ -1353,10 +1359,16 @@ struct ImageGridStrings {
     }
 
     func readyMessage(engine: ImageEngine) -> String {
+        if engine == .grokImagine2 {
+            return localized(
+                "Grok CLI経由で、Grok Imagine 2.0（Web版の2.0と同じ系統の画風）で画像を生成できます。",
+                "Ready to generate images with Grok Imagine 2.0 through the Grok CLI (the same style family as the web version's 2.0)."
+            )
+        }
         if engine == .grokImagine {
             return localized(
-                "Grok CLIのImagineで画像を生成できます（App Server Imageより品質は下がります）。",
-                "Ready to generate images with Grok CLI Imagine (lower quality than App Server Image)."
+                "Grok CLIの旧モデルで画像を生成できます（線の太いセル画調になります）。",
+                "Ready to generate images with the Grok CLI's older model (bold-line cel style)."
             )
         }
         if engine == .codexSvg {

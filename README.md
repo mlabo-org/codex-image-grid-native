@@ -5,12 +5,12 @@ SwiftUI. It provides Prompt Batch generation and editing, reference-image analys
 Japanese/English UI, light/dark themes, run history, and artifact handoff
 through the `codex_image_grid/generate_image_grid` MCP tool. Images are drawn
 with Codex image generation by default, as SVG with `codex-svg`, or with Grok
-Imagine through the local Grok CLI.
+Imagine (2.0 or the older model) through the local Grok CLI.
 
 Codex・Claude Code向けのmacOSネイティブ画像生成ワークスペースです。RustとSwiftUIで
 実装され、Prompt Batchでの生成・編集、参照画像解析、日英UI、ライト/ダークテーマ、
 生成履歴、成果物の受け渡しに対応しています。画像は既定でCodexの画像生成で描き、
-`codex-svg`ではSVGで、ローカルのGrok CLIを通してGrok Imagineでも描けます。
+`codex-svg`ではSVGで、ローカルのGrok CLIを通してGrok Imagine（2.0・旧モデル）でも描けます。
 
 [English](#english) · [日本語](#日本語)
 
@@ -42,7 +42,7 @@ Codex・Claude Code向けのmacOSネイティブ画像生成ワークスペー�
 - `jq`, `rg`, `curl`, Xcode command-line tools, and internet access for the
   first dependency build
 - Optional: the Grok CLI (`grok`), installed and signed in, for the
-  `grok-imagine` engine
+  `grok-imagine-2` and `grok-imagine` engines
 
 The default generated-image route uses `codex app-server`, so the active Codex
 account must have access to image generation.
@@ -127,7 +127,7 @@ image jobs in the same run.
 
 | Route | Best for |
 | --- | --- |
-| Native SwiftUI app | Editing Prompt Batches interactively, choosing the engine (App Server Image, Codex SVG, or Grok Imagine), choosing a reference image with the macOS file picker, and watching progress or run history. |
+| Native SwiftUI app | Editing Prompt Batches interactively, choosing the engine (App Server Image, Codex SVG, Grok Imagine 2.0, or the older Grok Imagine model), choosing a reference image with the macOS file picker, and watching progress or run history. |
 | Codex or Claude Code/MCP | Generating from a Codex task or Claude Code session, passing project-specific prompts or local reference files, and handing absolute artifact paths to another workflow. |
 
 Calling the MCP tool also opens the native app, so both routes use the same
@@ -158,14 +158,18 @@ For generation, only `prompts` is required. A batch may contain up to 12 prompts
 variants per prompt, with at most 24 image jobs in total
 (`prompts.length * count`). `referenceImagePath`, when supplied, must be an
 absolute path to a local PNG, JPEG, or WebP file no larger than 100 MiB. Use
-`engine: "codex-svg"` for SVG output, or `engine: "grok-imagine"` for Grok
-Imagine (see below). `waitMs` may be from 0 through 120,000.
+`engine: "codex-svg"` for SVG output, or `engine: "grok-imagine-2"` or
+`"grok-imagine"` for Grok Imagine (see below). `waitMs` may be from 0 through
+120,000.
+
+`mood` adds a style line to the prompt (`warm-mascot` by default).
+`mood: "none"` adds no style line, so the prompt alone sets the look.
 
 `operation` defaults to `generate`, preserving existing character-reference
 workflows such as creating different article illustrations featuring one mascot.
 For partial changes to an existing image, use `operation: "edit"` and supply
 the source as `referenceImagePath` with `engine: "app-server-image"` (or
-`"grok-imagine"`):
+`"grok-imagine-2"` or `"grok-imagine"`):
 
 ```json
 {
@@ -183,14 +187,22 @@ from the same supplied source; for a sequential edit, pass the preceding output
 as the next source. The native app offers the same Generate/Edit choice.
 Results and saved runs include `operation`; older runs default to `generate`.
 
-#### Grok Imagine engine
+#### Grok Imagine engines
 
-`engine: "grok-imagine"` draws through the local Grok CLI's Imagine tools
-instead of Codex image generation. Its quality is lower, so use it only when
-Grok is wanted, for example while Codex image generation is rate-limited. When
-an `app-server-image` job fails on a rate limit, its error message says so and
-suggests rerunning the prompts with `grok-imagine`; the engine is never
-switched automatically.
+`engine: "grok-imagine-2"` and `engine: "grok-imagine"` draw through the local
+Grok CLI's Imagine tools instead of Codex image generation. Use them when Grok
+is wanted, for example while Codex image generation is rate-limited. When an
+`app-server-image` job fails on a rate limit, its error message says so and
+suggests rerunning the prompts with a Grok engine; the engine is never switched
+automatically.
+
+- `grok-imagine-2` asks the CLI for Grok Imagine 2.0 (`grok-imagine-image-2.0`)
+  by setting `GROK_IMAGE_GEN_MODEL_OVERRIDE` and `GROK_IMAGE_EDIT_MODEL_OVERRIDE`.
+  Its style matches the web version's Imagine 2.0. Output stays 1024×1024 for
+  1:1.
+- `grok-imagine` uses the CLI's own default model
+  (`grok-imagine-image-quality` in Grok CLI 1.0.62), which draws in a flatter,
+  bold-line cel style.
 
 - The CLI is looked up in `IMAGE_GRID_GROK_BIN`, `~/.local/bin/grok`,
   `~/.grok/bin/grok`, and then `PATH`. The job fails with `GrokCliUnavailable`
@@ -207,7 +219,7 @@ switched automatically.
   the angle. Check hands and small facial marks on Grok output.
 - For `operation: "edit"`, Grok applies only the requested change and is asked
   to keep everything else.
-- Up to four Grok jobs run at the same time. If Grok replies with text instead
+- Up to four Grok jobs (both engines together) run at the same time. If Grok replies with text instead
   of calling the Imagine tool, the job is retried once in a fresh session.
 
 A completed one-image call returns structured fields such as:
@@ -314,7 +326,7 @@ MIT. See [LICENSE](LICENSE).
 - インストール・サインイン済みのCodex CLI
 - `jq`、`rg`、`curl`、Xcode Command Line Tools
 - 初回の依存関係取得に使うインターネット接続
-- 任意：`grok-imagine`エンジンを使う場合は、インストール・ログイン済みのGrok CLI（`grok`）
+- 任意：`grok-imagine-2`・`grok-imagine`エンジンを使う場合は、インストール・ログイン済みのGrok CLI（`grok`）
 
 既定の画像生成は`codex app-server`を使用します。利用中のCodexアカウントで画像生成が
 使える必要があります。
@@ -397,7 +409,7 @@ scripts/bootstrap-codex.sh --force
 
 | 利用方法 | 適している場面 |
 | --- | --- |
-| ネイティブSwiftUIアプリ | Prompt Batchを画面で調整する、エンジン（App Server Image・Codex SVG・Grok Imagine）を選ぶ、macOSのファイル選択から参照画像を指定する、進行状況や生成履歴を確認する場合 |
+| ネイティブSwiftUIアプリ | Prompt Batchを画面で調整する、エンジン（App Server Image・Codex SVG・Grok Imagine 2.0・Grok Imagine旧モデル）を選ぶ、macOSのファイル選択から参照画像を指定する、進行状況や生成履歴を確認する場合 |
 | Codex・Claude Code/MCP | CodexタスクやClaude Codeセッションの文脈から生成する、プロジェクト固有のプロンプトやローカル参照ファイルを渡す、絶対パス付きの成果物を別工程へ引き渡す場合 |
 
 MCPから呼び出した場合もネイティブアプリが開き、両方の経路が同じローカルランタイムと
@@ -428,13 +440,16 @@ MCPから呼び出した場合もネイティブアプリが開き、両方の�
 6バリエーションを指定でき、合計24画像ジョブまでです
 (`prompts.length * count`)。`referenceImagePath`には、100 MiB以下のローカルPNG・JPEG・
 WebPファイルの絶対パスを指定します。SVGが必要な場合は`engine: "codex-svg"`を、
-Grok Imagineで描く場合は`engine: "grok-imagine"`を使用します（後述）。
+Grok Imagineで描く場合は`engine: "grok-imagine-2"`か`"grok-imagine"`を使用します（後述）。
 `waitMs`には0から120,000までを指定できます。
+
+`mood`は、プロンプトに雰囲気の指定を1行足します（既定は`warm-mascot`）。
+`mood: "none"`では何も足さず、プロンプトだけで画風が決まります。
 
 `operation`を省略すると従来どおり`generate`になります。じぴこのベース画像から
 特徴を引き継いで各H2の新しい場面を作る、といった参照生成はそのまま使えます。
 元画像の一部を変更する場合は`operation: "edit"`にし、`referenceImagePath`に元画像を指定します。
-編集のエンジンは`app-server-image`か`grok-imagine`です。
+編集のエンジンは`app-server-image`・`grok-imagine-2`・`grok-imagine`のいずれかです。
 
 ```json
 {
@@ -453,10 +468,17 @@ Grok Imagineで描く場合は`engine: "grok-imagine"`を使用します（後�
 
 #### Grok Imagineエンジン
 
-`engine: "grok-imagine"`は、Codexの画像生成の代わりに、ローカルのGrok CLIのImagineで描きます。
-品質は下がるので、Codexの画像生成が上限に当たったときなど、Grokを使いたいときだけ選びます。
-`app-server-image`のジョブが上限で失敗したときは、エラーメッセージにその旨と
-`grok-imagine`での再実行の案内が出ます。エンジンが自動で切り替わることはありません。
+`engine: "grok-imagine-2"`と`engine: "grok-imagine"`は、Codexの画像生成の代わりに、
+ローカルのGrok CLIのImagineで描きます。Codexの画像生成が上限に当たったときなど、
+Grokを使いたいときに選びます。`app-server-image`のジョブが上限で失敗したときは、
+エラーメッセージにその旨とGrokエンジンでの再実行の案内が出ます。エンジンが自動で
+切り替わることはありません。
+
+- `grok-imagine-2`は、`GROK_IMAGE_GEN_MODEL_OVERRIDE`と`GROK_IMAGE_EDIT_MODEL_OVERRIDE`を
+  設定して、Grok Imagine 2.0（`grok-imagine-image-2.0`）で描くようCLIに指定します。
+  画風はWeb版のImagine 2.0と同じ系統です。1:1の出力は1024×1024のままです。
+- `grok-imagine`は、CLIの既定のモデル（Grok CLI 1.0.62では`grok-imagine-image-quality`）で
+  描きます。線の太いセル画調になります。
 
 - Grok CLIは`IMAGE_GRID_GROK_BIN`、`~/.local/bin/grok`、`~/.grok/bin/grok`、`PATH`の順に
   探します。見つからない場合、ジョブは`GrokCliUnavailable`で失敗します。
@@ -469,7 +491,7 @@ Grok Imagineで描く場合は`engine: "grok-imagine"`を使用します（後�
   描き直されることがあります。角度を変えたいときは、はっきり違うポーズを書いてください。
   Grokの出力は、手や顔の細かい印を確認してから使ってください。
 - `operation: "edit"`では、指示された変更だけを加え、それ以外は維持するようGrokに指示します。
-- Grokのジョブは同時に4つまで実行します。GrokがImagineを呼ばずに文章で返した場合は、
+- Grokのジョブは、2つのエンジンを合わせて同時に4つまで実行します。GrokがImagineを呼ばずに文章で返した場合は、
   新しいセッションで1回だけやり直します。
 
 1枚の生成が完了したときは、次のような構造化フィールドが返ります。
