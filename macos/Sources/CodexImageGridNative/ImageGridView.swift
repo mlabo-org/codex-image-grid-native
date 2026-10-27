@@ -50,6 +50,9 @@ enum ImageEngine: String, CaseIterable, Identifiable {
     case grokImagine2 = "grok-imagine-2"
     case grokImagine = "grok-imagine"
 
+    /// The engine before the user picks one; the server starts from the same one.
+    static let initialDefault = Self.grokImagine2
+
     var id: String { rawValue }
 }
 
@@ -106,7 +109,7 @@ struct ImageGridView: View {
     @State private var batchPrompts = ImageGridContract.defaultBatchPrompts
     @State private var operation = ImageGridOperation.generate
     @State private var mood = ImageMood.warmMascot
-    @State private var engine = ImageEngine.appServerImage
+    @State private var engine = ImageEngine.initialDefault
     @State private var count = 1
     @State private var aspectRatio = AspectRatio.widescreen
     @State private var referenceImage: ImageGridReference?
@@ -158,6 +161,12 @@ struct ImageGridView: View {
         .onChange(of: draftMetadata) { _, metadata in
             guard draftReady else { return }
             draftPersistence.schedule(metadata)
+        }
+        .onChange(of: defaultEngineToRecord, initial: true) { _, value in
+            guard let value else { return }
+            Task {
+                await store.recordDefaultEngine(value)
+            }
         }
         .onChange(of: resultLimit) { _, value in
             store.applyRetentionMode(resultLimit: value)
@@ -854,6 +863,14 @@ struct ImageGridView: View {
         case .preparationError, .displayError:
             referenceImage == nil ? .empty : .ready
         }
+    }
+
+    /// The engine shown once the draft is restored and the server is up. The
+    /// server makes it the default for runs that name no engine, so the choice
+    /// is recorded at launch and on every change.
+    private var defaultEngineToRecord: ImageEngine? {
+        guard draftReady, case .ready = runtimeLifecycle.state else { return nil }
+        return engine
     }
 
     private func restoreDraft() async {

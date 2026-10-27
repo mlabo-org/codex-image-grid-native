@@ -34,8 +34,8 @@ display-safe image URLs, and Codex Markdown."
             "Generate images or edit a supplied image, singly or in Prompt Batch. \
 Use operation=generate for new images and reference-character variations; use operation=edit \
 with referenceImagePath for requested changes preserving the rest of the source. \
-Activates the installed native Codex Image Grid app (generation runs through the Codex App Server \
-and its Codex account), then returns handoff.md, absolute output paths, webpPaths for the lossy \
+Activates the installed native Codex Image Grid app (the app-server-image engine runs through the \
+Codex App Server and its Codex account), then returns handoff.md, absolute output paths, webpPaths for the lossy \
 WebP copy saved beside each PNG or JPEG for web upload, display-safe image URLs, \
 and Markdown image links in the codexMarkdown field for Claude Code."
         }
@@ -165,7 +165,7 @@ struct NormalizedArguments {
     prompts: Vec<String>,
     count: usize,
     mood: String,
-    engine: String,
+    engine: Option<String>,
     aspect_ratio: String,
     reference_premise: Option<String>,
     reference_image: Option<InlineReferenceImage>,
@@ -455,14 +455,30 @@ fn submit_generate_image_grid(
     config: &BridgeConfig,
 ) -> Result<Value, String> {
     let mut server = start_or_join_native_server(config)?;
-    server.health = assert_engine_ready(config, server.health, &arguments.engine)?;
+    // An omitted engine is the server's to choose, so readiness follows the
+    // default the running server reports.
+    let engine = match &arguments.engine {
+        Some(engine) => engine.clone(),
+        None => server
+            .health
+            .get("defaultEngine")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                "Image Grid server did not report a default engine; quit and reopen Codex Image Grid"
+                    .to_owned()
+            })?,
+    };
+    server.health = assert_engine_ready(config, server.health, &engine)?;
 
     let mut body = serde_json::Map::new();
     body.insert("operation".to_owned(), json!(arguments.operation));
     body.insert("prompts".to_owned(), json!(arguments.prompts));
     body.insert("count".to_owned(), json!(arguments.count));
     body.insert("mood".to_owned(), json!(arguments.mood));
-    body.insert("engine".to_owned(), json!(arguments.engine));
+    if let Some(engine) = &arguments.engine {
+        body.insert("engine".to_owned(), json!(engine));
+    }
     body.insert("aspectRatio".to_owned(), json!(arguments.aspect_ratio));
     body.insert("waitMs".to_owned(), json!(arguments.wait_ms));
     if let Some(reference_premise) = &arguments.reference_premise {
@@ -546,8 +562,7 @@ fn normalize_tool_arguments(
         engine: arguments
             .get("engine")
             .and_then(Value::as_str)
-            .unwrap_or("app-server-image")
-            .to_owned(),
+            .map(str::to_owned),
         aspect_ratio: arguments
             .get("aspectRatio")
             .and_then(Value::as_str)
@@ -2039,10 +2054,7 @@ fn validate_tool_arguments(arguments: &Value) -> Result<(), String> {
         .unwrap_or_default();
     operation
         .validate(
-            arguments
-                .get("engine")
-                .and_then(Value::as_str)
-                .unwrap_or("app-server-image"),
+            arguments.get("engine").and_then(Value::as_str),
             arguments
                 .get("referenceImagePath")
                 .and_then(Value::as_str)
@@ -2115,8 +2127,7 @@ pub fn tool_record() -> Value {
                 "engine": {
                     "type": "string",
                     "enum": ["app-server-image", "codex-svg", "grok-imagine-2", "grok-imagine"],
-                    "default": "app-server-image",
-                    "description": "app-server-image draws with Codex image generation. codex-svg writes SVG. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style. Use a Grok engine only when the user asks for Grok; prefer grok-imagine-2 unless they ask for the older model."
+                    "description": "Omit unless the user names an engine; an omitted engine uses the one last chosen in the Image Grid app. app-server-image draws with Codex image generation. codex-svg writes SVG. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style."
                 },
                 "aspectRatio": {
                     "type": "string",
@@ -2746,6 +2757,32 @@ skipped PATH=(none): PATH is unavailable."
         reference_operation_payload(Some("edit"));
     }
 
+    #[test]
+    fn omitted_engine_is_left_to_the_server_default() {
+        let directory = TestDirectory::new("default-engine");
+        let root = fs::canonicalize(&directory.path).expect("canonical root");
+        let fake = FakeServer::running(root.clone(), 3);
+        let config = test_config(&fake.url, Some(root), None);
+
+        call_generate_image_grid_with_config(&json!({"prompts": ["project visual"]}), &config)
+            .expect("generation without an engine");
+        let requests = fake.finish();
+
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| format!("{} {}", request.method, request.path))
+                .collect::<Vec<_>>(),
+            vec![
+                "GET /api/health",
+                "POST /api/preflight/app-server-image",
+                "POST /api/run-batch"
+            ],
+            "the reported default engine decides readiness"
+        );
+        assert!(requests[2].body.get("engine").is_none());
+    }
+
     fn reference_operation_payload(operation: Option<&str>) {
         let directory = TestDirectory::new("running");
         let root = fs::canonicalize(&directory.path).expect("canonical root");
@@ -3042,6 +3079,11 @@ skipped PATH=(none): PATH is unavailable."
         while requests.len() < expected_requests && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // macOS hands the listener's nonblocking mode to accepted
+                    // streams; the read must wait for the request instead.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("blocking fake stream");
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .expect("fake read timeout");
@@ -3122,7 +3164,8 @@ skipped PATH=(none): PATH is unavailable."
                     "serverRoot": root
                 },
                 "appServerImage": false,
-                "appServerImageReady": false
+                "appServerImageReady": false,
+                "defaultEngine": "app-server-image"
             }),
             "/api/preflight/app-server-image" => json!({
                 "ok": true,

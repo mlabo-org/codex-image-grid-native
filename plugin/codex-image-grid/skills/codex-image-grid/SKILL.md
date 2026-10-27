@@ -34,8 +34,8 @@ instructions. For edits, the tool schema documents which generation settings
 are ignored. Preserve batch intent: each prompt and variant edits the supplied
 source independently. To edit a preceding result, supply that result's path.
 
-Leave `engine` at its default unless the user names one. Use a Grok engine
-only when the user asks for Grok; both draw through the local Grok CLI.
+Omit `engine` unless the user names one; an omitted engine uses the one last
+chosen in the Image Grid app. Both Grok engines draw through the local Grok CLI.
 `grok-imagine-2` draws with Grok Imagine 2.0, the web version's style, and is
 the one to use when the user just says Grok. `grok-imagine` is the CLI's older
 default model; use it only when the user asks for the older model. When a

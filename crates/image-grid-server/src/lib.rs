@@ -163,6 +163,8 @@ impl RuntimeIdentity {
 pub struct HealthResponse {
     pub ok: bool,
     pub jobs: usize,
+    /// The engine a run uses when its request names none.
+    pub default_engine: String,
     pub app_server_image: bool,
     pub app_server_image_ready: bool,
     pub app_server_image_diagnostics: AppServerDiagnostics,
@@ -178,6 +180,7 @@ impl HealthResponse {
             AppServerDiagnostics::default(),
             SchedulerSnapshot::default(),
             0,
+            runtime::load_default_engine(&config.data_dir),
         )
     }
 
@@ -186,11 +189,13 @@ impl HealthResponse {
         diagnostics: AppServerDiagnostics,
         scheduler: SchedulerSnapshot,
         jobs: usize,
+        default_engine: String,
     ) -> Self {
         let identity = RuntimeIdentity::from_config(config, diagnostics.clone(), scheduler);
         Self {
             ok: true,
             jobs,
+            default_engine,
             app_server_image: diagnostics.ready,
             app_server_image_ready: diagnostics.ready,
             app_server_image_diagnostics: diagnostics,
@@ -301,6 +306,10 @@ fn router_with_state(state: RuntimeState) -> Router {
             "/api/preflight/app-server-image",
             get(preflight).post(preflight),
         )
+        .route(
+            "/api/preferences/default-engine",
+            axum::routing::put(set_default_engine),
+        )
         .layer(middleware::from_fn(reject_non_loopback_origin))
         .with_state(state)
 }
@@ -345,12 +354,34 @@ async fn health(State(state): State<RuntimeState>) -> Json<HealthResponse> {
     let diagnostics = state.app_server.diagnostics().await;
     let scheduler = state.generation.scheduler_snapshot();
     let jobs = state.generation.job_count().await;
+    let default_engine = state.generation.default_engine().await;
     Json(HealthResponse::from_parts(
         &state.config,
         diagnostics,
         scheduler,
         jobs,
+        default_engine,
     ))
+}
+
+async fn set_default_engine(State(state): State<RuntimeState>, request: AxumRequest) -> Response {
+    let body = match http_json::read_json_body(request).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    let engine = body.get("engine").and_then(Value::as_str).unwrap_or_default();
+    match state.generation.set_default_engine(engine).await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "defaultEngine": engine }))).into_response(),
+        Err(error) => (
+            if error.code.as_deref() == Some("invalid_engine") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+            Json(error.body()),
+        )
+            .into_response(),
+    }
 }
 
 async fn preflight(
@@ -973,6 +1004,7 @@ mod tests {
 
         assert!(health.ok);
         assert_eq!(health.jobs, 0);
+        assert_eq!(health.default_engine, "grok-imagine-2");
         assert!(!health.app_server_image);
         assert_eq!(health.app_server_image_diagnostics.status, "not-started");
         assert_eq!(health.identity.app, "codex-image-grid");
@@ -1200,6 +1232,7 @@ done
                     .body(Body::from(
                         json!({
                             "prompts": ["SSE fixture"],
+                            "engine": "app-server-image",
                             "count": 1,
                             "waitMs": 2000
                         })

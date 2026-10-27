@@ -53,6 +53,11 @@ The baseline executable contract is:
 | default `aspectRatio` | `16:9` |
 | default `waitMs` | 0 |
 
+The native project later departed from two rows above: it added the
+`grok-imagine` and `grok-imagine-2` engines, and a request without an engine
+uses the engine last chosen in the app (`grok-imagine-2` before any choice)
+instead of `app-server-image`.
+
 Validation rules:
 
 - `prompts` is a non-empty array of non-empty strings and has at most 12

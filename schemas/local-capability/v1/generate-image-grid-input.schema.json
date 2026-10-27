@@ -27,7 +27,7 @@
     "engine": {
       "type": "string",
       "enum": ["app-server-image", "codex-svg", "grok-imagine-2", "grok-imagine"],
-      "default": "app-server-image"
+      "description": "Omit unless the user names an engine; an omitted engine uses the one last chosen in the Image Grid app."
     },
     "aspectRatio": {
       "type": "string",

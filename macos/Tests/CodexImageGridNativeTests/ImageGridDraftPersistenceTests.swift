@@ -70,7 +70,7 @@ func draftMetadataRoundTripAndInvalidValuesUseFrozenDefaults() async throws {
     #expect(validated.promptMode == .single)
     #expect(validated.batchPrompts == [""])
     #expect(validated.mood == .warmMascot)
-    #expect(validated.engine == .appServerImage)
+    #expect(validated.engine == .grokImagine2)
     #expect(validated.count == 1)
     #expect(validated.aspectRatio == .widescreen)
     #expect(validated.referenceStatusKey == .empty)

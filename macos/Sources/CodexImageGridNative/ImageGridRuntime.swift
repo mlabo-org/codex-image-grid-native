@@ -241,6 +241,14 @@ private struct ImageGridDeleteRunsRequest: Encodable {
     let runIds: [String]
 }
 
+private struct ImageGridDefaultEngineRequest: Encodable {
+    let engine: String
+}
+
+private struct ImageGridDefaultEngineResponse: Decodable {
+    let defaultEngine: String
+}
+
 struct ImageGridDeleteRunFailure: Decodable, Equatable, Sendable {
     let runId: String
     let error: String
@@ -525,6 +533,14 @@ struct ImageGridAPIClient: Sendable {
             path: "/api/delete-runs",
             method: "POST",
             body: ImageGridDeleteRunsRequest(runIds: runIDs)
+        )
+    }
+
+    func setDefaultEngine(_ engine: String) async throws {
+        let _: ImageGridDefaultEngineResponse = try await send(
+            path: "/api/preferences/default-engine",
+            method: "PUT",
+            body: ImageGridDefaultEngineRequest(engine: engine)
         )
     }
 
@@ -895,8 +911,10 @@ final class ImageGridStore: ObservableObject {
                 recordArtifactError(runID: run.runId, run.artifactError)
             }
         } catch {
+            // At launch this runs before the server is up; recorded as a
+            // connectivity failure, the message clears once the server connects.
             if jobs.isEmpty {
-                generationMessage = error.localizedDescription
+                recordConnectivityFailure(error.localizedDescription)
             }
         }
     }
@@ -956,6 +974,14 @@ final class ImageGridStore: ObservableObject {
         } catch {
             referenceAnalysisMessage = error.localizedDescription
             return nil
+        }
+    }
+
+    func recordDefaultEngine(_ engine: ImageEngine) async {
+        do {
+            try await client.setDefaultEngine(engine.rawValue)
+        } catch {
+            generationMessage = error.localizedDescription
         }
     }
 

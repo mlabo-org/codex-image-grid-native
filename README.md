@@ -4,13 +4,15 @@ A native macOS image-generation workspace for Codex and Claude Code, built with 
 SwiftUI. It provides Prompt Batch generation and editing, reference-image analysis,
 Japanese/English UI, light/dark themes, run history, and artifact handoff
 through the `codex_image_grid/generate_image_grid` MCP tool. Images are drawn
-with Codex image generation by default, as SVG with `codex-svg`, or with Grok
-Imagine (2.0 or the older model) through the local Grok CLI.
+with Codex image generation, as SVG with `codex-svg`, or with Grok Imagine (2.0
+or the older model) through the local Grok CLI; a call that names no engine uses
+the one last chosen in the app.
 
 Codex・Claude Code向けのmacOSネイティブ画像生成ワークスペースです。RustとSwiftUIで
 実装され、Prompt Batchでの生成・編集、参照画像解析、日英UI、ライト/ダークテーマ、
-生成履歴、成果物の受け渡しに対応しています。画像は既定でCodexの画像生成で描き、
-`codex-svg`ではSVGで、ローカルのGrok CLIを通してGrok Imagine（2.0・旧モデル）でも描けます。
+生成履歴、成果物の受け渡しに対応しています。画像はCodexの画像生成、`codex-svg`でのSVG、
+ローカルのGrok CLIを通したGrok Imagine（2.0・旧モデル）で描けます。エンジンを指定しない
+呼び出しは、アプリで最後に選んだエンジンを使います。
 
 [English](#english) · [日本語](#日本語)
 
@@ -44,8 +46,8 @@ Codex・Claude Code向けのmacOSネイティブ画像生成ワークスペー�
 - Optional: the Grok CLI (`grok`), installed and signed in, for the
   `grok-imagine-2` and `grok-imagine` engines
 
-The default generated-image route uses `codex app-server`, so the active Codex
-account must have access to image generation.
+The `app-server-image` engine uses `codex app-server`, so the active Codex
+account must have access to image generation to use it.
 
 ### Automatic setup when opened in Codex
 
@@ -161,6 +163,14 @@ absolute path to a local PNG, JPEG, or WebP file no larger than 100 MiB. Use
 `engine: "codex-svg"` for SVG output, or `engine: "grok-imagine-2"` or
 `"grok-imagine"` for Grok Imagine (see below). `waitMs` may be from 0 through
 120,000.
+
+Omit `engine` unless the user names one. A call without `engine` uses the
+engine last chosen in the app's engine picker: the app records its choice at
+launch and on every change, the server keeps it in `preferences.json` in the
+data directory and reports it as `defaultEngine` in `/api/health`, and before
+any choice it is `grok-imagine-2`. Callers such as RelayPress and CodexVideo
+must not fix an engine of their own. An edit without `engine` while the default
+is `codex-svg` is rejected rather than moved to another engine.
 
 `mood` adds a style line to the prompt (`warm-mascot` by default).
 `mood: "none"` adds no style line, so the prompt alone sets the look.
@@ -330,8 +340,8 @@ MIT. See [LICENSE](LICENSE).
 - 初回の依存関係取得に使うインターネット接続
 - 任意：`grok-imagine-2`・`grok-imagine`エンジンを使う場合は、インストール・ログイン済みのGrok CLI（`grok`）
 
-既定の画像生成は`codex app-server`を使用します。利用中のCodexアカウントで画像生成が
-使える必要があります。
+`app-server-image`エンジンは`codex app-server`を使用します。このエンジンを使うには、
+利用中のCodexアカウントで画像生成が使える必要があります。
 
 ### Codexに取り込んだときの自動セットアップ
 
@@ -444,6 +454,13 @@ MCPから呼び出した場合もネイティブアプリが開き、両方の�
 WebPファイルの絶対パスを指定します。SVGが必要な場合は`engine: "codex-svg"`を、
 Grok Imagineで描く場合は`engine: "grok-imagine-2"`か`"grok-imagine"`を使用します（後述）。
 `waitMs`には0から120,000までを指定できます。
+
+`engine`は、ユーザーがエンジンを名指ししたときだけ指定します。`engine`のない呼び出しは、
+アプリのエンジン選択で最後に選んだエンジンを使います。アプリは起動時と切り替えのたびに
+選択を記録し、サーバーはそれをデータフォルダの`preferences.json`に保存して、`/api/health`の
+`defaultEngine`で返します。一度も選んでいないときは`grok-imagine-2`です。RelayPressや
+CodexVideoなどの呼び出し側は、独自にエンジンを決め打ちしません。既定が`codex-svg`のときに
+`engine`なしで編集を頼むと、別のエンジンに切り替えずにエラーにします。
 
 `mood`は、プロンプトに雰囲気の指定を1行足します（既定は`warm-mascot`）。
 `mood: "none"`では何も足さず、プロンプトだけで画風が決まります。

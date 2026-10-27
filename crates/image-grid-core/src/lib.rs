@@ -36,12 +36,16 @@ impl ImageOperation {
         }
     }
 
-    pub fn validate(self, engine: &str, has_reference: bool) -> Result<(), &'static str> {
+    /// Checks an edit's engine and source. `engine` is `None` when the request
+    /// names none and the server's default engine decides it later.
+    pub fn validate(self, engine: Option<&str>, has_reference: bool) -> Result<(), &'static str> {
         if self == Self::Edit {
-            if !matches!(
-                engine,
-                "app-server-image" | "grok-imagine-2" | "grok-imagine"
-            ) {
+            if engine.is_some_and(|engine| {
+                !matches!(
+                    engine,
+                    "app-server-image" | "grok-imagine-2" | "grok-imagine"
+                )
+            }) {
                 return Err(
                     "edit requires the app-server-image, grok-imagine-2, or grok-imagine engine",
                 );

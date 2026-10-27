@@ -44,6 +44,10 @@ const ENGINES: [&str; 4] = [
     "grok-imagine-2",
     "grok-imagine",
 ];
+/// The engine a run without one uses until the app records a choice.
+const INITIAL_DEFAULT_ENGINE: &str = "grok-imagine-2";
+/// Holds the engine last chosen in the app, which runs without one use.
+const PREFERENCES_FILENAME: &str = "preferences.json";
 const RATE_LIMIT_GROK_HINT: &str = "Codex image generation is rate-limited. Grok can draw these \
 prompts instead: rerun them with engine grok-imagine-2 (Grok Imagine 2.0) or grok-imagine (the \
 older Grok model) if the user wants Grok.";
@@ -496,6 +500,7 @@ struct RuntimeInner {
     shutdown_gate: Mutex<()>,
     shutdown_signal: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    default_engine: RwLock<String>,
     #[cfg(test)]
     fail_artifact_write: AtomicBool,
 }
@@ -520,6 +525,7 @@ impl GenerationRuntime {
         recovery: RecoveryConfig,
     ) -> Self {
         let restored = restore_persisted_runtime(&config);
+        let default_engine = load_default_engine(&config.data_dir);
         let (events, _) = broadcast::channel(1024);
         let (shutdown_signal, _) = watch::channel(false);
         let runtime = Self {
@@ -543,12 +549,38 @@ impl GenerationRuntime {
                 shutdown_gate: Mutex::new(()),
                 shutdown_signal,
                 tasks: Mutex::new(Vec::new()),
+                default_engine: RwLock::new(default_engine),
                 #[cfg(test)]
                 fail_artifact_write: AtomicBool::new(false),
             }),
         };
         runtime.persist_normalized_restorations(restored.normalized_run_ids);
         runtime
+    }
+
+    /// The engine a run uses when its request names none.
+    pub(crate) async fn default_engine(&self) -> String {
+        self.inner.default_engine.read().await.clone()
+    }
+
+    /// Records the engine chosen in the app as the default for later runs.
+    pub(crate) async fn set_default_engine(&self, engine: &str) -> Result<(), RunApiError> {
+        if !ENGINES.contains(&engine) {
+            return Err(RunApiError::new(
+                format!("engine must be one of: {}", ENGINES.join(", ")),
+                "invalid_engine",
+            ));
+        }
+        let mut current = self.inner.default_engine.write().await;
+        let bytes = serde_json::to_vec_pretty(&json!({ "defaultEngine": engine }))
+            .expect("preferences serialize");
+        atomic_write(
+            &self.inner.config.data_dir.join(PREFERENCES_FILENAME),
+            &bytes,
+        )
+        .await?;
+        *current = engine.to_owned();
+        Ok(())
     }
 
     fn persist_normalized_restorations(&self, run_ids: Vec<String>) {
@@ -800,7 +832,13 @@ impl GenerationRuntime {
         if self.is_closed() {
             return Err(runtime_closed_api_error());
         }
-        let request = normalize_request(body, require_prompts_array, query_wait_ms)?;
+        let default_engine = self.default_engine().await;
+        let request = normalize_request(
+            body,
+            require_prompts_array,
+            query_wait_ms,
+            &default_engine,
+        )?;
         let (run_id, run_directory) = self
             .reserve_run_directory(|| Uuid::new_v4().to_string()[..8].to_owned())
             .await?;
@@ -2934,6 +2972,33 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Reads the engine last chosen in the app; a data directory without a valid
+/// choice uses the initial default.
+pub(crate) fn load_default_engine(data_dir: &Path) -> String {
+    let path = data_dir.join(PREFERENCES_FILENAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return INITIAL_DEFAULT_ENGINE.to_owned();
+        }
+        Err(error) => {
+            eprintln!("image-grid-server: could not read {}: {error}", path.display());
+            return INITIAL_DEFAULT_ENGINE.to_owned();
+        }
+    };
+    let engine = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("defaultEngine")?.as_str().map(str::to_owned))
+        .filter(|engine| ENGINES.contains(&engine.as_str()));
+    engine.unwrap_or_else(|| {
+        eprintln!(
+            "image-grid-server: {} has no valid defaultEngine; using {INITIAL_DEFAULT_ENGINE}",
+            path.display()
+        );
+        INITIAL_DEFAULT_ENGINE.to_owned()
+    })
+}
+
 fn restore_persisted_runtime(config: &RuntimeConfig) -> RestoredRuntimeState {
     let Ok(generated_root) = std::fs::canonicalize(&config.generated_dir) else {
         return RestoredRuntimeState::default();
@@ -3103,7 +3168,7 @@ fn validate_restored_request(
     };
     request
         .operation
-        .validate(&request.engine, request.reference_image.is_some())
+        .validate(Some(&request.engine), request.reference_image.is_some())
         .ok()?;
     Some(request)
 }
@@ -3375,6 +3440,7 @@ fn normalize_request(
     body: &Value,
     require_prompts_array: bool,
     query_wait_ms: Option<&str>,
+    default_engine: &str,
 ) -> Result<NormalizedRunRequest, RunApiError> {
     let prompts_value = body.get("prompts");
     let prompts = if require_prompts_array {
@@ -3448,7 +3514,7 @@ fn normalize_request(
         .get("engine")
         .and_then(Value::as_str)
         .filter(|value| ENGINES.contains(value))
-        .unwrap_or("app-server-image")
+        .unwrap_or(default_engine)
         .to_owned();
     let aspect_ratio = body
         .get("aspectRatio")
@@ -3483,9 +3549,7 @@ fn normalize_request(
         .unwrap_or_default();
     operation
         .validate(
-            body.get("engine")
-                .and_then(Value::as_str)
-                .unwrap_or("app-server-image"),
+            Some(&engine),
             inline_reference_image.is_some() || reference_image_path.is_some(),
         )
         .map_err(|error| RunApiError::new(error, "invalid_edit_request"))?;
@@ -4732,12 +4796,13 @@ mod tests {
             }),
             true,
             None,
+            INITIAL_DEFAULT_ENGINE,
         )
         .expect("normalized request");
         assert_eq!(request.prompts, vec!["first", "second"]);
         assert_eq!(request.count, 2);
         assert_eq!(request.mood, "warm-mascot");
-        assert_eq!(request.engine, "app-server-image");
+        assert_eq!(request.engine, INITIAL_DEFAULT_ENGINE);
         assert_eq!(request.aspect_ratio, "16:9");
         assert_eq!(request.wait_ms, 13);
 
@@ -4748,6 +4813,7 @@ mod tests {
             }),
             true,
             None,
+            INITIAL_DEFAULT_ENGINE,
         )
         .expect_err("too many jobs");
         assert_eq!(error.code.as_deref(), Some("too_many_jobs"));
@@ -4815,6 +4881,71 @@ mod tests {
     }
 
     #[test]
+    fn a_request_without_an_engine_uses_the_default_engine() {
+        let unnamed = json!({"prompts": ["A mascot"]});
+        for default_engine in ENGINES {
+            let request = normalize_request(&unnamed, true, None, default_engine)
+                .expect("request without an engine");
+            assert_eq!(request.engine, default_engine);
+        }
+        let named = json!({"prompts": ["A mascot"], "engine": "codex-svg"});
+        let request = normalize_request(&named, true, None, "grok-imagine-2").expect("named engine");
+        assert_eq!(request.engine, "codex-svg");
+
+        let edit = json!({
+            "prompts": ["replace burger"], "operation": "edit", "referenceImagePath": "/source.png"
+        });
+        let error = normalize_request(&edit, true, None, "codex-svg")
+            .expect_err("an edit cannot fall to the SVG default");
+        assert_eq!(error.code.as_deref(), Some("invalid_edit_request"));
+        assert_eq!(
+            normalize_request(&edit, true, None, "grok-imagine-2")
+                .expect("edit with an image default")
+                .engine,
+            "grok-imagine-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_engine_persists_in_the_data_directory() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let data_dir = temporary.path().join("data");
+        let workspace = temporary.path().join("workspace");
+        std_fs::create_dir_all(&workspace).expect("workspace");
+        let config = Arc::new(RuntimeConfig::new(
+            temporary.path().join("server"),
+            data_dir.clone(),
+            Some(workspace.clone()),
+            "server".to_owned(),
+        ));
+        config.prepare_directories().expect("runtime directories");
+        let app_server = AppServerBridge::new(
+            workspace,
+            AppServerLaunchConfig::single("fixture", temporary.path().join("unused-codex")),
+        );
+        let runtime = GenerationRuntime::new(config.clone(), app_server);
+        assert_eq!(runtime.default_engine().await, INITIAL_DEFAULT_ENGINE);
+
+        runtime
+            .set_default_engine("app-server-image")
+            .await
+            .expect("record a default engine");
+        assert_eq!(runtime.default_engine().await, "app-server-image");
+        assert_eq!(load_default_engine(&data_dir), "app-server-image");
+
+        let error = runtime
+            .set_default_engine("dall-e")
+            .await
+            .expect_err("unknown engine");
+        assert_eq!(error.code.as_deref(), Some("invalid_engine"));
+        assert_eq!(runtime.default_engine().await, "app-server-image");
+
+        std_fs::write(data_dir.join(PREFERENCES_FILENAME), "{\"defaultEngine\": 7}")
+            .expect("corrupt preferences");
+        assert_eq!(load_default_engine(&data_dir), INITIAL_DEFAULT_ENGINE);
+    }
+
+    #[test]
     fn edit_requests_require_a_source_and_image_engine_before_scheduling() {
         for body in [
             json!({"prompts": ["replace burger"], "operation": "edit"}),
@@ -4822,7 +4953,7 @@ mod tests {
             json!({"prompts": ["replace burger"], "operation": "edit", "engine": "codex-svg", "referenceImagePath": "/source.png"}),
             json!({"prompts": ["replace burger"], "operation": "edti"}),
         ] {
-            assert!(normalize_request(&body, true, None).is_err());
+            assert!(normalize_request(&body, true, None, INITIAL_DEFAULT_ENGINE).is_err());
         }
         let edit = normalize_request(
             &json!({
@@ -4831,6 +4962,7 @@ mod tests {
             }),
             true,
             None,
+            INITIAL_DEFAULT_ENGINE,
         )
         .unwrap();
         assert_eq!(edit.operation, ImageOperation::Edit);
@@ -4861,6 +4993,7 @@ mod tests {
             &json!({"prompts": ["A mascot on a sofa"], "engine": "grok-imagine"}),
             true,
             None,
+            INITIAL_DEFAULT_ENGINE,
         )
         .expect("normalized grok request");
         assert_eq!(request.engine, "grok-imagine");
@@ -4881,6 +5014,7 @@ mod tests {
             &json!({"prompts": ["A mascot on a sofa"], "engine": "grok-imagine-2", "mood": "none"}),
             true,
             None,
+            INITIAL_DEFAULT_ENGINE,
         )
         .expect("normalized grok 2.0 request");
         assert_eq!(grok_2.engine, "grok-imagine-2");
@@ -5221,6 +5355,7 @@ done
             .create_run(
                 &json!({
                     "prompts": ["recover missing output"],
+                    "engine": "app-server-image",
                     "count": 1,
                     "waitMs": 7000
                 }),
@@ -5294,6 +5429,7 @@ done
             .create_run(
                 &json!({
                     "prompts": ["reject empty image output"],
+                    "engine": "app-server-image",
                     "count": 1,
                     "waitMs": 7000
                 }),
@@ -5371,6 +5507,7 @@ done
             .create_run(
                 &json!({
                     "prompts": ["recover rate limit"],
+                    "engine": "app-server-image",
                     "count": 1,
                     "waitMs": 7000
                 }),
@@ -5445,6 +5582,7 @@ done
             .create_run(
                 &json!({
                     "prompts": ["timeout"],
+                    "engine": "app-server-image",
                     "count": 1,
                     "waitMs": 3000
                 }),
@@ -5525,6 +5663,7 @@ done
             .create_run(
                 &json!({
                     "prompts": ["active pending RPC"],
+                    "engine": "app-server-image",
                     "count": 1,
                     "waitMs": 0
                 }),
@@ -5563,6 +5702,7 @@ done
             .create_run(
                 &json!({
                     "prompts": ["queued in cooldown"],
+                    "engine": "app-server-image",
                     "count": 1,
                     "waitMs": 0
                 }),
