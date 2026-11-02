@@ -1,6 +1,5 @@
 {
   "name": "codex-image-grid",
-  "version": "0.1.0",
   "description": "Native macOS image generation and editing for Codex and Claude Code. Supports Prompt Batch, reference-character generation, partial edits, thumbnails, and project/article/video visuals through codex_image_grid/generate_image_grid.",
   "author": {
     "name": "mlabo-org",
