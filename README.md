@@ -114,7 +114,9 @@ claude plugin install codex-image-grid@codex-image-grid-native
 
 To use your local clone instead of GitHub, run `claude plugin marketplace add .`
 from the repository root. Start a new Claude Code session after installing.
-To pick up a newer plugin version, run
+A local-clone install loads the plugin in place, so plugin edits take effect at
+the next session start or `/reload-plugins`. For a GitHub install, pick up a
+newer plugin version with
 `claude plugin marketplace update codex-image-grid-native` and then
 `claude plugin update codex-image-grid@codex-image-grid-native`. When native
 source changes, rebuild and reinstall the app with
@@ -428,7 +430,9 @@ claude plugin install codex-image-grid@codex-image-grid-native
 
 GitHubではなく手元のcloneを使う場合は、リポジトリのルートで
 `claude plugin marketplace add .`を実行します。インストール後は新しいClaude Code
-セッションを開始してください。新しい版を取り込むときは
+セッションを開始してください。手元のcloneから入れた場合はプラグインをその場で
+読み込むので、プラグインの変更は次のセッション開始か`/reload-plugins`で効きます。
+GitHubから入れた場合は、新しい版を取り込むときに
 `claude plugin marketplace update codex-image-grid-native`のあとに
 `claude plugin update codex-image-grid@codex-image-grid-native`を実行します。
 ネイティブのソースを変えたときは`scripts/install-native-app.sh --execute`で

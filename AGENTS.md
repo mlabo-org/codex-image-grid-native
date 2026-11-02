@@ -15,9 +15,10 @@ both hosts; `CLAUDE.md` only points here.
 - In Claude Code, the plugin `plugin/codex-image-grid/` is installed from this
   repository's `codex-image-grid-native` marketplace
   (`.claude-plugin/marketplace.json`) with
-  `claude plugin install codex-image-grid@codex-image-grid-native`. Apply
-  plugin source changes with
-  `claude plugin marketplace update codex-image-grid-native` and
+  `claude plugin install codex-image-grid@codex-image-grid-native`. A
+  local-clone install loads the plugin in place, so source changes take effect
+  at the next session start or `/reload-plugins`. For a GitHub install, apply
+  them with `claude plugin marketplace update codex-image-grid-native` and
   `claude plugin update codex-image-grid@codex-image-grid-native` only when
   activation is part of the task. Do not run `scripts/bootstrap-codex.sh`; it registers the Codex
   marketplace.

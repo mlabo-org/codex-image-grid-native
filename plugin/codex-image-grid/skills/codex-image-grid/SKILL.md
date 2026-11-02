@@ -65,9 +65,12 @@ or fall back to the separate retired Electron project.
 - Build, installation, and active-session pickup are separate actions. Apply
   them only when repository setup or activation is authorized, and do not
   claim that a source edit activated the plugin. In Codex, use
-  `scripts/bootstrap-codex.sh` in a source checkout; in Claude Code, update
-  the plugin with `claude plugin marketplace update codex-image-grid-native`
-  and `claude plugin update codex-image-grid@codex-image-grid-native`. Both
+  `scripts/bootstrap-codex.sh` in a source checkout; in Claude Code, a
+  marketplace added from GitHub is updated with
+  `claude plugin marketplace update codex-image-grid-native` and
+  `claude plugin update codex-image-grid@codex-image-grid-native`; one added
+  from a local clone loads the plugin in place, so a source change takes
+  effect at the next session start or `/reload-plugins`. Both
   hosts share `~/Applications/Codex Image Grid Native.app`.
 
 ## Stop conditions
