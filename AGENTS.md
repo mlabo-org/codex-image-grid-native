@@ -40,6 +40,10 @@ both hosts; `CLAUDE.md` only points here.
 - Use `scripts/check.sh` as the repository's single buildable-slice acceptance
   command unless the current task declares a narrower focused check.
 - Source changes, local app installation, plugin activation, Git commit, and
-  publication are separate actions.
+  publication are separate actions. A Claude Code local-clone install has no
+  separate plugin activation step: changes under `plugin/codex-image-grid/`
+  take effect at the next session start or `/reload-plugins`, so Claude Code
+  plugin activation means only the GitHub-install update above. Native app
+  changes still need the installation step above.
 - Any change to this file requires the applicable `agents-md-clarifier` check
   before commit or handoff.
