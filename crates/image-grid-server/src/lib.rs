@@ -1076,6 +1076,9 @@ done
             permissions.set_mode(0o755);
             fs::set_permissions(&fake, permissions).expect("fake executable permissions");
         }
+        // Close the write handle before the fixture runs: Linux refuses to
+        // execute a file that is still open for writing (ETXTBSY).
+        drop(file);
 
         let config =
             RuntimeConfig::new(server_root, data_dir, Some(workspace), "server".to_owned());
@@ -1178,6 +1181,9 @@ done
             permissions.set_mode(0o755);
             fs::set_permissions(&fake, permissions).expect("fake executable permissions");
         }
+        // Close the write handle before the fixture runs: Linux refuses to
+        // execute a file that is still open for writing (ETXTBSY).
+        drop(file);
 
         let config =
             RuntimeConfig::new(server_root, data_dir, Some(workspace), "server".to_owned());
@@ -1373,6 +1379,9 @@ done
             permissions.set_mode(0o755);
             fs::set_permissions(&fake, permissions).expect("fake executable permissions");
         }
+        // Close the write handle before the fixture runs: Linux refuses to
+        // execute a file that is still open for writing (ETXTBSY).
+        drop(file);
 
         let config =
             RuntimeConfig::new(server_root, data_dir, Some(workspace), "server".to_owned());
@@ -1679,6 +1688,9 @@ done
             permissions.set_mode(0o755);
             fs::set_permissions(&fake, permissions).expect("fake executable permissions");
         }
+        // Close the write handle before the fixture runs: Linux refuses to
+        // execute a file that is still open for writing (ETXTBSY).
+        drop(file);
 
         let config = RuntimeConfig::new(
             server_root,
@@ -1963,6 +1975,9 @@ done
             permissions.set_mode(0o755);
             fs::set_permissions(&fake, permissions).expect("fake executable permissions");
         }
+        // Close the write handle before the fixture runs: Linux refuses to
+        // execute a file that is still open for writing (ETXTBSY).
+        drop(file);
 
         let config = RuntimeConfig::new(
             server_root,

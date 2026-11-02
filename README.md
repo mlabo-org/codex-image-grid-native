@@ -93,12 +93,34 @@ installed MCP route is discovered.
 
 ### Claude Code plugin
 
-The same `plugin/codex-image-grid/` package is loaded in Claude Code from the
-`suzuki-local-plugins` marketplace. Apply a plugin source change with
-`~/.claude/local-plugins/bin/claude-plugin-refresh codex-image-grid --execute`, then start a new session.
-Claude Code uses the same
-`~/Applications/Codex Image Grid Native.app`; build or reinstall it with
-`scripts/install-native-app.sh --execute` when native source changes.
+The same `plugin/codex-image-grid/` package installs in Claude Code from this
+repository's marketplace (`.claude-plugin/marketplace.json`). The plugin's MCP
+server runs the binary inside `~/Applications/Codex Image Grid Native.app`, so
+build and install the app first from a clone:
+
+```bash
+scripts/install-native-app.sh --execute
+```
+
+Then add the marketplace and install the plugin:
+
+```bash
+claude plugin marketplace add mlabo-org/codex-image-grid-native
+```
+
+```bash
+claude plugin install codex-image-grid@codex-image-grid-native
+```
+
+To use your local clone instead of GitHub, run `claude plugin marketplace add .`
+from the repository root. Start a new Claude Code session after installing.
+To pick up a newer plugin version, run
+`claude plugin marketplace update codex-image-grid-native` and then
+`claude plugin update codex-image-grid@codex-image-grid-native`. When native
+source changes, rebuild and reinstall the app with
+`scripts/install-native-app.sh --execute`. Do not run
+`scripts/bootstrap-codex.sh` for Claude Code; it registers the Codex
+marketplace.
 
 ### Quick Start and MCP usage
 
@@ -385,12 +407,33 @@ scripts/bootstrap-codex.sh --force
 
 ### Claude Codeプラグイン
 
-同じ`plugin/codex-image-grid/`を、Claude Codeでは`suzuki-local-plugins`
-マーケットプレイスから読み込みます。プラグインのソース変更は
-`~/.claude/local-plugins/bin/claude-plugin-refresh codex-image-grid --execute`で反映し、新しいセッションで
-有効になります。Claude Codeも同じ`~/Applications/Codex Image Grid Native.app`を
-使います。ネイティブのソースを変えたときは`scripts/install-native-app.sh --execute`で
-再ビルド・再配置します。
+同じ`plugin/codex-image-grid/`を、Claude Codeではこのリポジトリのマーケットプレイス
+（`.claude-plugin/marketplace.json`）からインストールします。プラグインのMCPサーバーは
+`~/Applications/Codex Image Grid Native.app`内のバイナリを起動するため、先にcloneから
+アプリをビルド・配置してください。
+
+```bash
+scripts/install-native-app.sh --execute
+```
+
+次にマーケットプレイスを追加し、プラグインをインストールします。
+
+```bash
+claude plugin marketplace add mlabo-org/codex-image-grid-native
+```
+
+```bash
+claude plugin install codex-image-grid@codex-image-grid-native
+```
+
+GitHubではなく手元のcloneを使う場合は、リポジトリのルートで
+`claude plugin marketplace add .`を実行します。インストール後は新しいClaude Code
+セッションを開始してください。新しい版を取り込むときは
+`claude plugin marketplace update codex-image-grid-native`のあとに
+`claude plugin update codex-image-grid@codex-image-grid-native`を実行します。
+ネイティブのソースを変えたときは`scripts/install-native-app.sh --execute`で
+再ビルド・再配置します。Claude Codeでは`scripts/bootstrap-codex.sh`を実行しないで
+ください（Codexのマーケットプレイスを登録するスクリプトです）。
 
 ### Quick StartとMCP利用
 

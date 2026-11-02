@@ -1,0 +1,18 @@
+{
+  "name": "codex-image-grid-native",
+  "owner": {
+    "name": "mlabo-org",
+    "url": "https://github.com/mlabo-org"
+  },
+  "metadata": {
+    "description": "Claude Code marketplace for the native macOS Codex Image Grid plugin."
+  },
+  "plugins": [
+    {
+      "name": "codex-image-grid",
+      "source": "./plugin/codex-image-grid",
+      "description": "Native macOS image generation and editing through the codex_image_grid/generate_image_grid MCP tool. Requires the Codex Image Grid Native app installed in ~/Applications.",
+      "category": "productivity"
+    }
+  ]
+}

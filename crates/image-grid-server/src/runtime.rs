@@ -5137,6 +5137,9 @@ done
             permissions.set_mode(0o755);
             std_fs::set_permissions(&fake, permissions).expect("fake executable permissions");
         }
+        // Close the write handle before the fixture runs: Linux refuses to
+        // execute a file that is still open for writing (ETXTBSY).
+        drop(fake_file);
 
         let app_server =
             AppServerBridge::new(workspace, AppServerLaunchConfig::single("fixture", fake));
@@ -5498,8 +5501,13 @@ done
             RecoveryConfig {
                 max_retries: 1,
                 retry_base: Duration::ZERO,
-                rate_limit_cooldown: Duration::from_millis(15),
-                rate_limit_cooldown_max: Duration::from_millis(15),
+                // The cooldown clock starts when the rate limit is seen, and the
+                // retry only begins waiting after the failed attempt is torn
+                // down, so `cooldownMs` is the delay minus that teardown time.
+                // A wide delay keeps the assertion below independent of how
+                // fast the machine tears the attempt down.
+                rate_limit_cooldown: Duration::from_millis(250),
+                rate_limit_cooldown_max: Duration::from_millis(250),
                 job_timeout: Duration::from_secs(5),
             },
         );
@@ -5522,7 +5530,7 @@ done
         assert!(
             output["timing"]["cooldownMs"]
                 .as_i64()
-                .is_some_and(|milliseconds| milliseconds >= 10)
+                .is_some_and(|milliseconds| milliseconds >= 100)
         );
         let diagnostic = output["diagnosticLog"].as_str().expect("diagnostic log");
         assert!(diagnostic.contains("code=TooManyRequests"));
