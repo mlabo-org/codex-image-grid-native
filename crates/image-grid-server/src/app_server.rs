@@ -480,12 +480,14 @@ impl AppServerClient {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = command.spawn().map_err(|error| {
-            AppServerClientError::new(
-                "AppServerSpawnFailed",
-                format!("could not start {}: {error}", command_path.display()),
-            )
-        })?;
+        let mut child = spawn_retrying_busy_executable(&mut command)
+            .await
+            .map_err(|error| {
+                AppServerClientError::new(
+                    "AppServerSpawnFailed",
+                    format!("could not start {}: {error}", command_path.display()),
+                )
+            })?;
         let stdin = child.stdin.take().ok_or_else(|| {
             AppServerClientError::new(
                 "AppServerTransportUnavailable",
@@ -634,22 +636,25 @@ impl AppServerClient {
 
         let mut stdin = self.stdin.lock().await;
         if let Err(error) = stdin.write_all(&bytes).await {
-            let error = AppServerClientError::new(
-                "AppServerWriteFailed",
-                format!("could not write App Server request: {error}"),
-            );
-            self.lifecycle.defer_terminal("error", &error.message);
-            return Err(error);
+            return Err(self.write_failure(format!("could not write App Server request: {error}")));
         }
         if let Err(error) = stdin.flush().await {
-            let error = AppServerClientError::new(
-                "AppServerWriteFailed",
-                format!("could not flush App Server request: {error}"),
-            );
-            self.lifecycle.defer_terminal("error", &error.message);
-            return Err(error);
+            return Err(self.write_failure(format!("could not flush App Server request: {error}")));
         }
         Ok(())
+    }
+
+    /// Classifies a failed write to the child's stdin. A shutdown that starts
+    /// after the `closed` check above can stop the child while the write is in
+    /// flight; that write fails only because the runtime is closing, so it is
+    /// reported as `RuntimeClosed` rather than as an App Server error.
+    fn write_failure(&self, message: String) -> AppServerClientError {
+        if self.closed.load(Ordering::Acquire) {
+            return runtime_closed_error();
+        }
+        let error = AppServerClientError::new("AppServerWriteFailed", message);
+        self.lifecycle.defer_terminal("error", &error.message);
+        error
     }
 
     pub(crate) async fn is_running(&self) -> bool {
@@ -1142,6 +1147,29 @@ fn now_string() -> String {
         .unwrap_or_else(|_| OffsetDateTime::now_utc().unix_timestamp().to_string())
 }
 
+/// Spawns `command`, retrying briefly while the executable is busy.
+///
+/// Linux refuses to execute a file that any process holds open for writing
+/// (`ETXTBSY`). A file that was just written and closed can still be briefly
+/// held by a forked child of another thread until that child calls `exec`, so
+/// the first spawn of a freshly installed executable can fail spuriously. macOS
+/// does not report this error, so the retry never runs there.
+async fn spawn_retrying_busy_executable(command: &mut Command) -> std::io::Result<Child> {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 1;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1254,6 +1282,9 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(&fake, permissions).expect("fake executable permissions");
         }
+        // Close the write handle before the fixture runs: Linux refuses to
+        // execute a file that is still open for writing (ETXTBSY).
+        drop(file);
         let (public_events, _) = broadcast::channel(16);
         let (lifecycle, _) = fixture_lifecycle();
         let client = AppServerClient::spawn(&fake, &workspace, public_events, lifecycle)
@@ -1333,6 +1364,9 @@ done
             permissions.set_mode(0o755);
             fs::set_permissions(&fake, permissions).expect("fake executable permissions");
         }
+        // Close the write handle before the fixture runs: Linux refuses to
+        // execute a file that is still open for writing (ETXTBSY).
+        drop(file);
 
         let bridge = AppServerBridge::new(
             workspace,
