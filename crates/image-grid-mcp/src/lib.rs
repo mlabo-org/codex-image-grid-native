@@ -672,15 +672,12 @@ fn start_or_join_native_server(config: &BridgeConfig) -> Result<ServerStartup, S
     if let Some(activation) = &config.native_app_activation {
         activate_native_app(activation, config.activation_timeout)?;
     }
-    match check_health(config, deadline)? {
-        Some(health) => {
-            return Ok(ServerStartup {
-                started: false,
-                launch_plan: None,
-                health,
-            });
-        }
-        None => {}
+    if let Some(health) = check_health(config, deadline)? {
+        return Ok(ServerStartup {
+            started: false,
+            launch_plan: None,
+            health,
+        });
     }
 
     if config.native_app_activation.is_none() && config.launch_plan.is_none() {
@@ -1617,7 +1614,9 @@ fn render_tool_result(data: &Value, server: &ServerStartup, base_url: &str) -> V
     );
     summary.push("webpPaths:".to_owned());
     if webp_paths.is_empty() {
-        summary.push("- none yet; each PNG or JPEG output gets a WebP copy when it finishes".to_owned());
+        summary.push(
+            "- none yet; each PNG or JPEG output gets a WebP copy when it finishes".to_owned(),
+        );
     } else {
         summary.extend(webp_paths.iter().map(|webp_path| format!("- {webp_path}")));
     }
@@ -2270,6 +2269,29 @@ mod tests {
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+    /// Serializes loopback port allocation across tests in this process. A
+    /// test that reserves a port, drops the listener, and lets a later bind
+    /// (in a thread or a child process) reuse it holds this lock for its whole
+    /// run, so a parallel `bind("127.0.0.1:0")` cannot be handed the freed
+    /// port in between.
+    static LOOPBACK_PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_loopback_ports() -> std::sync::MutexGuard<'static, ()> {
+        LOOPBACK_PORT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Reserves a free loopback port for a later bind and returns the guard
+    /// that keeps other tests from allocating ports until it is dropped.
+    fn reserve_loopback_port() -> (SocketAddr, std::sync::MutexGuard<'static, ()>) {
+        let guard = lock_loopback_ports();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let address = listener.local_addr().expect("reserved address");
+        drop(listener);
+        (address, guard)
+    }
+
     #[test]
     fn agent_facing_wording_follows_resolved_host() {
         assert!(tool_description(AgentHost::Codex).contains("Codex Markdown"));
@@ -2309,7 +2331,10 @@ mod tests {
 
     impl FakeServer {
         fn running(root: PathBuf, expected_requests: usize) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
+            let listener = {
+                let _ports = lock_loopback_ports();
+                TcpListener::bind("127.0.0.1:0").expect("bind fake server")
+            };
             let address = listener.local_addr().expect("fake address");
             let handle =
                 thread::spawn(move || serve_fake_native(listener, root, expected_requests));
@@ -2919,9 +2944,7 @@ skipped PATH=(none): PATH is unavailable."
     fn cold_app_activation_keeps_polling_after_the_launcher_exits_successfully() {
         let directory = TestDirectory::new("cold-app-activation");
         let root = fs::canonicalize(&directory.path).expect("canonical root");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
-        let address = listener.local_addr().expect("reserved address");
-        drop(listener);
+        let (address, _ports) = reserve_loopback_port();
         let server_root = root.clone();
         let server = thread::spawn(move || {
             thread::sleep(Duration::from_millis(150));
@@ -2967,9 +2990,7 @@ skipped PATH=(none): PATH is unavailable."
     fn configured_native_process_is_launched_once_and_verified() {
         let directory = TestDirectory::new("launch");
         let root = fs::canonicalize(&directory.path).expect("canonical root");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
-        let address = listener.local_addr().expect("reserved address");
-        drop(listener);
+        let (address, _ports) = reserve_loopback_port();
         let url = format!("http://{address}");
         let executable = env::current_exe().expect("test executable");
         let launch = LaunchPlan {
@@ -3081,9 +3102,7 @@ skipped PATH=(none): PATH is unavailable."
                 Ok((mut stream, _)) => {
                     // macOS hands the listener's nonblocking mode to accepted
                     // streams; the read must wait for the request instead.
-                    stream
-                        .set_nonblocking(false)
-                        .expect("blocking fake stream");
+                    stream.set_nonblocking(false).expect("blocking fake stream");
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .expect("fake read timeout");
