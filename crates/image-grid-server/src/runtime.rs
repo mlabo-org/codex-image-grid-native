@@ -1578,7 +1578,8 @@ impl GenerationRuntime {
                         continue;
                     }
                     if let Some(result) = item.get("result").and_then(Value::as_str)
-                        && let Err(error) = self.write_job_image(job_id, attempt_id, result).await
+                        && let Err(error) =
+                            self.write_job_image(job_id, attempt_id, result, item).await
                     {
                         self.record_attempt_failure(
                             job_id,
@@ -1598,7 +1599,9 @@ impl GenerationRuntime {
                         continue;
                     }
                     if let Some(result) = item.get("result").and_then(Value::as_str) {
-                        if let Err(error) = self.write_job_image(job_id, attempt_id, result).await {
+                        if let Err(error) =
+                            self.write_job_image(job_id, attempt_id, result, item).await
+                        {
                             self.record_attempt_failure(
                                 job_id,
                                 attempt_id,
@@ -2579,6 +2582,7 @@ impl GenerationRuntime {
         job_id: &str,
         attempt_id: &str,
         encoded: &str,
+        item: &Value,
     ) -> Result<(), RunApiError> {
         if !self.is_current_attempt(job_id, attempt_id).await {
             return Ok(());
@@ -2587,20 +2591,40 @@ impl GenerationRuntime {
             .job(job_id)
             .await
             .ok_or_else(|| RunApiError::message("job not found"))?;
-        let bytes = BASE64_STANDARD
-            .decode(encoded)
-            .map_err(|error| RunApiError::message(format!("invalid image result: {error}")))?;
         let output_path = PathBuf::from(&job.output_path);
+        let bytes = match BASE64_STANDARD.decode(encoded) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let kept =
+                    preserve_undecodable_result(&output_path, item, encoded.len(), None).await;
+                return Err(RunApiError::message(format!(
+                    "invalid image result: {error}; {kept}"
+                )));
+            }
+        };
         let webp_path = webp_copy_path(&output_path, &job.output_format);
         let output_format = job.output_format.clone();
         let wants_webp = webp_path.is_some();
-        let (bytes, webp_bytes) = tokio::task::spawn_blocking(move || {
-            let image = decode_generated_image(&bytes, &output_format)?;
-            let webp_bytes = wants_webp.then(|| encode_webp_copy(&image));
-            Ok::<_, RunApiError>((bytes, webp_bytes))
+        let decoded = tokio::task::spawn_blocking(move || {
+            match decode_generated_image(&bytes, &output_format) {
+                Ok(image) => {
+                    let webp_bytes = wants_webp.then(|| encode_webp_copy(&image));
+                    Ok((bytes, webp_bytes))
+                }
+                Err(error) => Err((error, bytes)),
+            }
         })
         .await
-        .map_err(|error| RunApiError::message(format!("image decoding failed: {error}")))??;
+        .map_err(|error| RunApiError::message(format!("image decoding failed: {error}")))?;
+        let (bytes, webp_bytes) = match decoded {
+            Ok(decoded) => decoded,
+            Err((error, bytes)) => {
+                let kept =
+                    preserve_undecodable_result(&output_path, item, encoded.len(), Some(&bytes))
+                        .await;
+                return Err(RunApiError::message(format!("{}; {kept}", error.error)));
+            }
+        };
         let temporary_path =
             output_path.with_extension(format!("{}.{}.tmp", job.output_format, Uuid::new_v4()));
         fs::write(&temporary_path, bytes)
@@ -2899,6 +2923,72 @@ fn decode_generated_image(
                 "invalid image result: decoded data is not a valid {output_format} image"
             ))
         })
+}
+
+/// Keeps an App Server image result that could not become the job's image, so
+/// a later look can tell a refusal-shaped reply from corrupt data. The item is
+/// written as `<stem>.failed-item.json` with its base64 `result` replaced by
+/// its length, and non-empty decoded bytes as `<stem>.failed-result.bin`;
+/// neither extension is listed as a generated image. Returns a short summary
+/// for the job's error message.
+async fn preserve_undecodable_result(
+    output_path: &Path,
+    item: &Value,
+    encoded_chars: usize,
+    bytes: Option<&[u8]>,
+) -> String {
+    let stem = output_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("result");
+    let directory = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut summary = vec![format!("result was {encoded_chars} base64 chars")];
+    if let Some(bytes) = bytes {
+        let detected = image::guess_format(bytes)
+            .map(|format| format!("{format:?}"))
+            .unwrap_or_else(|_| "unknown".to_owned());
+        let head = bytes
+            .iter()
+            .take(48)
+            .map(|byte| {
+                if byte.is_ascii_graphic() || *byte == b' ' {
+                    char::from(*byte)
+                } else {
+                    '.'
+                }
+            })
+            .collect::<String>();
+        summary.push(format!(
+            "{} decoded bytes, detected format {detected}, head \"{head}\"",
+            bytes.len()
+        ));
+        if !bytes.is_empty() {
+            let path = directory.join(format!("{stem}.failed-result.bin"));
+            match fs::write(&path, bytes).await {
+                Ok(()) => summary.push(format!("raw bytes kept at {}", path.display())),
+                Err(error) => summary.push(format!("could not keep raw bytes: {error}")),
+            }
+        }
+    }
+    let mut kept_item = item.clone();
+    if let Some(object) = kept_item.as_object_mut()
+        && object.contains_key("result")
+    {
+        object.insert(
+            "result".to_owned(),
+            json!({ "omittedBase64Chars": encoded_chars }),
+        );
+    }
+    let path = directory.join(format!("{stem}.failed-item.json"));
+    let written = match serde_json::to_vec_pretty(&kept_item) {
+        Ok(json) => fs::write(&path, json).await.map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    match written {
+        Ok(()) => summary.push(format!("item kept at {}", path.display())),
+        Err(error) => summary.push(format!("could not keep item: {error}")),
+    }
+    summary.join("; ")
 }
 
 /// Quality of the lossy WebP copy written beside every PNG or JPEG output.
@@ -5455,6 +5545,19 @@ done
                 .is_some_and(|path| !Path::new(path).exists())
         );
         assert_eq!(output["imageUrl"], Value::Null);
+        let output_path = PathBuf::from(output["outputPath"].as_str().expect("output path"));
+        let kept_item: Value = serde_json::from_slice(
+            &std_fs::read(output_path.with_file_name("variant-01.failed-item.json"))
+                .expect("failed item kept beside the output"),
+        )
+        .expect("failed item is JSON");
+        assert_eq!(kept_item["status"], "completed");
+        assert_eq!(kept_item["result"]["omittedBase64Chars"], 0);
+        assert!(
+            !output_path
+                .with_file_name("variant-01.failed-result.bin")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -5770,6 +5873,7 @@ done
                     &late_job_id,
                     &attempt_id,
                     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                    &Value::Null,
                 )
                 .await
                 .expect("retired late write is ignored");
