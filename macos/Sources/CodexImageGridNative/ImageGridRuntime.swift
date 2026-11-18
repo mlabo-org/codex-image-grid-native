@@ -4,14 +4,6 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-enum RuntimeConnectionState: Sendable {
-    case disconnected
-    case idle
-    case starting
-    case ready
-    case error
-}
-
 struct ImageGridTimestamp: Codable, Hashable, Sendable {
     let milliseconds: Int64
 
@@ -288,8 +280,6 @@ struct ImageGridHealthResponse: Decodable {
     let packageRootKind: String?
     let launchTarget: String?
     let generatedDir: String?
-    let appServerImageReady: Bool?
-    let appServerImageDiagnostics: ImageGridDiagnostics?
     let identity: ImageGridRuntimeIdentity?
 
     var topLevelIdentity: ImageGridRuntimeIdentity {
@@ -471,18 +461,11 @@ struct ImageGridAPIClient: Sendable {
         self.session = session
     }
 
-    func health() async throws -> (
-        state: RuntimeConnectionState,
-        generatedDirectory: URL?
-    ) {
+    /// Confirms the server is the expected one and returns its generated-image directory.
+    func health() async throws -> URL? {
         let response: ImageGridHealthResponse = try await send(path: "/api/health")
         _ = try ImageGridRuntimeIdentityValidation.validate(response)
-        let diagnostics = response.appServerImageDiagnostics
-        let ready = response.appServerImageReady == true || diagnostics?.ready == true
-            || diagnostics?.status == "ready"
-        let failed = ["error", "failed", "stopped", "exited"].contains(diagnostics?.status ?? "")
-        let directory = response.generatedDir.map { URL(fileURLWithPath: $0) }
-        return (failed ? .error : (ready ? .ready : .idle), directory)
+        return response.generatedDir.map { URL(fileURLWithPath: $0) }
     }
 
     func preflight() async throws {
@@ -825,7 +808,6 @@ struct ImageGridFailureNoticeTracker {
 final class ImageGridStore: ObservableObject {
     @Published private(set) var jobs: [String: ImageGridJob] = [:]
     @Published private(set) var deletionJobs: [String: ImageGridJob] = [:]
-    @Published private(set) var runtimeState = RuntimeConnectionState.disconnected
     @Published private(set) var generatedDirectory: URL?
     @Published private(set) var isSubmitting = false
     @Published private(set) var isAnalyzing = false
@@ -860,14 +842,12 @@ final class ImageGridStore: ObservableObject {
         switch nativeState {
         case .idle:
             stop()
-            runtimeState = .disconnected
         case .checking, .launching:
-            runtimeState = .starting
+            break
         case .ready:
             start()
         case let .failed(message):
             stop()
-            runtimeState = .disconnected
             recordConnectivityFailure(message)
         }
     }
@@ -892,14 +872,10 @@ final class ImageGridStore: ObservableObject {
     }
 
     func refreshHealth() async {
-        runtimeState = .starting
         do {
-            let health = try await client.health()
-            runtimeState = health.state
-            generatedDirectory = health.generatedDirectory
+            generatedDirectory = try await client.health()
             clearConnectivityFailure()
         } catch {
-            runtimeState = .disconnected
             recordConnectivityFailure(error.localizedDescription)
         }
     }
@@ -939,9 +915,7 @@ final class ImageGridStore: ObservableObject {
                 referenceLease?.path ?? request.referenceImagePath
             )
             if request.engine == "app-server-image" {
-                runtimeState = .starting
                 try await client.preflight()
-                runtimeState = .ready
             }
             let run = try await client.generate(request: request, batch: batch)
             merge(run.hydratedJobs)
@@ -952,7 +926,6 @@ final class ImageGridStore: ObservableObject {
             }
             return true
         } catch {
-            runtimeState = request.engine == "app-server-image" ? .error : runtimeState
             generationMessage = error.localizedDescription
             return false
         }
@@ -1106,7 +1079,6 @@ final class ImageGridStore: ObservableObject {
                 return
             } catch {
                 failures = min(5, failures + 1)
-                runtimeState = .disconnected
                 recordConnectivityFailure(error.localizedDescription)
                 let delay = Double(min(16, 1 << (failures - 1)))
                 do {
@@ -1119,10 +1091,9 @@ final class ImageGridStore: ObservableObject {
     }
 
     private func connectAndHydrate() async throws {
-        let health = try await client.health()
+        let directory = try await client.health()
         let runs = try await client.runs()
-        runtimeState = health.state
-        generatedDirectory = health.generatedDirectory
+        generatedDirectory = directory
         for run in runs {
             merge(run.hydratedJobs)
         }
@@ -1130,11 +1101,6 @@ final class ImageGridStore: ObservableObject {
     }
 
     private func receive(_ event: ImageGridSSEEvent) {
-        if case .ready = runtimeState {
-            // Preserve App Server readiness while the live stream is healthy.
-        } else {
-            runtimeState = .idle
-        }
         clearConnectivityFailure()
         let decoder = JSONDecoder()
         switch event.name {

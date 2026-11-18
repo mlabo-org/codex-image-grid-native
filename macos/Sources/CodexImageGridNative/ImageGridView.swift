@@ -45,10 +45,10 @@ enum ImageMood: String, CaseIterable, Identifiable {
 }
 
 enum ImageEngine: String, CaseIterable, Identifiable {
-    case appServerImage = "app-server-image"
-    case codexSvg = "codex-svg"
     case grokImagine2 = "grok-imagine-2"
     case grokImagine = "grok-imagine"
+    case appServerImage = "app-server-image"
+    case codexSvg = "codex-svg"
 
     /// The engine before the user picks one; the server starts from the same one.
     static let initialDefault = Self.grokImagine2
@@ -246,7 +246,6 @@ struct ImageGridView: View {
                     .frame(minWidth: 180, idealWidth: 220)
                 themeSegment
                     .frame(minWidth: 180, idealWidth: 220)
-                RuntimePill(state: store.runtimeState, strings: strings)
             }
 
             VStack(alignment: .leading, spacing: 12) {
@@ -254,7 +253,6 @@ struct ImageGridView: View {
                     .frame(maxWidth: .infinity)
                 themeSegment
                     .frame(maxWidth: .infinity)
-                RuntimePill(state: store.runtimeState, strings: strings)
             }
         }
     }
@@ -1398,56 +1396,6 @@ struct ImageGridStrings {
             "Codex App Server経由で画像を並列生成できます。",
             "Ready to generate parallel images through Codex App Server."
         )
-    }
-
-    func runtimeStatus(_ state: RuntimeConnectionState) -> String {
-        switch state {
-        case .idle:
-            localized("App Server: 待機中", "App Server: Idle")
-        case .starting:
-            localized("App Server: 接続中...", "App Server: Starting...")
-        case .ready:
-            localized("App Server: 接続済み", "App Server: Ready")
-        case .error:
-            localized("App Server: エラー", "App Server: Error")
-        case .disconnected:
-            localized("Image Grid: 切断", "Image Grid: Disconnected")
-        }
-    }
-}
-
-private struct RuntimePill: View {
-    let state: RuntimeConnectionState
-    let strings: ImageGridStrings
-
-    var body: some View {
-        Text(strings.runtimeStatus(state))
-            .appFont(.caption, weight: .semibold)
-            .foregroundStyle(foregroundColor)
-            .padding(.horizontal, 12)
-            .frame(height: 32)
-            .background(backgroundColor, in: RoundedRectangle(cornerRadius: 6))
-            .overlay {
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(foregroundColor.opacity(0.5), lineWidth: 1)
-            }
-    }
-
-    private var foregroundColor: Color {
-        switch state {
-        case .ready:
-            .green
-        case .starting:
-            .accentColor
-        case .error, .disconnected:
-            .red
-        case .idle:
-            .secondary
-        }
-    }
-
-    private var backgroundColor: Color {
-        foregroundColor.opacity(0.08)
     }
 }
 

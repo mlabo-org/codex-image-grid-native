@@ -34,8 +34,8 @@ display-safe image URLs, and Codex Markdown."
             "Generate images or edit a supplied image, singly or in Prompt Batch. \
 Use operation=generate for new images and reference-character variations; use operation=edit \
 with referenceImagePath for requested changes preserving the rest of the source. \
-Activates the installed native Codex Image Grid app (the app-server-image engine runs through the \
-Codex App Server and its Codex account), then returns handoff.md, absolute output paths, webpPaths for the lossy \
+Activates the installed native Codex Image Grid app (the Grok engines run through the local \
+Grok CLI; the app-server-image engine runs through the Codex App Server and its Codex account), then returns handoff.md, absolute output paths, webpPaths for the lossy \
 WebP copy saved beside each PNG or JPEG for web upload, display-safe image URLs, \
 and Markdown image links in the codexMarkdown field for Claude Code."
         }
@@ -2126,7 +2126,7 @@ pub fn tool_record() -> Value {
                 "engine": {
                     "type": "string",
                     "enum": ["app-server-image", "codex-svg", "grok-imagine-2", "grok-imagine"],
-                    "description": "Omit unless the user names an engine; an omitted engine uses the one last chosen in the Image Grid app. app-server-image draws with Codex image generation. codex-svg writes SVG. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style."
+                    "description": "Omit unless the user names an engine; an omitted engine uses the one last chosen in the Image Grid app. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI and is the engine used before any choice in the app. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style. app-server-image draws with Codex image generation. codex-svg writes SVG."
                 },
                 "aspectRatio": {
                     "type": "string",
