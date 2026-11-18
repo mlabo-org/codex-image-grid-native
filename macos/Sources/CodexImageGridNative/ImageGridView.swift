@@ -230,13 +230,8 @@ struct ImageGridView: View {
     }
 
     private var brand: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text("CODEX APP SERVER")
-                .appFont(.caption, weight: .bold)
-                .foregroundStyle(Color.accentColor)
-            Text("Image Grid")
-                .appFont(.largeTitle, weight: .semibold)
-        }
+        Text("Image Grid")
+            .appFont(.largeTitle, weight: .semibold)
     }
 
     private var headerControls: some View {
