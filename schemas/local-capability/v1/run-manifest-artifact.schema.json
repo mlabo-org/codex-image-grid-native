@@ -108,6 +108,7 @@
         "prompts": { "type": "array", "items": { "$ref": "#/$defs/prompt" } },
         "mood": { "type": "string" },
         "engine": { "type": "string" },
+        "requestedEngine": { "type": "string", "description": "Present when the request named gpt-image; engine is the route that was picked." },
         "model": { "type": "string" },
         "aspectRatio": { "type": "string" },
         "variantsPerPrompt": { "type": "integer" },

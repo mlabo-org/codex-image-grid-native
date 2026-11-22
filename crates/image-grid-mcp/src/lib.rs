@@ -35,7 +35,7 @@ display-safe image URLs, and Codex Markdown."
 Use operation=generate for new images and reference-character variations; use operation=edit \
 with referenceImagePath for requested changes preserving the rest of the source. \
 Activates the installed native Codex Image Grid app (the Grok engines run through the local \
-Grok CLI; the app-server-image engine runs through the Codex App Server and its Codex account), then returns handoff.md, absolute output paths, webpPaths for the lossy \
+Grok CLI; the app-server-image engine runs through the Codex App Server and its Codex account; the openai-image-api engine calls the OpenAI Image API and is billed per image), then returns handoff.md, absolute output paths, webpPaths for the lossy \
 WebP copy saved beside each PNG or JPEG for web upload, display-safe image URLs, \
 and Markdown image links in the codexMarkdown field for Claude Code."
         }
@@ -2015,6 +2015,8 @@ fn validate_tool_arguments(arguments: &Value) -> Result<(), String> {
             "codex-svg",
             "grok-imagine-2",
             "grok-imagine",
+            "gpt-image",
+            "openai-image-api",
         ],
     )?;
     validate_enum(
@@ -2090,7 +2092,7 @@ pub fn tool_record() -> Value {
                     "type": "string",
                     "enum": ["generate", "edit"],
                     "default": "generate",
-                    "description": "generate creates new images, optionally retaining reference-character traits. edit changes the supplied source image only as requested and preserves other details, style, composition and aspect ratio; requires referenceImagePath and app-server-image, grok-imagine-2, or grok-imagine. Each batch edit uses the same source independently."
+                    "description": "generate creates new images, optionally retaining reference-character traits. edit changes the supplied source image only as requested and preserves other details, style, composition and aspect ratio; requires referenceImagePath and app-server-image, grok-imagine-2, grok-imagine, gpt-image, or openai-image-api. Each batch edit uses the same source independently."
                 },
                 "prompts": {
                     "type": "array",
@@ -2125,8 +2127,8 @@ pub fn tool_record() -> Value {
                 },
                 "engine": {
                     "type": "string",
-                    "enum": ["app-server-image", "codex-svg", "grok-imagine-2", "grok-imagine"],
-                    "description": "Omit unless the user names an engine; an omitted engine uses the one last chosen in the Image Grid app. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI and is the engine used before any choice in the app. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style. app-server-image draws with Codex image generation. codex-svg writes SVG."
+                    "enum": ["app-server-image", "codex-svg", "grok-imagine-2", "grok-imagine", "gpt-image", "openai-image-api"],
+                    "description": "Omit unless the user names an engine; an omitted engine uses the one last chosen in the Image Grid app. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI and is the engine used before any choice in the app. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style. app-server-image draws with Codex image generation on the ChatGPT subscription. openai-image-api draws with the OpenAI Image API (gpt-image-2) using the API key saved in the app and is billed per image. gpt-image picks between those two when the run starts: app-server-image on a paid ChatGPT plan, openai-image-api otherwise; the returned engine is the one that drew. codex-svg writes SVG."
                 },
                 "aspectRatio": {
                     "type": "string",
@@ -2156,7 +2158,7 @@ pub fn tool_record() -> Value {
                     "if": {"required": ["operation"], "properties": {"operation": {"const": "edit"}}},
                     "then": {"required": ["referenceImagePath"], "properties": {
                         "referenceImagePath": {"minLength": 1, "pattern": "\\S"},
-                        "engine": {"enum": ["app-server-image", "grok-imagine-2", "grok-imagine"]}
+                        "engine": {"enum": ["app-server-image", "grok-imagine-2", "grok-imagine", "gpt-image", "openai-image-api"]}
                     }}
                 },
                 conditional_prompt_limit(1, 12),
@@ -2748,7 +2750,7 @@ skipped PATH=(none): PATH is unavailable."
             rule["if"]["properties"]["operation"]["const"] == "edit"
                 && rule["then"]["required"] == json!(["referenceImagePath"])
                 && rule["then"]["properties"]["engine"]["enum"]
-                    == json!(["app-server-image", "grok-imagine-2", "grok-imagine"])
+                    == json!(["app-server-image", "grok-imagine-2", "grok-imagine", "gpt-image", "openai-image-api"])
         }));
         for (arguments, expected) in [
             (
@@ -2761,7 +2763,7 @@ skipped PATH=(none): PATH is unavailable."
             ),
             (
                 json!({"prompts": ["replace burger"], "operation": "edit", "engine": "codex-svg", "referenceImagePath": "/not/read.png"}),
-                "edit requires the app-server-image, grok-imagine-2, or grok-imagine engine",
+                "edit requires the app-server-image, grok-imagine-2, grok-imagine, gpt-image, or openai-image-api engine",
             ),
             (
                 json!({"prompts": ["replace burger"], "operation": "edti"}),

@@ -4,6 +4,7 @@ use std::env;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -31,12 +32,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .transpose()?;
     let config = RuntimeConfig::new(server_root, data_dir, workspace_dir, options.launch_target);
     config.prepare_directories()?;
+    let openai_api_key = options
+        .openai_api_key_stdin
+        .then(read_openai_api_key)
+        .transpose()?;
 
     let listener = tokio::net::TcpListener::bind(options.bind).await?;
     let address = listener.local_addr()?;
     println!("listening: http://{address}");
 
     let (app, shutdown) = router_with_shutdown(config);
+    // Set before the first request is served, so a run submitted the moment
+    // the port answers already has the key.
+    if let Some(api_key) = openai_api_key {
+        shutdown.set_openai_api_key(&api_key);
+    }
     let signal_shutdown = shutdown.clone();
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -49,6 +59,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
     shutdown.shutdown().await;
     serve_result?;
     Ok(())
+}
+
+/// Reads the OpenAI API key the app wrote to standard input. Standard input
+/// keeps the key out of the arguments and the environment, which `ps` shows
+/// and child processes inherit.
+fn read_openai_api_key() -> Result<String, String> {
+    const MAX_KEY_BYTES: u64 = 8 * 1024;
+    let mut api_key = String::new();
+    std::io::stdin()
+        .take(MAX_KEY_BYTES)
+        .read_to_string(&mut api_key)
+        .map_err(|error| format!("could not read the OpenAI API key from standard input: {error}"))?;
+    Ok(api_key)
 }
 
 fn validate_loopback_bind(bind: SocketAddr) -> Result<(), String> {
@@ -137,6 +160,8 @@ struct Options {
     server_root: PathBuf,
     workspace_dir: Option<PathBuf>,
     launch_target: String,
+    /// Read the OpenAI API key from standard input before serving.
+    openai_api_key_stdin: bool,
     help: bool,
 }
 
@@ -162,6 +187,7 @@ impl Options {
             server_root,
             workspace_dir,
             launch_target,
+            openai_api_key_stdin: false,
             help: false,
         };
         let mut arguments = arguments;
@@ -192,6 +218,7 @@ impl Options {
                         .to_string_lossy()
                         .into_owned();
                 }
+                "--openai-api-key-stdin" => options.openai_api_key_stdin = true,
                 "--help" | "-h" => options.help = true,
                 unknown => return Err(format!("unknown argument: {unknown}")),
             }
@@ -256,7 +283,8 @@ fn print_help() {
            --data-root <PATH>          Native runtime data root\n\
            --server-root <PATH>        Runtime package root reported by health\n\
            --workspace-root <PATH>     Workspace path reported by health\n\
-           --launch-target <NAME>      Launch identity reported by health\n"
+           --launch-target <NAME>      Launch identity reported by health\n\
+           --openai-api-key-stdin      Read the OpenAI API key from standard input\n"
     );
 }
 

@@ -15,7 +15,9 @@ import Foundation
     #expect(ImageEngine.allCases.map(\.rawValue) == [
         "grok-imagine-2",
         "grok-imagine",
+        "gpt-image",
         "app-server-image",
+        "openai-image-api",
         "codex-svg",
     ])
     #expect(AspectRatio.allCases.map(\.rawValue) == ["16:9", "4:3", "1:1", "3:4", "9:16"])

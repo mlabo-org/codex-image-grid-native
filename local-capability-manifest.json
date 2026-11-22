@@ -34,7 +34,7 @@
         },
         {
           "authority": "image.generate",
-          "reason": "Conditionally requests image generation when engine is app-server-image (Codex App Server) or grok-imagine-2 / grok-imagine (local Grok CLI); codex-svg remains a local deterministic image-output route."
+          "reason": "Conditionally requests image generation when engine is app-server-image (Codex App Server), openai-image-api (OpenAI Image API, billed per image to the API key saved in the app), gpt-image (one of those two, picked from the ChatGPT plan), or grok-imagine-2 / grok-imagine (local Grok CLI); codex-svg remains a local deterministic image-output route."
         }
       ],
       "artifactRoots": [],

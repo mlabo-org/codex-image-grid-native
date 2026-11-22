@@ -420,7 +420,9 @@ struct ResultCardView: View {
         let promptPart = (job.promptTotal ?? 1) > 1
             ? "Prompt \(job.promptIndex ?? 1)/\(job.promptTotal ?? 1) · "
             : ""
-        return "\(promptPart)Variant \(job.variant ?? 1)/\(job.total ?? 1) · \(job.model ?? job.engine ?? "job")"
+        // The API route bills each image, so its cards say which route drew them.
+        let route = job.engine == "openai-image-api" ? " · API" : ""
+        return "\(promptPart)Variant \(job.variant ?? 1)/\(job.total ?? 1) · \(job.model ?? job.engine ?? "job")\(route)"
     }
 
     private func imageRequestIdentity(_ imageURL: URL) -> ResultCardImageRequestIdentity {

@@ -1,6 +1,7 @@
 mod analysis;
 mod app_server;
 mod http_json;
+mod openai_image;
 mod runtime;
 
 pub use app_server::{
@@ -165,6 +166,9 @@ pub struct HealthResponse {
     pub jobs: usize,
     /// The engine a run uses when its request names none.
     pub default_engine: String,
+    /// Whether the server holds an OpenAI API key for the `openai-image-api`
+    /// engine. The key itself is never reported.
+    pub openai_api_key_configured: bool,
     pub app_server_image: bool,
     pub app_server_image_ready: bool,
     pub app_server_image_diagnostics: AppServerDiagnostics,
@@ -181,6 +185,7 @@ impl HealthResponse {
             SchedulerSnapshot::default(),
             0,
             runtime::load_default_engine(&config.data_dir),
+            false,
         )
     }
 
@@ -190,12 +195,14 @@ impl HealthResponse {
         scheduler: SchedulerSnapshot,
         jobs: usize,
         default_engine: String,
+        openai_api_key_configured: bool,
     ) -> Self {
         let identity = RuntimeIdentity::from_config(config, diagnostics.clone(), scheduler);
         Self {
             ok: true,
             jobs,
             default_engine,
+            openai_api_key_configured,
             app_server_image: diagnostics.ready,
             app_server_image_ready: diagnostics.ready,
             app_server_image_diagnostics: diagnostics,
@@ -241,6 +248,14 @@ impl RuntimeState {
 #[derive(Clone)]
 pub struct RuntimeShutdown {
     generation: GenerationRuntime,
+}
+
+impl RuntimeShutdown {
+    /// Gives the runtime the OpenAI API key read at launch; a blank key
+    /// leaves it without one. Returns whether a key is now held.
+    pub fn set_openai_api_key(&self, api_key: &str) -> bool {
+        self.generation.set_openai_api_key(Some(api_key))
+    }
 }
 
 impl RuntimeShutdown {
@@ -310,6 +325,11 @@ fn router_with_state(state: RuntimeState) -> Router {
             "/api/preferences/default-engine",
             axum::routing::put(set_default_engine),
         )
+        .route(
+            "/api/preferences/openai-api-key",
+            axum::routing::put(set_openai_api_key),
+        )
+        .route("/api/gpt-image-route", get(gpt_image_route))
         .layer(middleware::from_fn(reject_non_loopback_origin))
         .with_state(state)
 }
@@ -361,7 +381,40 @@ async fn health(State(state): State<RuntimeState>) -> Json<HealthResponse> {
         scheduler,
         jobs,
         default_engine,
+        state.generation.openai_api_key_configured(),
     ))
+}
+
+/// Takes the OpenAI API key from the app, or clears it when the body carries
+/// none. The key stays in memory and is not echoed back.
+async fn set_openai_api_key(State(state): State<RuntimeState>, request: AxumRequest) -> Response {
+    let body = match http_json::read_json_body(request).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    let configured = state
+        .generation
+        .set_openai_api_key(body.get("apiKey").and_then(Value::as_str));
+    (
+        StatusCode::OK,
+        Json(json!({ "openaiApiKeyConfigured": configured })),
+    )
+        .into_response()
+}
+
+/// Reports which route a `gpt-image` run would take right now.
+async fn gpt_image_route(State(state): State<RuntimeState>) -> Response {
+    match state.generation.gpt_image_route().await {
+        Ok(route) => (
+            StatusCode::OK,
+            Json(json!({
+                "engine": route.engine(),
+                "openaiApiKeyConfigured": state.generation.openai_api_key_configured(),
+            })),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, Json(error.body())).into_response(),
+    }
 }
 
 async fn set_default_engine(State(state): State<RuntimeState>, request: AxumRequest) -> Response {

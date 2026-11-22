@@ -464,9 +464,19 @@ private actor FoundationNativeRuntimeProcess: NativeRuntimeProcessHandle {
     init(plan: NativeRuntimeLaunchPlan) throws {
         let process = Process()
         process.executableURL = plan.executableURL
-        process.arguments = plan.arguments
         process.currentDirectoryURL = plan.currentDirectoryURL
-        process.standardInput = FileHandle.nullDevice
+        // The server reads the OpenAI API key from standard input before it
+        // serves its first request, so a run submitted the moment health turns
+        // ready already has it.
+        let keyInput = OpenAIAPIKeyStore.shared.read().map { ($0, Pipe()) }
+        if let (_, pipe) = keyInput {
+            process.arguments =
+                plan.arguments + [OpenAIAPIKeyStore.serverStandardInputArgument]
+            process.standardInput = pipe
+        } else {
+            process.arguments = plan.arguments
+            process.standardInput = FileHandle.nullDevice
+        }
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do {
@@ -476,6 +486,12 @@ private actor FoundationNativeRuntimeProcess: NativeRuntimeProcessHandle {
                 "Could not launch Image Grid Native with \(plan.source.rawValue): "
                     + error.localizedDescription
             )
+        }
+        if let (key, pipe) = keyInput {
+            // Closing the pipe ends the server's read; a failed write leaves
+            // the server without a key, which its API engine reports.
+            try? pipe.fileHandleForWriting.write(contentsOf: Data(key.utf8))
+            try? pipe.fileHandleForWriting.close()
         }
         self.process = process
         launchedProcessIdentifier = process.processIdentifier

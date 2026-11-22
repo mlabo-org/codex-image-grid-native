@@ -66,7 +66,17 @@ Rust owns:
 - global concurrency, retries, timeouts, cooldowns, and diagnostics;
 - reference-image validation and staging;
 - manifest, handoff, and generated-file paths;
-- Codex App Server JSON-RPC transport and notification routing.
+- Codex App Server JSON-RPC transport and notification routing;
+- the OpenAI Image API call of the `openai-image-api` engine, and the choice
+  between it and the App Server route for `gpt-image`.
+
+The OpenAI API key belongs to the SwiftUI app, which keeps it in the macOS
+keychain and hands it to the server: on the server's standard input at launch
+(`--openai-api-key-stdin`) and through `PUT /api/preferences/openai-api-key`
+when it changes. It is never placed in the server's arguments or environment,
+which `ps` shows and the Codex and Grok child processes inherit. The server
+holds it in memory only. `/api/health` reports
+`openaiApiKeyConfigured`, never the key.
 
 ### Rust server
 
@@ -130,7 +140,11 @@ The following are public behavior and must remain stable at cutover:
 - `app-server-image` and `codex-svg` engines (`grok-imagine` was added later
   as an opt-in engine that runs the local Grok CLI's Imagine tools and saves
   JPEG output; `grok-imagine-2` was added after that, the same route with the
-  CLI told to draw with Grok Imagine 2.0; a request without an engine, once
+  CLI told to draw with Grok Imagine 2.0; `openai-image-api` was added after
+  that, calling the OpenAI Image API with an API key and billing each image,
+  together with `gpt-image`, which picks `app-server-image` or
+  `openai-image-api` from the ChatGPT plan when a run is admitted; a request
+  without an engine, once
   `app-server-image`, later took the engine last chosen in the app, kept in
   `preferences.json` and reported as `defaultEngine` in `/api/health`);
 - maximums: 12 prompts, 6 variants per prompt, 24 total jobs;

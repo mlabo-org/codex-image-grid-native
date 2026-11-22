@@ -32,6 +32,8 @@ import Testing
     #expect(!ImageGridOperation.edit.canSubmit(engine: "app-server-image", referenceImagePath: "  "))
     #expect(!ImageGridOperation.edit.canSubmit(engine: "codex-svg", referenceImagePath: "/tmp/source.png"))
     #expect(ImageGridOperation.edit.canSubmit(engine: "grok-imagine-2", referenceImagePath: "/tmp/source.png"))
+    #expect(ImageGridOperation.edit.canSubmit(engine: "gpt-image", referenceImagePath: "/tmp/source.png"))
+    #expect(ImageGridOperation.edit.canSubmit(engine: "openai-image-api", referenceImagePath: "/tmp/source.png"))
     #expect(ImageGridOperation.edit.canSubmit(engine: "grok-imagine", referenceImagePath: "/tmp/source.png"))
     #expect(ImageGridOperation.generate.canSubmit(engine: "codex-svg", referenceImagePath: nil))
 }

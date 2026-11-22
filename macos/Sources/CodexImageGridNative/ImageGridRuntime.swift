@@ -42,8 +42,13 @@ enum ImageGridOperation: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var id: String { rawValue }
 
+    /// The engines that can edit a supplied image; `codex-svg` cannot.
+    static let editEngines: Set<String> = [
+        "app-server-image", "grok-imagine-2", "grok-imagine", "gpt-image", "openai-image-api",
+    ]
+
     func canSubmit(engine: String, referenceImagePath: String?) -> Bool {
-        self == .generate || (["app-server-image", "grok-imagine-2", "grok-imagine"].contains(engine)
+        self == .generate || (Self.editEngines.contains(engine)
             && !(referenceImagePath ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 }
@@ -239,6 +244,21 @@ private struct ImageGridDefaultEngineRequest: Encodable {
 
 private struct ImageGridDefaultEngineResponse: Decodable {
     let defaultEngine: String
+}
+
+private struct ImageGridOpenAIAPIKeyRequest: Encodable {
+    /// Omitted from the body when nil, which clears the server's key.
+    let apiKey: String?
+}
+
+private struct ImageGridOpenAIAPIKeyResponse: Decodable {
+    let openaiApiKeyConfigured: Bool
+}
+
+/// Which engine a `gpt-image` run would use right now.
+struct ImageGridGPTImageRoute: Decodable, Equatable, Sendable {
+    let engine: String
+    let openaiApiKeyConfigured: Bool
 }
 
 struct ImageGridDeleteRunFailure: Decodable, Equatable, Sendable {
@@ -525,6 +545,19 @@ struct ImageGridAPIClient: Sendable {
             method: "PUT",
             body: ImageGridDefaultEngineRequest(engine: engine)
         )
+    }
+
+    /// Hands the server the OpenAI API key, or clears it with nil.
+    func setOpenAIAPIKey(_ apiKey: String?) async throws {
+        let _: ImageGridOpenAIAPIKeyResponse = try await send(
+            path: "/api/preferences/openai-api-key",
+            method: "PUT",
+            body: ImageGridOpenAIAPIKeyRequest(apiKey: apiKey)
+        )
+    }
+
+    func gptImageRoute() async throws -> ImageGridGPTImageRoute {
+        try await send(path: "/api/gpt-image-route")
     }
 
     func analyze(referenceImagePath: String) async throws -> String {
@@ -905,7 +938,7 @@ final class ImageGridStore: ObservableObject {
             guard request.operation.canSubmit(
                 engine: request.engine, referenceImagePath: request.referenceImagePath
             ) else {
-                throw ImageGridAPIError(message: "Image editing requires a source image and the App Server Image or Grok Imagine engine.")
+                throw ImageGridAPIError(message: "Image editing requires a source image and a Grok Imagine or GPT Image engine.")
             }
             let referenceLease = try Self.makeReferenceOperationLease(
                 referenceImagePath: request.referenceImagePath
@@ -947,6 +980,22 @@ final class ImageGridStore: ObservableObject {
         } catch {
             referenceAnalysisMessage = error.localizedDescription
             return nil
+        }
+    }
+
+    func applyOpenAIAPIKey(_ apiKey: String?) async throws {
+        try await client.setOpenAIAPIKey(apiKey)
+    }
+
+    /// The route a `gpt-image` run would take now, or the server's reason it
+    /// cannot tell.
+    func gptImageRoute() async -> Result<ImageGridGPTImageRoute, ImageGridAPIError> {
+        do {
+            return .success(try await client.gptImageRoute())
+        } catch let error as ImageGridAPIError {
+            return .failure(error)
+        } catch {
+            return .failure(ImageGridAPIError(message: error.localizedDescription))
         }
     }
 

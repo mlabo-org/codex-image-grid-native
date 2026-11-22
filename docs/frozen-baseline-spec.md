@@ -54,7 +54,8 @@ The baseline executable contract is:
 | default `waitMs` | 0 |
 
 The native project later departed from two rows above: it added the
-`grok-imagine` and `grok-imagine-2` engines, and a request without an engine
+`grok-imagine`, `grok-imagine-2`, `openai-image-api`, and `gpt-image` engines,
+and a request without an engine
 uses the engine last chosen in the app (`grok-imagine-2` before any choice)
 instead of `app-server-image`.
 

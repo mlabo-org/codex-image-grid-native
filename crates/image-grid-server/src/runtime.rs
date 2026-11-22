@@ -1,4 +1,5 @@
 use crate::app_server::{AppServerBridge, AppServerClient, RUNTIME_CLOSED_MESSAGE};
+use crate::openai_image;
 use crate::{RuntimeConfig, RuntimeIdentity, SchedulerSnapshot};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -38,11 +39,15 @@ const GROK_IMAGINE_ATTEMPTS: u32 = 2;
 /// The Imagine model the grok-imagine-2 engine asks the Grok CLI for. The CLI's
 /// own default (grok-imagine-image-quality) is what grok-imagine draws with.
 const GROK_IMAGINE_2_MODEL: &str = "grok-imagine-image-2.0";
-const ENGINES: [&str; 4] = [
+const OPENAI_IMAGE_CONCURRENCY: usize = 4;
+const ACCOUNT_READ_TIMEOUT: Duration = Duration::from_secs(20);
+const ENGINES: [&str; 6] = [
     "app-server-image",
     "codex-svg",
     "grok-imagine-2",
     "grok-imagine",
+    openai_image::AUTO_ENGINE,
+    openai_image::API_ENGINE,
 ];
 /// The engine a run without one uses until the app records a choice.
 const INITIAL_DEFAULT_ENGINE: &str = "grok-imagine-2";
@@ -306,6 +311,10 @@ struct RunRequestRecord {
     prompts: Vec<PromptRecord>,
     mood: String,
     engine: String,
+    /// The engine the request named when it left the choice to the server
+    /// (`gpt-image`); `engine` is the one that was picked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_engine: Option<String>,
     model: String,
     aspect_ratio: String,
     variants_per_prompt: usize,
@@ -489,6 +498,14 @@ struct RuntimeInner {
     image_slots: Arc<Semaphore>,
     svg_slots: Arc<Semaphore>,
     grok_slots: Arc<Semaphore>,
+    openai_slots: Arc<Semaphore>,
+    /// The OpenAI API key. It arrives from the app on the server's standard
+    /// input at launch or through the preferences route, is held in memory
+    /// only, and is never put in an environment, where the Codex and Grok
+    /// child processes would inherit it.
+    openai_api_key: std::sync::RwLock<Option<String>>,
+    openai_base_url: std::sync::RwLock<String>,
+    openai_client: reqwest::Client,
     queued_jobs: AtomicUsize,
     artifact_write: Mutex<()>,
     recovery: RecoveryConfig,
@@ -538,6 +555,12 @@ impl GenerationRuntime {
                 image_slots: Arc::new(Semaphore::new(MAX_RUN_JOBS)),
                 svg_slots: Arc::new(Semaphore::new(CODEX_SVG_CONCURRENCY)),
                 grok_slots: Arc::new(Semaphore::new(GROK_IMAGINE_CONCURRENCY)),
+                openai_slots: Arc::new(Semaphore::new(OPENAI_IMAGE_CONCURRENCY)),
+                openai_api_key: std::sync::RwLock::new(None),
+                openai_base_url: std::sync::RwLock::new(
+                    openai_image::DEFAULT_BASE_URL.to_owned(),
+                ),
+                openai_client: reqwest::Client::new(),
                 queued_jobs: AtomicUsize::new(0),
                 artifact_write: Mutex::new(()),
                 recovery,
@@ -581,6 +604,88 @@ impl GenerationRuntime {
         .await?;
         *current = engine.to_owned();
         Ok(())
+    }
+
+    /// Replaces the OpenAI API key the `openai-image-api` engine sends; an
+    /// empty or missing key clears it. Returns whether a key is now held.
+    pub(crate) fn set_openai_api_key(&self, api_key: Option<&str>) -> bool {
+        let api_key = normalize_api_key(api_key);
+        let configured = api_key.is_some();
+        *self
+            .inner
+            .openai_api_key
+            .write()
+            .expect("OpenAI API key lock poisoned") = api_key;
+        configured
+    }
+
+    pub(crate) fn openai_api_key_configured(&self) -> bool {
+        self.openai_api_key().is_some()
+    }
+
+    fn openai_api_key(&self) -> Option<String> {
+        self.inner
+            .openai_api_key
+            .read()
+            .expect("OpenAI API key lock poisoned")
+            .clone()
+    }
+
+    /// Asks the Codex App Server for the signed-in account and reads the GPT
+    /// Image route from its plan. A Codex that cannot answer picks no route:
+    /// drawing through the API on a failed lookup would bill the user for a
+    /// run their subscription may cover.
+    pub(crate) async fn gpt_image_route(&self) -> Result<openai_image::Route, RunApiError> {
+        let unknown = |reason: String| {
+            RunApiError::new(
+                format!(
+                    "{reason}. Name the engine instead: app-server-image draws with the ChatGPT \
+subscription, openai-image-api draws with the OpenAI API key and is billed per image."
+                ),
+                "GptImageRouteUnknown",
+            )
+        };
+        let client = self.inner.app_server.ready_client().await.map_err(|diagnostics| {
+            unknown(format!(
+                "Codex App Server is not ready, so the ChatGPT plan could not be read ({})",
+                diagnostics
+                    .error
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| "no diagnostic".to_owned())
+            ))
+        })?;
+        let account = client
+            .request(
+                "account/read",
+                json!({ "refreshToken": true }),
+                ACCOUNT_READ_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                unknown(format!(
+                    "Codex App Server could not read the account ({})",
+                    error.message
+                ))
+            })?;
+        openai_image::route_for_account(&account).map_err(unknown)
+    }
+
+    /// Turns the engine a request named into the one its jobs run on, and
+    /// refuses an API run that has no key before anything is created.
+    async fn resolve_engine(&self, engine: &str) -> Result<String, RunApiError> {
+        let engine = if engine == openai_image::AUTO_ENGINE {
+            self.gpt_image_route().await?.engine()
+        } else {
+            engine
+        };
+        if engine == openai_image::API_ENGINE && !self.openai_api_key_configured() {
+            return Err(RunApiError::new(
+                "the openai-image-api engine needs an OpenAI API key; save one in the Image Grid \
+app's settings",
+                "OpenAiApiKeyMissing",
+            ));
+        }
+        Ok(engine.to_owned())
     }
 
     fn persist_normalized_restorations(&self, run_ids: Vec<String>) {
@@ -833,12 +938,15 @@ impl GenerationRuntime {
             return Err(runtime_closed_api_error());
         }
         let default_engine = self.default_engine().await;
-        let request = normalize_request(
+        let mut request = normalize_request(
             body,
             require_prompts_array,
             query_wait_ms,
             &default_engine,
         )?;
+        let resolved_engine = self.resolve_engine(&request.engine).await?;
+        let requested_engine = (resolved_engine != request.engine)
+            .then(|| std::mem::replace(&mut request.engine, resolved_engine));
         let (run_id, run_directory) = self
             .reserve_run_directory(|| Uuid::new_v4().to_string()[..8].to_owned())
             .await?;
@@ -884,6 +992,7 @@ impl GenerationRuntime {
                 "app-server-image" => "app-server-image",
                 "grok-imagine" => "grok-imagine",
                 "grok-imagine-2" => GROK_IMAGINE_2_MODEL,
+                openai_image::API_ENGINE => openai_image::MODEL,
                 _ => "codex-app-server",
             }
             .to_owned();
@@ -900,6 +1009,7 @@ impl GenerationRuntime {
                     .collect(),
                 mood: request.mood.clone(),
                 engine: request.engine.clone(),
+                requested_engine: requested_engine.clone(),
                 model: model.clone(),
                 aspect_ratio: request.aspect_ratio.clone(),
                 variants_per_prompt: request.count,
@@ -1012,6 +1122,7 @@ impl GenerationRuntime {
         for job in &created {
             let is_svg = job.engine == "codex-svg";
             let is_grok = is_grok_engine(&job.engine);
+            let is_openai = job.engine == openai_image::API_ENGINE;
             if !is_svg {
                 self.inner.queued_jobs.fetch_add(1, Ordering::Relaxed);
             }
@@ -1027,6 +1138,8 @@ impl GenerationRuntime {
                             runtime.inner.svg_slots.clone().acquire_owned().await
                         } else if is_grok {
                             runtime.inner.grok_slots.clone().acquire_owned().await
+                        } else if is_openai {
+                            runtime.inner.openai_slots.clone().acquire_owned().await
                         } else {
                             runtime.inner.image_slots.clone().acquire_owned().await
                         }
@@ -1305,6 +1418,7 @@ impl GenerationRuntime {
         match job.engine.as_str() {
             "codex-svg" => self.run_codex_svg_job(job_id).await,
             "grok-imagine" | "grok-imagine-2" => self.run_grok_imagine_job(job_id).await,
+            openai_image::API_ENGINE => self.run_openai_image_job(job_id).await,
             _ => self.run_app_server_image_job_with_retries(job_id).await,
         }
     }
@@ -1845,6 +1959,20 @@ impl GenerationRuntime {
                 return;
             }
         };
+        let source = display_path(&image);
+        self.install_job_image(job_id, &job, bytes, format!("[grok-imagine] source={source}"))
+            .await;
+    }
+
+    /// Checks that `bytes` decode as the job's format, installs them as the
+    /// job's output with its WebP copy, and marks the job done.
+    async fn install_job_image(
+        &self,
+        job_id: &str,
+        job: &ImageGridJob,
+        bytes: Vec<u8>,
+        diagnostic: String,
+    ) {
         let output_path = PathBuf::from(&job.output_path);
         let webp_path = webp_copy_path(&output_path, &job.output_format);
         let output_format = job.output_format.clone();
@@ -1894,17 +2022,144 @@ impl GenerationRuntime {
             _ => None,
         };
         let image_url = format!("/generated/{}/{}", job.run_id, job.filename);
-        let source = display_path(&image);
         self.update_job(job_id, |job, now| {
             job.status = "done".to_owned();
             job.status_text = "Generated".to_owned();
             job.image_url = Some(image_url);
             job.error_code = None;
             job.error_message = None;
-            append_job_diagnostic(job, format!("[grok-imagine] source={source}"));
+            append_job_diagnostic(job, diagnostic);
             record_webp_copy(job, webp);
             job.timing.transition("done", now);
         })
+        .await;
+    }
+
+    async fn run_openai_image_job(&self, job_id: &str) {
+        let Some(job) = self.job(job_id).await else {
+            return;
+        };
+        let Some(api_key) = self.openai_api_key() else {
+            self.fail_job(
+                job_id,
+                "OpenAiApiKeyMissing",
+                "the OpenAI API key was removed before this job started",
+            )
+            .await;
+            return;
+        };
+        let reference = match &job.reference_image_path {
+            Some(path) => match fs::read(path).await {
+                Ok(bytes) => Some((reference_media_type(path), bytes)),
+                Err(error) => {
+                    self.fail_job(
+                        job_id,
+                        "ReferenceImageUnavailable",
+                        &format!("could not read the staged reference image {path}: {error}"),
+                    )
+                    .await;
+                    return;
+                }
+            },
+            None => None,
+        };
+        let request = match openai_image::build_request(
+            &build_openai_image_prompt(&job),
+            &job.aspect_ratio,
+            job.operation == ImageOperation::Edit,
+            reference
+                .as_ref()
+                .map(|(media_type, bytes)| (*media_type, bytes.as_slice())),
+        ) {
+            Ok(request) => request,
+            Err(failure) => {
+                self.fail_job(job_id, failure.code, &failure.message).await;
+                return;
+            }
+        };
+        drop(reference);
+        let base_url = self
+            .inner
+            .openai_base_url
+            .read()
+            .expect("OpenAI base URL lock poisoned")
+            .clone();
+        let deadline = Instant::now() + self.inner.recovery.job_timeout;
+        let mut shutdown = self.shutdown_receiver();
+        let mut attempt = 0;
+        let bytes = loop {
+            attempt += 1;
+            self.update_job(job_id, |job, now| {
+                job.status = "running".to_owned();
+                job.status_text = "Waiting for the OpenAI Image API...".to_owned();
+                job.timing.transition("running", now);
+            })
+            .await;
+            let sent = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => return,
+                sent = timeout_at(
+                    deadline,
+                    openai_image::send(&self.inner.openai_client, &base_url, &api_key, &request),
+                ) => sent,
+            };
+            let failure = match sent {
+                Ok(Ok(bytes)) => break bytes,
+                Ok(Err(failure)) => failure,
+                Err(_) => {
+                    self.fail_job(
+                        job_id,
+                        "ImageGenerationTimeout",
+                        &format!(
+                            "Timed out waiting for the OpenAI Image API after {}ms",
+                            self.inner.recovery.job_timeout.as_millis()
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let retry_after = failure
+                .retry_after
+                .filter(|_| attempt < openai_image::ATTEMPTS);
+            let Some(retry_after) = retry_after else {
+                let status = failure.status.map(|status| status.to_string());
+                self.update_job(job_id, |job, _| job.upstream_status = status)
+                    .await;
+                self.fail_job(job_id, failure.code, &failure.message).await;
+                return;
+            };
+            self.update_job(job_id, |job, _| {
+                job.retry_count = job.retry_count.saturating_add(1);
+                job.status_text = format!(
+                    "Retrying the OpenAI Image API in {}s...",
+                    retry_after.as_secs()
+                );
+                append_job_diagnostic(
+                    job,
+                    format!(
+                        "[openai-image-api] attempt={attempt} {}: {}",
+                        failure.code, failure.message
+                    ),
+                );
+            })
+            .await;
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => return,
+                _ = sleep(retry_after) => {}
+            }
+        };
+        self.install_job_image(
+            job_id,
+            &job,
+            bytes,
+            format!(
+                "[openai-image-api] model={} endpoint={}",
+                openai_image::MODEL,
+                request.path
+            ),
+        )
         .await;
     }
 
@@ -2850,6 +3105,7 @@ impl GenerationRuntime {
         self.inner.image_slots.close();
         self.inner.svg_slots.close();
         self.inner.grok_slots.close();
+        self.inner.openai_slots.close();
         let _ = self.inner.shutdown_signal.send(true);
         self.inner.queued_jobs.store(0, Ordering::Release);
         self.inner.attempts.write().await.clear();
@@ -4043,9 +4299,34 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RunApiError> {
 }
 
 fn build_image_prompt(job: &ImageGridJob) -> String {
+    image_prompt(job, true)
+}
+
+/// The prompt sent to the OpenAI Image API: the App Server prompt without the
+/// lines that tell a Codex agent to call its image tool, so both GPT Image
+/// routes ask for the same image.
+fn build_openai_image_prompt(job: &ImageGridJob) -> String {
+    image_prompt(job, false)
+}
+
+/// `via_tool` words the prompt for a Codex agent that draws by calling its
+/// image generation tool; without it the prompt goes to the image model as is.
+fn image_prompt(job: &ImageGridJob, via_tool: bool) -> String {
     if job.operation == ImageOperation::Edit {
+        let (opening, tool_rules) = if via_tool {
+            (
+                "Use the image generation tool to edit the attached source image and return exactly one edited image.",
+                "- Do not create SVG or HTML. Edit the image through the image generation tool using the attached source.\n\
+- Do not ask follow-up questions.\n",
+            )
+        } else {
+            (
+                "Edit the attached source image and return exactly one edited image.",
+                "",
+            )
+        };
         return format!(
-            "Use the image generation tool to edit the attached source image and return exactly one edited image.\n\n\
+            "{opening}\n\n\
 User edit request:\n{}\n\n\
 Editing requirements:\n\
 - The attached local image is the source to edit, not a character reference for a new composition.\n\
@@ -4053,8 +4334,7 @@ Editing requirements:\n\
 - Preserve the source aspect ratio unless the user edit request explicitly changes it.\n\
 - Make only the local adjustments needed for a natural result, such as the grip when replacing a held object.\n\
 - Each batch output independently applies its request to the same source. Do not introduce unrelated variation between outputs.\n\
-- Do not create SVG or HTML. Edit the image through the image generation tool using the attached source.\n\
-- Do not ask follow-up questions.\n",
+{tool_rules}",
             job.prompt
         );
     }
@@ -4079,8 +4359,17 @@ Editing requirements:\n\
     } else {
         format!("Variant {} of {}", job.variant, job.total)
     };
+    let (opening, tool_rules) = if via_tool {
+        (
+            "Use the image generation tool to create exactly one polished thumbnail image.",
+            "- Do not create SVG or HTML. Generate the image through the image generation tool.\n\
+- Do not ask follow-up questions.\n",
+        )
+    } else {
+        ("Create exactly one polished thumbnail image.", "")
+    };
     format!(
-        "Use the image generation tool to create exactly one polished thumbnail image.\n\n\
+        "{opening}\n\n\
 Reference premise:\n{premise}\n\n\
 User concept:\n{}\n\n\
 {mood}\
@@ -4093,10 +4382,26 @@ Composition requirements:\n\
 - Preserve the reference character's recognizable traits when a reference image is attached.\n\
 - If using Japanese or English text, keep it short, readable, and non-overlapping.\n\
 - Avoid generic stock-photo blandness and avoid scammy information-product styling.\n\
-- Do not create SVG or HTML. Generate the image through the image generation tool.\n\
-- Do not ask follow-up questions.\n",
+{tool_rules}",
         job.prompt, job.aspect_ratio
     )
+}
+
+/// A key with surrounding whitespace removed; blank means no key.
+fn normalize_api_key(api_key: Option<&str>) -> Option<String> {
+    api_key
+        .map(str::trim)
+        .filter(|api_key| !api_key.is_empty())
+        .map(str::to_owned)
+}
+
+/// The media type of a staged reference image, from the name it was staged under.
+fn reference_media_type(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|value| value.to_str()) {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        _ => "image/png",
+    }
 }
 
 fn is_grok_engine(engine: &str) -> bool {
@@ -5245,6 +5550,7 @@ done
             }],
             mood: job.mood.clone(),
             engine: job.engine.clone(),
+            requested_engine: None,
             model: job.model.clone(),
             aspect_ratio: job.aspect_ratio.clone(),
             variants_per_prompt: job.total,
@@ -5959,6 +6265,7 @@ done
             }],
             mood: job.mood.clone(),
             engine: job.engine.clone(),
+            requested_engine: None,
             model: job.model.clone(),
             aspect_ratio: job.aspect_ratio.clone(),
             variants_per_prompt: job.total,
@@ -6055,6 +6362,7 @@ done
                 }],
                 mood: first.mood.clone(),
                 engine: first.engine.clone(),
+                requested_engine: None,
                 model: first.model.clone(),
                 aspect_ratio: first.aspect_ratio.clone(),
                 variants_per_prompt: jobs.len(),
@@ -6251,5 +6559,235 @@ done
                 .filter_map(Result::ok)
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
         );
+    }
+
+    const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    /// A stand-in for the OpenAI Image API on a loopback port. It records each
+    /// call's path, Authorization header and JSON body, and answers with the
+    /// queued responses in order, repeating the last one.
+    async fn fake_image_api(
+        responses: Vec<(u16, Value)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<(String, String, Value)>>>) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let responses = Arc::new(responses);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let (recorded, responses) = (recorded.clone(), responses.clone());
+            async move {
+                let path = request.uri().path().to_owned();
+                let authorization = request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .expect("request body");
+                let body = serde_json::from_slice(&body).expect("JSON request");
+                let index = {
+                    let mut recorded = recorded.lock().expect("recorded calls");
+                    recorded.push((path, authorization, body));
+                    recorded.len() - 1
+                };
+                let (status, body) = responses[index.min(responses.len() - 1)].clone();
+                (
+                    axum::http::StatusCode::from_u16(status).expect("status"),
+                    axum::Json(body),
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}/v1"), calls)
+    }
+
+    fn point_openai_at(runtime: &GenerationRuntime, base_url: String) {
+        *runtime
+            .inner
+            .openai_base_url
+            .write()
+            .expect("OpenAI base URL lock") = base_url;
+    }
+
+    #[tokio::test]
+    async fn the_api_engine_refuses_a_run_without_a_key_before_creating_anything() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (runtime, config) =
+            provider_free_runtime(&temporary, "#!/bin/sh\nexit 1\n", RecoveryConfig::default());
+        assert!(!runtime.openai_api_key_configured());
+        assert!(!runtime.set_openai_api_key(Some("   ")));
+
+        let error = runtime
+            .create_run(
+                &json!({"prompts": ["a cat"], "engine": "openai-image-api", "waitMs": 0}),
+                true,
+                None,
+            )
+            .await
+            .expect_err("a run without a key");
+
+        assert_eq!(error.code.as_deref(), Some("OpenAiApiKeyMissing"));
+        assert!(runtime.inner.runs.read().await.is_empty());
+        assert_eq!(
+            std_fs::read_dir(&config.generated_dir)
+                .expect("generated root")
+                .count(),
+            0
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_api_engine_draws_through_the_image_api_and_keeps_the_key_out_of_the_records() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (runtime, config) =
+            provider_free_runtime(&temporary, "#!/bin/sh\nexit 1\n", RecoveryConfig::default());
+        let (base_url, calls) = fake_image_api(vec![(
+            200,
+            json!({"data": [{"b64_json": ONE_PIXEL_PNG}]}),
+        )])
+        .await;
+        point_openai_at(&runtime, base_url);
+        assert!(runtime.set_openai_api_key(Some(" sk-test-secret \n")));
+
+        let (_, run) = runtime
+            .create_run(
+                &json!({
+                    "prompts": ["a cat on a sofa"], "engine": "openai-image-api",
+                    "aspectRatio": "3:4", "mood": "none", "waitMs": 20000
+                }),
+                true,
+                None,
+            )
+            .await
+            .expect("accepted run");
+
+        let output = &run["outputs"][0];
+        assert_eq!(output["status"], "done", "{output}");
+        assert_eq!(output["engine"], "openai-image-api");
+        assert_eq!(output["model"], "gpt-image-2");
+        let run_id = run["runId"].as_str().expect("run ID");
+        let directory = config.generated_dir.join(run_id);
+        assert_eq!(
+            std_fs::read(directory.join("variant-01.png")).expect("installed image"),
+            BASE64_STANDARD.decode(ONE_PIXEL_PNG).expect("fixture")
+        );
+        assert!(directory.join("variant-01.webp").exists());
+
+        let calls = calls.lock().expect("recorded calls").clone();
+        assert_eq!(calls.len(), 1);
+        let (path, authorization, body) = &calls[0];
+        assert_eq!(path, "/v1/images/generations");
+        assert_eq!(authorization, "Bearer sk-test-secret");
+        assert_eq!(body["model"], "gpt-image-2");
+        assert_eq!(body["size"], "1056x1408");
+        let prompt = body["prompt"].as_str().expect("prompt");
+        assert!(prompt.starts_with("Create exactly one polished thumbnail image."));
+        assert!(prompt.contains("User concept:\na cat on a sofa"));
+        assert!(!prompt.contains("image generation tool"));
+        assert!(!prompt.contains("follow-up questions"));
+
+        for artifact in ["manifest.json", "handoff.md"] {
+            let text = std_fs::read_to_string(directory.join(artifact)).expect(artifact);
+            assert!(!text.contains("sk-test-secret"), "{artifact} leaked the key");
+        }
+        let manifest: Value = serde_json::from_str(
+            &std_fs::read_to_string(directory.join("manifest.json")).expect("manifest"),
+        )
+        .expect("manifest JSON");
+        assert_eq!(manifest["request"]["engine"], "openai-image-api");
+        assert!(manifest["request"].get("requestedEngine").is_none());
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_api_engine_sends_an_edit_source_inline_and_reports_a_moderation_block() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (runtime, _config) =
+            provider_free_runtime(&temporary, "#!/bin/sh\nexit 1\n", RecoveryConfig::default());
+        let (base_url, calls) = fake_image_api(vec![(
+            400,
+            json!({"error": {
+                "type": "image_generation_user_error", "code": "moderation_blocked",
+                "message": "Your request was rejected by the safety system."
+            }}),
+        )])
+        .await;
+        point_openai_at(&runtime, base_url);
+        runtime.set_openai_api_key(Some("sk-test-secret"));
+
+        let (_, run) = runtime
+            .create_run(
+                &json!({
+                    "prompts": ["make the hat red"], "engine": "openai-image-api",
+                    "operation": "edit", "waitMs": 20000,
+                    "referenceImage": {"dataUrl": format!("data:image/png;base64,{ONE_PIXEL_PNG}")}
+                }),
+                true,
+                None,
+            )
+            .await
+            .expect("accepted run");
+
+        let output = &run["outputs"][0];
+        assert_eq!(output["status"], "error", "{output}");
+        assert_eq!(output["errorCode"], "ImageModerationBlocked");
+        assert_eq!(output["upstreamStatus"], "400");
+        assert_eq!(output["retryCount"], 0);
+        let calls = calls.lock().expect("recorded calls").clone();
+        assert_eq!(calls.len(), 1, "a blocked request is not retried");
+        let (path, _, body) = &calls[0];
+        assert_eq!(path, "/v1/images/edits");
+        assert_eq!(body["size"], "auto");
+        assert_eq!(
+            body["images"],
+            json!([{"image_url": format!("data:image/png;base64,{ONE_PIXEL_PNG}")}])
+        );
+        assert!(
+            body["prompt"]
+                .as_str()
+                .expect("prompt")
+                .starts_with("Edit the attached source image and return exactly one edited image.")
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gpt_image_never_falls_to_the_billed_api_when_the_plan_cannot_be_read() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        // The fake Codex exits at once, so the plan lookup fails.
+        let (runtime, config) =
+            provider_free_runtime(&temporary, "#!/bin/sh\nexit 1\n", RecoveryConfig::default());
+        let (base_url, calls) =
+            fake_image_api(vec![(200, json!({"data": [{"b64_json": ONE_PIXEL_PNG}]}))]).await;
+        point_openai_at(&runtime, base_url);
+        runtime.set_openai_api_key(Some("sk-test-secret"));
+
+        let error = runtime
+            .create_run(
+                &json!({"prompts": ["a cat"], "engine": "gpt-image", "waitMs": 0}),
+                true,
+                None,
+            )
+            .await
+            .expect_err("no route without a plan");
+
+        assert_eq!(error.code.as_deref(), Some("GptImageRouteUnknown"));
+        assert!(error.error.contains("openai-image-api"));
+        assert!(calls.lock().expect("recorded calls").is_empty());
+        assert_eq!(
+            std_fs::read_dir(&config.generated_dir)
+                .expect("generated root")
+                .count(),
+            0
+        );
+        runtime.shutdown().await;
     }
 }

@@ -44,7 +44,9 @@ Grok Imagine 2.0）。
 - The Grok CLI (`grok`), installed and signed in, for the `grok-imagine-2`
   engine (the one used before any choice in the app) and `grok-imagine`
 - Codex CLI installed and signed in, for the `app-server-image` and `codex-svg`
-  engines and reference-image analysis
+  engines, the `gpt-image` engine's plan lookup, and reference-image analysis
+- An OpenAI API key with credit, for the `openai-image-api` engine (and for
+  `gpt-image` when there is no paid ChatGPT plan)
 - `jq`, `rg`, `curl`, Xcode command-line tools, and internet access for the
   first dependency build
 
@@ -155,7 +157,7 @@ image jobs in the same run.
 
 | Route | Best for |
 | --- | --- |
-| Native SwiftUI app | Editing Prompt Batches interactively, choosing the engine (App Server Image, Codex SVG, Grok Imagine 2.0, or the older Grok Imagine model), choosing a reference image with the macOS file picker, and watching progress or run history. |
+| Native SwiftUI app | Editing Prompt Batches interactively, choosing the engine (GPT Image through App Server, the API, or picked automatically; Codex SVG; Grok Imagine 2.0; or the older Grok Imagine model), choosing a reference image with the macOS file picker, and watching progress or run history. |
 | Codex or Claude Code/MCP | Generating from a Codex task or Claude Code session, passing project-specific prompts or local reference files, and handing absolute artifact paths to another workflow. |
 
 Calling the MCP tool also opens the native app, so both routes use the same
@@ -187,8 +189,9 @@ variants per prompt, with at most 24 image jobs in total
 (`prompts.length * count`). `referenceImagePath`, when supplied, must be an
 absolute path to a local PNG, JPEG, or WebP file no larger than 100 MiB. Use
 `engine: "grok-imagine-2"` or `"grok-imagine"` for Grok Imagine (see below),
-`engine: "app-server-image"` for Codex image generation, or
-`engine: "codex-svg"` for SVG output. `waitMs` may be from 0 through
+`engine: "app-server-image"` for Codex image generation,
+`engine: "openai-image-api"` or `"gpt-image"` for the GPT Image engines
+described below, or `engine: "codex-svg"` for SVG output. `waitMs` may be from 0 through
 120,000.
 
 Omit `engine` unless the user names one. A call without `engine` uses the
@@ -206,7 +209,7 @@ is `codex-svg` is rejected rather than moved to another engine.
 workflows such as creating different article illustrations featuring one mascot.
 For partial changes to an existing image, use `operation: "edit"` and supply
 the source as `referenceImagePath` with `engine: "grok-imagine-2"`,
-`"grok-imagine"`, or `"app-server-image"`:
+`"grok-imagine"`, `"app-server-image"`, `"gpt-image"`, or `"openai-image-api"`:
 
 ```json
 {
@@ -223,6 +226,42 @@ are generation settings and are ignored for editing. Each batch edit starts
 from the same supplied source; for a sequential edit, pass the preceding output
 as the next source. The native app offers the same Generate/Edit choice.
 Results and saved runs include `operation`; older runs default to `generate`.
+
+#### GPT Image engines
+
+GPT Image has two routes and one engine that picks between them.
+
+- `app-server-image` draws through the Codex App Server on the ChatGPT
+  subscription.
+- `openai-image-api` calls the OpenAI Image API directly (`gpt-image-2`,
+  `quality: "medium"`) and is billed per image to an API key. Save the key in
+  the app under Settings › OpenAI API. It is stored in the macOS keychain,
+  handed only to the app's own server (on its standard input at launch and
+  over loopback when it changes, never in its arguments or environment), held
+  there in memory, and never written to a
+  manifest, handoff, log, or response. A run without a key is rejected with
+  `OpenAiApiKeyMissing` before anything is created.
+- `gpt-image` picks one of the two when a run is admitted. It asks the Codex
+  App Server for the signed-in account: a paid ChatGPT plan draws through
+  `app-server-image`; a free plan, an API-key login, or no login draws through
+  `openai-image-api`. When Codex cannot report the plan, the run is rejected
+  with `GptImageRouteUnknown` instead of guessing. The run's `engine` is the
+  route that was picked, and its manifest keeps `requestedEngine: "gpt-image"`.
+  `GET /api/gpt-image-route` reports the route a run would take now.
+
+An `app-server-image` failure, including a rate limit, never moves a job to the
+API route: the API bills each image, so it draws only when it was picked before
+the run started.
+
+The API route sends the same prompt as the App Server route without the lines
+that tell a Codex agent to call its image tool. Sizes are 1536×864 (16:9),
+1408×1056 (4:3), 1024×1024 (1:1), 1056×1408 (3:4), and 864×1536 (9:16); an
+edit keeps the source's own size. A job with an image, as an edit source or a
+character reference, goes to the edits endpoint with the image inline, which
+the API limits to about 15 MB. A rate limit or server error is retried once;
+a moderation block (`ImageModerationBlocked`), a rejected key
+(`OpenAiApiKeyRejected`), and exhausted credit (`OpenAiCreditExhausted`) are
+not.
 
 #### Grok Imagine engines
 
@@ -364,8 +403,10 @@ MIT. See [LICENSE](LICENSE).
 - Rust 1.99.1（`rust-toolchain.toml`で自動選択）
 - インストール・ログイン済みのGrok CLI（`grok`）：`grok-imagine-2`エンジン（アプリで一度も
   選んでいないときに使うエンジン）と`grok-imagine`エンジンで使います
-- インストール・サインイン済みのCodex CLI：`app-server-image`・`codex-svg`エンジンと
-  参照画像解析で使います
+- インストール・サインイン済みのCodex CLI：`app-server-image`・`codex-svg`エンジン、
+  `gpt-image`エンジンのプラン確認、参照画像解析で使います
+- 残高のあるOpenAIのAPIキー：`openai-image-api`エンジンで使います（ChatGPTの有料プランが
+  ないときの`gpt-image`でも使います）
 - `jq`、`rg`、`curl`、Xcode Command Line Tools
 - 初回の依存関係取得に使うインターネット接続
 
@@ -473,7 +514,7 @@ GitHubから入れた場合は、新しい版を取り込むときに
 
 | 利用方法 | 適している場面 |
 | --- | --- |
-| ネイティブSwiftUIアプリ | Prompt Batchを画面で調整する、エンジン（App Server Image・Codex SVG・Grok Imagine 2.0・Grok Imagine旧モデル）を選ぶ、macOSのファイル選択から参照画像を指定する、進行状況や生成履歴を確認する場合 |
+| ネイティブSwiftUIアプリ | Prompt Batchを画面で調整する、エンジン（GPT ImageのApp Server・API・自動、Codex SVG・Grok Imagine 2.0・Grok Imagine旧モデル）を選ぶ、macOSのファイル選択から参照画像を指定する、進行状況や生成履歴を確認する場合 |
 | Codex・Claude Code/MCP | CodexタスクやClaude Codeセッションの文脈から生成する、プロジェクト固有のプロンプトやローカル参照ファイルを渡す、絶対パス付きの成果物を別工程へ引き渡す場合 |
 
 MCPから呼び出した場合もネイティブアプリが開き、両方の経路が同じローカルランタイムと
@@ -505,7 +546,8 @@ MCPから呼び出した場合もネイティブアプリが開き、両方の�
 (`prompts.length * count`)。`referenceImagePath`には、100 MiB以下のローカルPNG・JPEG・
 WebPファイルの絶対パスを指定します。Grok Imagineで描く場合は
 `engine: "grok-imagine-2"`か`"grok-imagine"`（後述）、Codexの画像生成で描く場合は
-`engine: "app-server-image"`、SVGが必要な場合は`engine: "codex-svg"`を使用します。
+`engine: "app-server-image"`、後述のGPT Imageエンジンで描く場合は
+`engine: "openai-image-api"`か`"gpt-image"`、SVGが必要な場合は`engine: "codex-svg"`を使用します。
 `waitMs`には0から120,000までを指定できます。
 
 `engine`は、ユーザーがエンジンを名指ししたときだけ指定します。`engine`のない呼び出しは、
@@ -521,7 +563,8 @@ CodexVideoなどの呼び出し側は、独自にエンジンを決め打ちし�
 `operation`を省略すると従来どおり`generate`になります。じぴこのベース画像から
 特徴を引き継いで各H2の新しい場面を作る、といった参照生成はそのまま使えます。
 元画像の一部を変更する場合は`operation: "edit"`にし、`referenceImagePath`に元画像を指定します。
-編集のエンジンは`grok-imagine-2`・`grok-imagine`・`app-server-image`のいずれかです。
+編集のエンジンは`grok-imagine-2`・`grok-imagine`・`app-server-image`・`gpt-image`・
+`openai-image-api`のいずれかです。
 
 ```json
 {
@@ -537,6 +580,35 @@ CodexVideoなどの呼び出し側は、独自にエンジンを決め打ちし�
 バッチの各編集は同じ元画像から独立して実行します。続けて編集する場合は、前の出力を
 次の元画像として渡してください。ネイティブ画面でも「生成／編集」を選択できます。
 結果と保存済み実行には`operation`が記録され、古い履歴は`generate`として読み込まれます。
+
+#### GPT Imageエンジン
+
+GPT Imageには2つの経路と、そのどちらかを選ぶエンジンがあります。
+
+- `app-server-image`は、ChatGPTのサブスクリプションでCodex App Server経由で描きます。
+- `openai-image-api`は、OpenAIのImage APIを直接呼びます（`gpt-image-2`、
+  `quality: "medium"`）。1枚ごとにAPIキーへ料金がかかります。キーはアプリの
+  「設定 › OpenAI API」で保存します。保存先はmacOSのキーチェーンで、渡す先はこのアプリの
+  サーバーだけです（起動時は標準入力、変更時はループバック通信。引数や環境変数には入れません）。サーバーはキーをメモリにだけ
+  持ち、マニフェスト・handoff・ログ・応答には書きません。キーがないときは、何も作る前に
+  `OpenAiApiKeyMissing`で断ります。
+- `gpt-image`は、実行を受け付けるときに上の2つから1つを選びます。Codex App Serverに
+  ログイン中のアカウントを問い合わせ、ChatGPTの有料プランなら`app-server-image`、無料プラン・
+  APIキーでのログイン・未ログインなら`openai-image-api`で描きます。Codexがプランを返せない
+  ときは、推測せずに`GptImageRouteUnknown`で断ります。実行の`engine`には選ばれた経路が入り、
+  マニフェストには`requestedEngine: "gpt-image"`が残ります。いま実行するとどちらになるかは
+  `GET /api/gpt-image-route`で分かります。
+
+`app-server-image`が失敗しても（上限による失敗を含む）、ジョブをAPIの経路へ移すことは
+ありません。APIは1枚ごとに料金がかかるため、実行の開始前に選ばれたときだけ描きます。
+
+APIの経路には、App Serverの経路と同じプロンプトから、Codexのエージェントに画像ツールを
+呼ばせるための行を除いたものを送ります。サイズは1536×864（16:9）、1408×1056（4:3）、
+1024×1024（1:1）、1056×1408（3:4）、864×1536（9:16）で、編集は元画像のサイズのままです。
+画像付きのジョブ（編集の元画像、キャラクターの参照画像）は、画像を埋め込んで編集用の
+エンドポイントへ送ります。APIの制限で、この画像は約15MBまでです。上限やサーバー側の
+エラーは1回だけ再試行します。モデレーションでの拒否（`ImageModerationBlocked`）、
+キーの拒否（`OpenAiApiKeyRejected`）、残高切れ（`OpenAiCreditExhausted`）は再試行しません。
 
 #### Grok Imagineエンジン
 

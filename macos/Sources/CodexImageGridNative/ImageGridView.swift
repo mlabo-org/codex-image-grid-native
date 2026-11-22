@@ -47,7 +47,10 @@ enum ImageMood: String, CaseIterable, Identifiable {
 enum ImageEngine: String, CaseIterable, Identifiable {
     case grokImagine2 = "grok-imagine-2"
     case grokImagine = "grok-imagine"
+    /// Picks `appServerImage` or `openAIImageAPI` from the ChatGPT plan.
+    case gptImage = "gpt-image"
     case appServerImage = "app-server-image"
+    case openAIImageAPI = "openai-image-api"
     case codexSvg = "codex-svg"
 
     /// The engine before the user picks one; the server starts from the same one.
@@ -110,6 +113,7 @@ struct ImageGridView: View {
     @State private var operation = ImageGridOperation.generate
     @State private var mood = ImageMood.warmMascot
     @State private var engine = ImageEngine.initialDefault
+    @State private var engineNote: String?
     @State private var count = 1
     @State private var aspectRatio = AspectRatio.widescreen
     @State private var referenceImage: ImageGridReference?
@@ -345,6 +349,16 @@ struct ImageGridView: View {
                 }
             }
             .labelsHidden()
+            if let engineNote {
+                Text(engineNote)
+                    .appFont(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .task(id: engine) {
+            await refreshEngineNote()
         }
 
         LabeledControl(strings.count) {
@@ -364,6 +378,18 @@ struct ImageGridView: View {
             }
             .labelsHidden()
             .disabled(engine == .codexSvg || operation == .edit)
+        }
+    }
+
+    /// Says, for the GPT Image engines, which route draws and whether it bills.
+    private func refreshEngineNote() async {
+        switch engine {
+        case .openAIImageAPI:
+            engineNote = strings.openAIImageAPINote
+        case .gptImage:
+            engineNote = strings.gptImageRouteNote(await store.gptImageRoute())
+        default:
+            engineNote = nil
         }
     }
 
@@ -1134,7 +1160,7 @@ struct ImageGridStrings {
         localized("変更したい箇所を指示してください。指定しない構図・画風・縦横比は元画像を維持します。雰囲気・縦横比・キャラクター解析の設定は使いません。複数枚は同じ元画像をそれぞれ編集します。", "Describe the changes. Composition, style, and aspect ratio stay as in the source unless requested. Mood, aspect ratio, and character analysis settings are not applied. Each result edits the same source independently.")
     }
     var editReferenceHelp: String {
-        localized("編集する元画像を添付し、エンジンに App Server Image か Grok Imagine（2.0・旧モデル）を選択してください。", "Attach the source image and select the App Server Image or a Grok Imagine engine (2.0 or older model).")
+        localized("編集する元画像を添付し、エンジンに Grok Imagine（2.0・旧モデル）か GPT Image のいずれかを選択してください。", "Attach the source image and select a Grok Imagine engine (2.0 or older model) or a GPT Image engine.")
     }
     var mood: String { localized("雰囲気", "Mood") }
     var engine: String { localized("エンジン", "Engine") }
@@ -1336,13 +1362,49 @@ struct ImageGridStrings {
     func engineName(_ value: ImageEngine) -> String {
         switch value {
         case .appServerImage:
-            "App Server Image"
+            localized("GPT Image（App Server・サブスク）", "GPT Image (App Server, subscription)")
+        case .gptImage:
+            localized("GPT Image（自動）", "GPT Image (auto)")
+        case .openAIImageAPI:
+            localized("GPT Image（API・従量課金）", "GPT Image (API, pay per image)")
         case .codexSvg:
             "Codex SVG"
         case .grokImagine2:
             "Grok Imagine 2.0"
         case .grokImagine:
             localized("Grok Imagine（旧モデル）", "Grok Imagine (older model)")
+        }
+    }
+
+    var openAIImageAPINote: String {
+        localized(
+            "OpenAI APIで描きます。1枚ごとに料金がかかります。",
+            "Draws with the OpenAI API. Each image is billed."
+        )
+    }
+
+    func gptImageRouteNote(_ route: Result<ImageGridGPTImageRoute, ImageGridAPIError>) -> String {
+        switch route {
+        case let .success(route) where route.engine == ImageEngine.openAIImageAPI.rawValue:
+            route.openaiApiKeyConfigured
+                ? localized(
+                    "いまはOpenAI APIで描きます（ChatGPTの有料プランなし）。1枚ごとに料金がかかります。",
+                    "Draws with the OpenAI API now (no paid ChatGPT plan). Each image is billed."
+                )
+                : localized(
+                    "ChatGPTの有料プランがないためOpenAI APIで描きますが、APIキーが未設定です（設定 › OpenAI API）。",
+                    "No paid ChatGPT plan, so this draws with the OpenAI API, but no API key is set (Settings › OpenAI API)."
+                )
+        case .success:
+            localized(
+                "いまはChatGPTのサブスクで描きます（App Server経由・追加料金なし）。",
+                "Draws with the ChatGPT subscription now (through App Server, no extra charge)."
+            )
+        case .failure:
+            localized(
+                "ChatGPTのプランを確認できません。このままでは生成できないので、App ServerかAPIを選んでください。",
+                "The ChatGPT plan could not be read. Runs will not start; pick the App Server or API engine."
+            )
         }
     }
 
@@ -1379,6 +1441,18 @@ struct ImageGridStrings {
             return localized(
                 "Grok CLIの旧モデルで画像を生成できます（線の太いセル画調になります）。",
                 "Ready to generate images with the Grok CLI's older model (bold-line cel style)."
+            )
+        }
+        if engine == .openAIImageAPI {
+            return localized(
+                "OpenAI APIで画像を並列生成できます（1枚ごとに料金がかかります）。",
+                "Ready to generate parallel images with the OpenAI API (each image is billed)."
+            )
+        }
+        if engine == .gptImage {
+            return localized(
+                "GPT Imageで画像を並列生成できます。ChatGPTの有料プランがあればApp Server、なければOpenAI API（従量課金）で描きます。",
+                "Ready to generate parallel images with GPT Image: through App Server on a paid ChatGPT plan, otherwise with the OpenAI API (billed per image)."
             )
         }
         if engine == .codexSvg {

@@ -54,7 +54,7 @@ struct CodexImageGridApp: App {
 
         Settings {
             AppShellRoot {
-                AppShellPreferencesView()
+                ImageGridSettingsView(store: store)
             }
         }
     }

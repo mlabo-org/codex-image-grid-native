@@ -43,11 +43,15 @@ impl ImageOperation {
             if engine.is_some_and(|engine| {
                 !matches!(
                     engine,
-                    "app-server-image" | "grok-imagine-2" | "grok-imagine"
+                    "app-server-image"
+                        | "grok-imagine-2"
+                        | "grok-imagine"
+                        | "gpt-image"
+                        | "openai-image-api"
                 )
             }) {
                 return Err(
-                    "edit requires the app-server-image, grok-imagine-2, or grok-imagine engine",
+                    "edit requires the app-server-image, grok-imagine-2, grok-imagine, gpt-image, or openai-image-api engine",
                 );
             }
             if !has_reference {
@@ -64,6 +68,8 @@ pub enum Engine {
     CodexSvg,
     GrokImagine2,
     GrokImagine,
+    GptImage,
+    OpenAiImageApi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
