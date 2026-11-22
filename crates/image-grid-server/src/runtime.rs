@@ -5,8 +5,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use image_grid_core::{
     APP_IDENTITY, BatchValidationError, ImageOperation, MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES,
-    MAX_RUN_JOBS, MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS, stage_reference_image,
-    validate_batch_shape,
+    MAX_RUN_JOBS, MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS, missing_choices_message,
+    stage_reference_image, validate_batch_shape,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -49,13 +49,10 @@ const ENGINES: [&str; 6] = [
     openai_image::AUTO_ENGINE,
     openai_image::API_ENGINE,
 ];
-/// The engine a run without one uses until the app records a choice.
-const INITIAL_DEFAULT_ENGINE: &str = "grok-imagine-2";
-/// Holds the engine last chosen in the app, which runs without one use.
-const PREFERENCES_FILENAME: &str = "preferences.json";
 const RATE_LIMIT_GROK_HINT: &str = "Codex image generation is rate-limited. Grok can draw these \
 prompts instead: rerun them with engine grok-imagine-2 (Grok Imagine 2.0) or grok-imagine (the \
-older Grok model) if the user wants Grok.";
+older Grok model) if the user wants Grok. The OpenAI API can draw them too but bills each image: \
+rerun with engine openai-image-api only if the user agrees to that charge.";
 
 const MOODS: [&str; 6] = [
     "warm-mascot",
@@ -66,6 +63,9 @@ const MOODS: [&str; 6] = [
     "none",
 ];
 const ASPECT_RATIOS: [&str; 5] = ["16:9", "4:3", "1:1", "3:4", "9:16"];
+/// Recorded on an edit that names no aspect ratio; an edit keeps its source's
+/// own ratio and never reads this value.
+const EDIT_UNUSED_ASPECT_RATIO: &str = "16:9";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -276,6 +276,10 @@ struct NormalizedRunRequest {
     count: usize,
     mood: String,
     engine: String,
+    /// Set only by the app, where the user picks the engine themselves. Such
+    /// a run uses the engine as chosen: `gpt-image` may take the billed API
+    /// route, and `app-server-image` is tried without a plan check.
+    chosen_in_app: bool,
     aspect_ratio: String,
     reference_premise: String,
     inline_reference_image: Option<InlineReferenceImage>,
@@ -517,7 +521,6 @@ struct RuntimeInner {
     shutdown_gate: Mutex<()>,
     shutdown_signal: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    default_engine: RwLock<String>,
     #[cfg(test)]
     fail_artifact_write: AtomicBool,
 }
@@ -542,7 +545,6 @@ impl GenerationRuntime {
         recovery: RecoveryConfig,
     ) -> Self {
         let restored = restore_persisted_runtime(&config);
-        let default_engine = load_default_engine(&config.data_dir);
         let (events, _) = broadcast::channel(1024);
         let (shutdown_signal, _) = watch::channel(false);
         let runtime = Self {
@@ -572,38 +574,12 @@ impl GenerationRuntime {
                 shutdown_gate: Mutex::new(()),
                 shutdown_signal,
                 tasks: Mutex::new(Vec::new()),
-                default_engine: RwLock::new(default_engine),
                 #[cfg(test)]
                 fail_artifact_write: AtomicBool::new(false),
             }),
         };
         runtime.persist_normalized_restorations(restored.normalized_run_ids);
         runtime
-    }
-
-    /// The engine a run uses when its request names none.
-    pub(crate) async fn default_engine(&self) -> String {
-        self.inner.default_engine.read().await.clone()
-    }
-
-    /// Records the engine chosen in the app as the default for later runs.
-    pub(crate) async fn set_default_engine(&self, engine: &str) -> Result<(), RunApiError> {
-        if !ENGINES.contains(&engine) {
-            return Err(RunApiError::new(
-                format!("engine must be one of: {}", ENGINES.join(", ")),
-                "invalid_engine",
-            ));
-        }
-        let mut current = self.inner.default_engine.write().await;
-        let bytes = serde_json::to_vec_pretty(&json!({ "defaultEngine": engine }))
-            .expect("preferences serialize");
-        atomic_write(
-            &self.inner.config.data_dir.join(PREFERENCES_FILENAME),
-            &bytes,
-        )
-        .await?;
-        *current = engine.to_owned();
-        Ok(())
     }
 
     /// Replaces the OpenAI API key the `openai-image-api` engine sends; an
@@ -639,8 +615,9 @@ impl GenerationRuntime {
         let unknown = |reason: String| {
             RunApiError::new(
                 format!(
-                    "{reason}. Name the engine instead: app-server-image draws with the ChatGPT \
-subscription, openai-image-api draws with the OpenAI API key and is billed per image."
+                    "{reason}. Nothing was generated. Name the engine instead: \
+app-server-image draws with the ChatGPT subscription. openai-image-api draws with the OpenAI \
+API and bills each image: use it only after asking the user and getting a yes."
                 ),
                 "GptImageRouteUnknown",
             )
@@ -670,13 +647,46 @@ subscription, openai-image-api draws with the OpenAI API key and is billed per i
         openai_image::route_for_account(&account).map_err(unknown)
     }
 
-    /// Turns the engine a request named into the one its jobs run on, and
-    /// refuses an API run that has no key before anything is created.
-    async fn resolve_engine(&self, engine: &str) -> Result<String, RunApiError> {
-        let engine = if engine == openai_image::AUTO_ENGINE {
-            self.gpt_image_route().await?.engine()
-        } else {
-            engine
+    /// Turns a request's engine into the one its jobs run on, before anything
+    /// is created. The billed API route runs only for a request that names
+    /// `openai-image-api`, or that chose `gpt-image` in the app. A request
+    /// from any other caller that names a subscription engine (`gpt-image` or
+    /// `app-server-image`) while Codex has no paid ChatGPT plan is refused
+    /// with a message telling the caller to ask the user before drawing with
+    /// the API. An API run without a key is refused too.
+    async fn resolve_engine(&self, request: &NormalizedRunRequest) -> Result<String, RunApiError> {
+        let needs_approval = || {
+            let key = if self.openai_api_key_configured() {
+                ""
+            } else {
+                " No API key is saved yet: the user saves one in the Image Grid app's settings \
+first."
+            };
+            RunApiError::new(
+                format!(
+                    "Nothing was generated: Codex is not signed in to a paid ChatGPT plan, so \
+the subscription route cannot draw this run. The OpenAI API can draw it but bills each image. \
+Ask the user whether to draw with the API; only if they agree, call again with engine \
+openai-image-api.{key} Do not switch to it without asking."
+                ),
+                "OpenAiApiNeedsApproval",
+            )
+        };
+        let engine = match request.engine.as_str() {
+            openai_image::AUTO_ENGINE => match self.gpt_image_route().await? {
+                openai_image::Route::AppServer => "app-server-image",
+                openai_image::Route::Api if request.chosen_in_app => openai_image::API_ENGINE,
+                openai_image::Route::Api => return Err(needs_approval()),
+            },
+            // A plan that cannot be read is left to the App Server run itself,
+            // which reports why Codex is not ready.
+            "app-server-image"
+                if !request.chosen_in_app
+                    && matches!(self.gpt_image_route().await, Ok(openai_image::Route::Api)) =>
+            {
+                return Err(needs_approval());
+            }
+            engine => engine,
         };
         if engine == openai_image::API_ENGINE && !self.openai_api_key_configured() {
             return Err(RunApiError::new(
@@ -937,16 +947,11 @@ app's settings",
         if self.is_closed() {
             return Err(runtime_closed_api_error());
         }
-        let default_engine = self.default_engine().await;
-        let mut request = normalize_request(
-            body,
-            require_prompts_array,
-            query_wait_ms,
-            &default_engine,
-        )?;
-        let resolved_engine = self.resolve_engine(&request.engine).await?;
+        let mut request = normalize_request(body, require_prompts_array, query_wait_ms)?;
+        let resolved_engine = self.resolve_engine(&request).await?;
         let requested_engine = (resolved_engine != request.engine)
             .then(|| std::mem::replace(&mut request.engine, resolved_engine));
+
         let (run_id, run_directory) = self
             .reserve_run_directory(|| Uuid::new_v4().to_string()[..8].to_owned())
             .await?;
@@ -3318,33 +3323,6 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
-/// Reads the engine last chosen in the app; a data directory without a valid
-/// choice uses the initial default.
-pub(crate) fn load_default_engine(data_dir: &Path) -> String {
-    let path = data_dir.join(PREFERENCES_FILENAME);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return INITIAL_DEFAULT_ENGINE.to_owned();
-        }
-        Err(error) => {
-            eprintln!("image-grid-server: could not read {}: {error}", path.display());
-            return INITIAL_DEFAULT_ENGINE.to_owned();
-        }
-    };
-    let engine = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|value| value.get("defaultEngine")?.as_str().map(str::to_owned))
-        .filter(|engine| ENGINES.contains(&engine.as_str()));
-    engine.unwrap_or_else(|| {
-        eprintln!(
-            "image-grid-server: {} has no valid defaultEngine; using {INITIAL_DEFAULT_ENGINE}",
-            path.display()
-        );
-        INITIAL_DEFAULT_ENGINE.to_owned()
-    })
-}
-
 fn restore_persisted_runtime(config: &RuntimeConfig) -> RestoredRuntimeState {
     let Ok(generated_root) = std::fs::canonicalize(&config.generated_dir) else {
         return RestoredRuntimeState::default();
@@ -3786,7 +3764,6 @@ fn normalize_request(
     body: &Value,
     require_prompts_array: bool,
     query_wait_ms: Option<&str>,
-    default_engine: &str,
 ) -> Result<NormalizedRunRequest, RunApiError> {
     let prompts_value = body.get("prompts");
     let prompts = if require_prompts_array {
@@ -3856,18 +3833,32 @@ fn normalize_request(
         .filter(|value| MOODS.contains(value))
         .unwrap_or("warm-mascot")
         .to_owned();
+    // The engine and, for a generation, the aspect ratio are the caller's to
+    // set. A missing or unknown value is sent back as a question instead of
+    // being filled in here.
     let engine = body
         .get("engine")
         .and_then(Value::as_str)
-        .filter(|value| ENGINES.contains(value))
-        .unwrap_or(default_engine)
-        .to_owned();
+        .filter(|value| ENGINES.contains(value));
     let aspect_ratio = body
         .get("aspectRatio")
         .and_then(Value::as_str)
-        .filter(|value| ASPECT_RATIOS.contains(value))
-        .unwrap_or("16:9")
-        .to_owned();
+        .filter(|value| ASPECT_RATIOS.contains(value));
+    // An edit keeps its source's aspect ratio, so it has none to choose.
+    let is_edit = body.get("operation").and_then(Value::as_str) == Some("edit");
+    if let Some(message) =
+        missing_choices_message(engine.is_none(), aspect_ratio.is_none() && !is_edit)
+    {
+        let code = if engine.is_none() {
+            "EngineRequired"
+        } else {
+            "AspectRatioRequired"
+        };
+        return Err(RunApiError::new(message, code));
+    }
+    let engine = engine.unwrap_or_default().to_owned();
+    let aspect_ratio = aspect_ratio.unwrap_or(EDIT_UNUSED_ASPECT_RATIO).to_owned();
+    let chosen_in_app = body.get("engineChosenInApp").and_then(Value::as_bool) == Some(true);
     let reference_premise = body
         .get("referencePremise")
         .and_then(Value::as_str)
@@ -3907,6 +3898,7 @@ fn normalize_request(
         count,
         mood,
         engine,
+        chosen_in_app,
         aspect_ratio,
         reference_premise,
         inline_reference_image,
@@ -4934,7 +4926,7 @@ mod tests {
 
         let error = runtime
             .create_run(
-                &json!({"prompts": ["rejected run"], "waitMs": 0}),
+                &json!({"engine": "grok-imagine-2", "aspectRatio": "16:9", "prompts": ["rejected run"], "waitMs": 0}),
                 true,
                 None,
             )
@@ -4972,7 +4964,7 @@ mod tests {
             .expect("image slots");
         let (_, accepted) = runtime
             .create_run(
-                &json!({"prompts": ["preserved generated image"], "waitMs": 0}),
+                &json!({"engine": "grok-imagine-2", "aspectRatio": "16:9", "prompts": ["preserved generated image"], "waitMs": 0}),
                 true,
                 None,
             )
@@ -5185,30 +5177,30 @@ mod tests {
                 "prompts": [" first ", "second"],
                 "count": 2,
                 "mood": "unknown",
-                "engine": "unknown",
-                "aspectRatio": "unknown",
+                "engine": "grok-imagine-2",
+                "aspectRatio": "4:3",
                 "waitMs": 12.6
             }),
             true,
             None,
-            INITIAL_DEFAULT_ENGINE,
         )
         .expect("normalized request");
         assert_eq!(request.prompts, vec!["first", "second"]);
         assert_eq!(request.count, 2);
         assert_eq!(request.mood, "warm-mascot");
-        assert_eq!(request.engine, INITIAL_DEFAULT_ENGINE);
-        assert_eq!(request.aspect_ratio, "16:9");
+        assert_eq!(request.engine, "grok-imagine-2");
+        assert_eq!(request.aspect_ratio, "4:3");
         assert_eq!(request.wait_ms, 13);
 
         let error = normalize_request(
             &json!({
                 "prompts": ["one", "two", "three", "four", "five"],
-                "count": 5
+                "count": 5,
+                "engine": "grok-imagine-2",
+                "aspectRatio": "16:9"
             }),
             true,
             None,
-            INITIAL_DEFAULT_ENGINE,
         )
         .expect_err("too many jobs");
         assert_eq!(error.code.as_deref(), Some("too_many_jobs"));
@@ -5276,88 +5268,87 @@ mod tests {
     }
 
     #[test]
-    fn a_request_without_an_engine_uses_the_default_engine() {
-        let unnamed = json!({"prompts": ["A mascot"]});
-        for default_engine in ENGINES {
-            let request = normalize_request(&unnamed, true, None, default_engine)
-                .expect("request without an engine");
-            assert_eq!(request.engine, default_engine);
-        }
-        let named = json!({"prompts": ["A mascot"], "engine": "codex-svg"});
-        let request = normalize_request(&named, true, None, "grok-imagine-2").expect("named engine");
-        assert_eq!(request.engine, "codex-svg");
+    fn a_request_that_leaves_the_engine_or_aspect_ratio_open_is_sent_back_as_a_question() {
+        // Built from parts so each case states exactly what it sets.
+        let request = |engine: Option<&str>, aspect_ratio: Option<&str>| {
+            let mut body = serde_json::Map::new();
+            body.insert("prompts".to_owned(), json!(["A mascot"]));
+            if let Some(engine) = engine {
+                body.insert("engine".to_owned(), json!(engine));
+            }
+            if let Some(aspect_ratio) = aspect_ratio {
+                body.insert("aspectRatio".to_owned(), json!(aspect_ratio));
+            }
+            normalize_request(&Value::Object(body), true, None)
+        };
 
-        let edit = json!({
-            "prompts": ["replace burger"], "operation": "edit", "referenceImagePath": "/source.png"
-        });
-        let error = normalize_request(&edit, true, None, "codex-svg")
-            .expect_err("an edit cannot fall to the SVG default");
-        assert_eq!(error.code.as_deref(), Some("invalid_edit_request"));
+        let neither = request(None, None).expect_err("nothing chosen");
+        assert_eq!(neither.code.as_deref(), Some("EngineRequired"));
+        assert!(neither.error.contains("did not set engine and aspectRatio"));
+        assert!(neither.error.contains("ask the user"));
+        assert!(neither.error.contains("openai-image-api"));
+        assert!(neither.error.contains("16:9, 4:3, 1:1, 3:4, 9:16"));
+
+        let no_engine = request(None, Some("1:1")).expect_err("no engine");
+        assert_eq!(no_engine.code.as_deref(), Some("EngineRequired"));
+        assert!(no_engine.error.contains("did not set engine,"));
+        // An unknown value is not replaced with another one either.
+        let unknown_engine = request(Some("dall-e"), Some("1:1")).expect_err("unknown engine");
+        assert_eq!(unknown_engine.code.as_deref(), Some("EngineRequired"));
+
+        let no_ratio = request(Some("grok-imagine-2"), None).expect_err("no aspect ratio");
+        assert_eq!(no_ratio.code.as_deref(), Some("AspectRatioRequired"));
+        assert!(!no_ratio.error.contains("grok-imagine-2"));
+        let unknown_ratio =
+            request(Some("grok-imagine-2"), Some("2:1")).expect_err("unknown aspect ratio");
+        assert_eq!(unknown_ratio.code.as_deref(), Some("AspectRatioRequired"));
+
+        let named = request(Some("codex-svg"), Some("3:4")).expect("both set");
         assert_eq!(
-            normalize_request(&edit, true, None, "grok-imagine-2")
-                .expect("edit with an image default")
-                .engine,
+            (named.engine.as_str(), named.aspect_ratio.as_str()),
+            ("codex-svg", "3:4")
+        );
+        assert!(!named.chosen_in_app);
+
+        // An edit keeps its source's ratio, so only its engine is the caller's.
+        let edit = |engine: Option<&str>| {
+            let mut body = serde_json::Map::new();
+            body.insert("prompts".to_owned(), json!(["replace burger"]));
+            body.insert("operation".to_owned(), json!("edit"));
+            body.insert("referenceImagePath".to_owned(), json!("/source.png"));
+            if let Some(engine) = engine {
+                body.insert("engine".to_owned(), json!(engine));
+            }
+            normalize_request(&Value::Object(body), true, None)
+        };
+        assert_eq!(
+            edit(None).expect_err("edit without an engine").code.as_deref(),
+            Some("EngineRequired")
+        );
+        assert_eq!(
+            edit(Some("grok-imagine-2")).expect("edit with an engine").engine,
             "grok-imagine-2"
         );
-    }
-
-    #[tokio::test]
-    async fn the_default_engine_persists_in_the_data_directory() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
-        let data_dir = temporary.path().join("data");
-        let workspace = temporary.path().join("workspace");
-        std_fs::create_dir_all(&workspace).expect("workspace");
-        let config = Arc::new(RuntimeConfig::new(
-            temporary.path().join("server"),
-            data_dir.clone(),
-            Some(workspace.clone()),
-            "server".to_owned(),
-        ));
-        config.prepare_directories().expect("runtime directories");
-        let app_server = AppServerBridge::new(
-            workspace,
-            AppServerLaunchConfig::single("fixture", temporary.path().join("unused-codex")),
-        );
-        let runtime = GenerationRuntime::new(config.clone(), app_server);
-        assert_eq!(runtime.default_engine().await, INITIAL_DEFAULT_ENGINE);
-
-        runtime
-            .set_default_engine("app-server-image")
-            .await
-            .expect("record a default engine");
-        assert_eq!(runtime.default_engine().await, "app-server-image");
-        assert_eq!(load_default_engine(&data_dir), "app-server-image");
-
-        let error = runtime
-            .set_default_engine("dall-e")
-            .await
-            .expect_err("unknown engine");
-        assert_eq!(error.code.as_deref(), Some("invalid_engine"));
-        assert_eq!(runtime.default_engine().await, "app-server-image");
-
-        std_fs::write(data_dir.join(PREFERENCES_FILENAME), "{\"defaultEngine\": 7}")
-            .expect("corrupt preferences");
-        assert_eq!(load_default_engine(&data_dir), INITIAL_DEFAULT_ENGINE);
     }
 
     #[test]
     fn edit_requests_require_a_source_and_image_engine_before_scheduling() {
         for body in [
-            json!({"prompts": ["replace burger"], "operation": "edit"}),
-            json!({"prompts": ["replace burger"], "operation": "edit", "referenceImagePath": ""}),
+            json!({"engine": "grok-imagine-2", "prompts": ["replace burger"], "operation": "edit"}),
+            json!({"engine": "grok-imagine-2", "prompts": ["replace burger"], "operation": "edit", "referenceImagePath": ""}),
             json!({"prompts": ["replace burger"], "operation": "edit", "engine": "codex-svg", "referenceImagePath": "/source.png"}),
-            json!({"prompts": ["replace burger"], "operation": "edti"}),
+            json!({"engine": "grok-imagine-2", "aspectRatio": "16:9", "prompts": ["replace burger"], "operation": "edti"}),
         ] {
-            assert!(normalize_request(&body, true, None, INITIAL_DEFAULT_ENGINE).is_err());
+            assert!(normalize_request(&body, true, None).is_err());
         }
         let edit = normalize_request(
             &json!({
+                "engine": "grok-imagine-2",
                 "prompts": ["replace burger", "change the drink"],
                 "operation": "edit", "referenceImagePath": "/source.png", "count": 2
             }),
             true,
             None,
-            INITIAL_DEFAULT_ENGINE,
         )
         .unwrap();
         assert_eq!(edit.operation, ImageOperation::Edit);
@@ -5385,10 +5376,9 @@ mod tests {
     #[test]
     fn grok_imagine_requests_carry_the_prompt_and_reference_verbatim() {
         let request = normalize_request(
-            &json!({"prompts": ["A mascot on a sofa"], "engine": "grok-imagine"}),
+            &json!({"aspectRatio": "16:9", "prompts": ["A mascot on a sofa"], "engine": "grok-imagine"}),
             true,
             None,
-            INITIAL_DEFAULT_ENGINE,
         )
         .expect("normalized grok request");
         assert_eq!(request.engine, "grok-imagine");
@@ -5406,10 +5396,9 @@ mod tests {
         ));
 
         let grok_2 = normalize_request(
-            &json!({"prompts": ["A mascot on a sofa"], "engine": "grok-imagine-2", "mood": "none"}),
+            &json!({"aspectRatio": "16:9", "prompts": ["A mascot on a sofa"], "engine": "grok-imagine-2", "mood": "none"}),
             true,
             None,
-            INITIAL_DEFAULT_ENGINE,
         )
         .expect("normalized grok 2.0 request");
         assert_eq!(grok_2.engine, "grok-imagine-2");
@@ -5753,8 +5742,9 @@ done
         let (_, response) = runtime
             .create_run(
                 &json!({
+                    "aspectRatio": "16:9",
                     "prompts": ["recover missing output"],
-                    "engine": "app-server-image",
+                    "engine": "app-server-image", "engineChosenInApp": true,
                     "count": 1,
                     "waitMs": 7000
                 }),
@@ -5827,8 +5817,9 @@ done
         let (_, response) = runtime
             .create_run(
                 &json!({
+                    "aspectRatio": "16:9",
                     "prompts": ["reject empty image output"],
-                    "engine": "app-server-image",
+                    "engine": "app-server-image", "engineChosenInApp": true,
                     "count": 1,
                     "waitMs": 7000
                 }),
@@ -5923,8 +5914,9 @@ done
         let (_, response) = runtime
             .create_run(
                 &json!({
+                    "aspectRatio": "16:9",
                     "prompts": ["recover rate limit"],
-                    "engine": "app-server-image",
+                    "engine": "app-server-image", "engineChosenInApp": true,
                     "count": 1,
                     "waitMs": 7000
                 }),
@@ -5998,8 +5990,9 @@ done
         let (_, response) = runtime
             .create_run(
                 &json!({
+                    "aspectRatio": "16:9",
                     "prompts": ["timeout"],
-                    "engine": "app-server-image",
+                    "engine": "app-server-image", "engineChosenInApp": true,
                     "count": 1,
                     "waitMs": 3000
                 }),
@@ -6079,8 +6072,9 @@ done
         let (_, first_response) = runtime
             .create_run(
                 &json!({
+                    "aspectRatio": "16:9",
                     "prompts": ["active pending RPC"],
-                    "engine": "app-server-image",
+                    "engine": "app-server-image", "engineChosenInApp": true,
                     "count": 1,
                     "waitMs": 0
                 }),
@@ -6118,8 +6112,9 @@ done
         let (_, queued_response) = runtime
             .create_run(
                 &json!({
+                    "aspectRatio": "16:9",
                     "prompts": ["queued in cooldown"],
-                    "engine": "app-server-image",
+                    "engine": "app-server-image", "engineChosenInApp": true,
                     "count": 1,
                     "waitMs": 0
                 }),
@@ -6626,7 +6621,7 @@ done
 
         let error = runtime
             .create_run(
-                &json!({"prompts": ["a cat"], "engine": "openai-image-api", "waitMs": 0}),
+                &json!({"aspectRatio": "16:9", "prompts": ["a cat"], "engine": "openai-image-api", "waitMs": 0}),
                 true,
                 None,
             )
@@ -6772,7 +6767,7 @@ done
 
         let error = runtime
             .create_run(
-                &json!({"prompts": ["a cat"], "engine": "gpt-image", "waitMs": 0}),
+                &json!({"aspectRatio": "16:9", "prompts": ["a cat"], "engine": "gpt-image", "waitMs": 0}),
                 true,
                 None,
             )
@@ -6787,6 +6782,121 @@ done
                 .expect("generated root")
                 .count(),
             0
+        );
+        runtime.shutdown().await;
+    }
+
+    /// A Codex that answers the plan lookup with `plan` and nothing else.
+    fn codex_reporting_plan(plan: &str) -> String {
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}'
+      ;;
+    *'"method":"account/read"'*)
+      id=${line#*'"id":'}
+      printf '{"id":%s,"result":{"account":{"type":"chatgpt","email":null,"planType":"PLAN"},"requiresOpenaiAuth":true}}\n' "${id%%,*}"
+      ;;
+  esac
+done
+"#
+        .replace("PLAN", plan)
+    }
+
+    #[tokio::test]
+    async fn without_a_paid_plan_a_caller_is_asked_before_the_billed_api_draws() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (runtime, config) = provider_free_runtime(
+            &temporary,
+            &codex_reporting_plan("free"),
+            RecoveryConfig::default(),
+        );
+        let (base_url, calls) =
+            fake_image_api(vec![(200, json!({"data": [{"b64_json": ONE_PIXEL_PNG}]}))]).await;
+        point_openai_at(&runtime, base_url);
+        runtime.set_openai_api_key(Some("sk-test-secret"));
+
+        // Both subscription engines stop and hand the question to the caller.
+        for engine in ["gpt-image", "app-server-image"] {
+            let error = runtime
+                .create_run(
+                    &json!({
+                        "prompts": ["a cat"], "engine": engine, "aspectRatio": "1:1", "waitMs": 0
+                    }),
+                    true,
+                    None,
+                )
+                .await
+                .expect_err("no subscription to draw with");
+            assert_eq!(error.code.as_deref(), Some("OpenAiApiNeedsApproval"), "{engine}");
+            assert!(error.error.contains("Ask the user"), "{engine}");
+            assert!(error.error.contains("openai-image-api"), "{engine}");
+            assert!(!error.error.contains("No API key is saved"), "{engine}");
+        }
+        assert!(calls.lock().expect("recorded calls").is_empty());
+        assert_eq!(
+            std_fs::read_dir(&config.generated_dir)
+                .expect("generated root")
+                .count(),
+            0
+        );
+
+        // The same choice made in the app draws through the API and records
+        // both what was chosen and what drew.
+        let (_, run) = runtime
+            .create_run(
+                &json!({
+                    "prompts": ["a cat"], "engine": "gpt-image", "engineChosenInApp": true,
+                    "aspectRatio": "1:1", "waitMs": 20000
+                }),
+                true,
+                None,
+            )
+            .await
+            .expect("accepted run");
+        assert_eq!(run["outputs"][0]["status"], "done", "{run}");
+        assert_eq!(run["outputs"][0]["engine"], "openai-image-api");
+        let manifest: Value = serde_json::from_str(
+            &std_fs::read_to_string(
+                config
+                    .generated_dir
+                    .join(run["runId"].as_str().expect("run ID"))
+                    .join("manifest.json"),
+            )
+            .expect("manifest"),
+        )
+        .expect("manifest JSON");
+        assert_eq!(manifest["request"]["engine"], "openai-image-api");
+        assert_eq!(manifest["request"]["requestedEngine"], "gpt-image");
+        assert_eq!(calls.lock().expect("recorded calls").len(), 1);
+
+        // Without a saved key the question says the key comes first.
+        runtime.set_openai_api_key(None);
+        let error = runtime
+            .create_run(
+                &json!({"prompts": ["a cat"], "engine": "gpt-image", "aspectRatio": "1:1", "waitMs": 0}),
+                true,
+                None,
+            )
+            .await
+            .expect_err("no subscription and no key");
+        assert_eq!(error.code.as_deref(), Some("OpenAiApiNeedsApproval"));
+        assert!(error.error.contains("No API key is saved"));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_paid_plan_sends_gpt_image_through_the_subscription() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (runtime, _config) = provider_free_runtime(
+            &temporary,
+            &codex_reporting_plan("plus"),
+            RecoveryConfig::default(),
+        );
+        assert_eq!(
+            runtime.gpt_image_route().await.expect("route"),
+            openai_image::Route::AppServer
         );
         runtime.shutdown().await;
     }

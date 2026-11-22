@@ -144,9 +144,10 @@ The following are public behavior and must remain stable at cutover:
   that, calling the OpenAI Image API with an API key and billing each image,
   together with `gpt-image`, which picks `app-server-image` or
   `openai-image-api` from the ChatGPT plan when a run is admitted; a request
-  without an engine, once
-  `app-server-image`, later took the engine last chosen in the app, kept in
-  `preferences.json` and reported as `defaultEngine` in `/api/health`);
+  without an engine, once `app-server-image` and for a time the engine last
+  chosen in the app, is now sent back with the question, and so is a
+  generation without an aspect ratio, once `16:9`: Image Grid chooses neither,
+  and nothing chosen in the app reaches another caller's request);
 - maximums: 12 prompts, 6 variants per prompt, 24 total jobs;
 - retry, timeout, rate-limit, missing-output, and diagnostic semantics;
 - manifest, handoff, generated image paths, and display-safe URLs (a lossy

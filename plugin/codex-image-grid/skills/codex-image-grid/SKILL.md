@@ -34,13 +34,22 @@ instructions. For edits, the tool schema documents which generation settings
 are ignored. Preserve batch intent: each prompt and variant edits the supplied
 source independently. To edit a preceding result, supply that result's path.
 
-Omit `engine` unless the user names one; an omitted engine uses the one last
-chosen in the Image Grid app. Both Grok engines draw through the local Grok CLI.
-`grok-imagine-2` draws with Grok Imagine 2.0, the web version's style, and is
-the one to use when the user just says Grok. `grok-imagine` is the CLI's older
-default model; use it only when the user asks for the older model. When a
-result reports that Codex image generation is rate-limited, tell the user and
-offer Grok; do not rerun with a Grok engine until the user says so.
+Image Grid does not choose the engine or a generation's aspect ratio, and
+nothing selected in its app applies to a tool call. Set `engine` and
+`aspectRatio` from what the user or the calling workflow decided. When neither
+has decided one, ask the user; do not pick a value yourself. A call that leaves
+one open returns that question instead of images: answer it by asking the user,
+then call again.
+
+Both Grok engines draw through the local Grok CLI. `grok-imagine-2` draws with
+Grok Imagine 2.0, the web version's style, and is the one to use when the user
+just says Grok. `grok-imagine` is the CLI's older default model; use it only
+when the user asks for the older model. `app-server-image` draws GPT Image on
+the ChatGPT subscription. `openai-image-api` draws GPT Image through the OpenAI
+API and bills each image: use it only when the user has agreed to that charge
+for this request. When a result says the subscription cannot draw the run, or
+that Codex image generation is rate-limited, tell the user and offer the
+options it names; do not rerun with another engine until the user says so.
 
 With a Grok engine, a `generate` prompt whose pose matches the reference
 image's pose gets the reference figure back with only the background redrawn,

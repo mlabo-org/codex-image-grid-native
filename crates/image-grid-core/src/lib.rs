@@ -18,6 +18,36 @@ pub const MAX_REFERENCE_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_WAIT_MS: u64 = 120_000;
 pub const DEFAULT_NATIVE_BIND: &str = "127.0.0.1:4322";
 
+/// The message a request gets back when it leaves the engine, the aspect
+/// ratio, or both for Image Grid to pick. Image Grid picks neither: the app's
+/// own controls never stand in for a caller's missing value, and one engine
+/// bills each image. `None` when nothing is missing.
+pub fn missing_choices_message(engine_missing: bool, aspect_ratio_missing: bool) -> Option<String> {
+    let missing = match (engine_missing, aspect_ratio_missing) {
+        (false, false) => return None,
+        (true, false) => "engine",
+        (false, true) => "aspectRatio",
+        (true, true) => "engine and aspectRatio",
+    };
+    let mut message = format!(
+        "Nothing was generated: the request did not set {missing}, and Image Grid never fills \
+that in. Set it from what the user or the calling workflow already decided; if neither has, ask \
+the user. Then call again."
+    );
+    if engine_missing {
+        message.push_str(
+            " engine: grok-imagine-2 (Grok Imagine 2.0), grok-imagine (older Grok model), \
+app-server-image (GPT Image on the ChatGPT subscription), openai-image-api (GPT Image through \
+the OpenAI API; it bills each image, so use it only when the user agreed to that charge), \
+codex-svg (SVG).",
+        );
+    }
+    if aspect_ratio_missing {
+        message.push_str(" aspectRatio: 16:9, 4:3, 1:1, 3:4, 9:16.");
+    }
+    Some(message)
+}
+
 /// How the supplied image participates in a run. Missing operation fields in
 /// existing requests and saved runs retain the original generation behavior.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -36,8 +66,8 @@ impl ImageOperation {
         }
     }
 
-    /// Checks an edit's engine and source. `engine` is `None` when the request
-    /// names none and the server's default engine decides it later.
+    /// Checks an edit's engine and source. `engine` is `None` only where the
+    /// caller has not yet checked that the request names one.
     pub fn validate(self, engine: Option<&str>, has_reference: bool) -> Result<(), &'static str> {
         if self == Self::Edit {
             if engine.is_some_and(|engine| {

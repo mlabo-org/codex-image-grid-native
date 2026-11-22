@@ -164,8 +164,6 @@ impl RuntimeIdentity {
 pub struct HealthResponse {
     pub ok: bool,
     pub jobs: usize,
-    /// The engine a run uses when its request names none.
-    pub default_engine: String,
     /// Whether the server holds an OpenAI API key for the `openai-image-api`
     /// engine. The key itself is never reported.
     pub openai_api_key_configured: bool,
@@ -184,7 +182,6 @@ impl HealthResponse {
             AppServerDiagnostics::default(),
             SchedulerSnapshot::default(),
             0,
-            runtime::load_default_engine(&config.data_dir),
             false,
         )
     }
@@ -194,14 +191,12 @@ impl HealthResponse {
         diagnostics: AppServerDiagnostics,
         scheduler: SchedulerSnapshot,
         jobs: usize,
-        default_engine: String,
         openai_api_key_configured: bool,
     ) -> Self {
         let identity = RuntimeIdentity::from_config(config, diagnostics.clone(), scheduler);
         Self {
             ok: true,
             jobs,
-            default_engine,
             openai_api_key_configured,
             app_server_image: diagnostics.ready,
             app_server_image_ready: diagnostics.ready,
@@ -322,10 +317,6 @@ fn router_with_state(state: RuntimeState) -> Router {
             get(preflight).post(preflight),
         )
         .route(
-            "/api/preferences/default-engine",
-            axum::routing::put(set_default_engine),
-        )
-        .route(
             "/api/preferences/openai-api-key",
             axum::routing::put(set_openai_api_key),
         )
@@ -374,13 +365,11 @@ async fn health(State(state): State<RuntimeState>) -> Json<HealthResponse> {
     let diagnostics = state.app_server.diagnostics().await;
     let scheduler = state.generation.scheduler_snapshot();
     let jobs = state.generation.job_count().await;
-    let default_engine = state.generation.default_engine().await;
     Json(HealthResponse::from_parts(
         &state.config,
         diagnostics,
         scheduler,
         jobs,
-        default_engine,
         state.generation.openai_api_key_configured(),
     ))
 }
@@ -414,26 +403,6 @@ async fn gpt_image_route(State(state): State<RuntimeState>) -> Response {
         )
             .into_response(),
         Err(error) => (StatusCode::SERVICE_UNAVAILABLE, Json(error.body())).into_response(),
-    }
-}
-
-async fn set_default_engine(State(state): State<RuntimeState>, request: AxumRequest) -> Response {
-    let body = match http_json::read_json_body(request).await {
-        Ok(body) => body,
-        Err(error) => return error.into_response(),
-    };
-    let engine = body.get("engine").and_then(Value::as_str).unwrap_or_default();
-    match state.generation.set_default_engine(engine).await {
-        Ok(()) => (StatusCode::OK, Json(json!({ "defaultEngine": engine }))).into_response(),
-        Err(error) => (
-            if error.code.as_deref() == Some("invalid_engine") {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            },
-            Json(error.body()),
-        )
-            .into_response(),
     }
 }
 
@@ -1057,7 +1026,6 @@ mod tests {
 
         assert!(health.ok);
         assert_eq!(health.jobs, 0);
-        assert_eq!(health.default_engine, "grok-imagine-2");
         assert!(!health.app_server_image);
         assert_eq!(health.app_server_image_diagnostics.status, "not-started");
         assert_eq!(health.identity.app, "codex-image-grid");
@@ -1290,8 +1258,9 @@ done
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({
+                            "aspectRatio": "16:9",
                             "prompts": ["SSE fixture"],
-                            "engine": "app-server-image",
+                            "engine": "app-server-image", "engineChosenInApp": true,
                             "count": 1,
                             "waitMs": 2000
                         })
@@ -1348,7 +1317,7 @@ done
                     .method("POST")
                     .uri("/api/run")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json!({"prompt": "closed"}).to_string()))
+                    .body(Body::from(json!({"engine": "grok-imagine-2", "aspectRatio": "16:9", "prompt": "closed"}).to_string()))
                     .expect("closed run request"),
             )
             .await
@@ -1477,7 +1446,7 @@ done
                             "prompts": ["fixture prompt"],
                             "count": 1,
                             "mood": "warm-mascot",
-                            "engine": "app-server-image",
+                            "engine": "app-server-image", "engineChosenInApp": true,
                             "aspectRatio": "16:9",
                             "waitMs": 5000
                         })
@@ -1761,7 +1730,7 @@ done
             "prompts": ["Replace only the hamburger with a strawberry crepe."],
             "count": 1,
             "mood": "warm-mascot",
-            "engine": "app-server-image",
+            "engine": "app-server-image", "engineChosenInApp": true,
             "aspectRatio": "16:9",
             "referencePremise": "Character reference: round glasses and blue scarf",
             "referenceImage": {

@@ -53,7 +53,8 @@ enum ImageEngine: String, CaseIterable, Identifiable {
     case openAIImageAPI = "openai-image-api"
     case codexSvg = "codex-svg"
 
-    /// The engine before the user picks one; the server starts from the same one.
+    /// The engine the picker shows before the user picks one. It is this
+    /// window's own starting point: other callers always name their engine.
     static let initialDefault = Self.grokImagine2
 
     var id: String { rawValue }
@@ -165,12 +166,6 @@ struct ImageGridView: View {
         .onChange(of: draftMetadata) { _, metadata in
             guard draftReady else { return }
             draftPersistence.schedule(metadata)
-        }
-        .onChange(of: defaultEngineToRecord, initial: true) { _, value in
-            guard let value else { return }
-            Task {
-                await store.recordDefaultEngine(value)
-            }
         }
         .onChange(of: resultLimit) { _, value in
             store.applyRetentionMode(resultLimit: value)
@@ -882,14 +877,6 @@ struct ImageGridView: View {
         case .preparationError, .displayError:
             referenceImage == nil ? .empty : .ready
         }
-    }
-
-    /// The engine shown once the draft is restored and the server is up. The
-    /// server makes it the default for runs that name no engine, so the choice
-    /// is recorded at launch and on every change.
-    private var defaultEngineToRecord: ImageEngine? {
-        guard draftReady, case .ready = runtimeLifecycle.state else { return nil }
-        return engine
     }
 
     private func restoreDraft() async {

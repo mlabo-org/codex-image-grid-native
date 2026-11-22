@@ -53,11 +53,13 @@ The baseline executable contract is:
 | default `aspectRatio` | `16:9` |
 | default `waitMs` | 0 |
 
-The native project later departed from two rows above: it added the
-`grok-imagine`, `grok-imagine-2`, `openai-image-api`, and `gpt-image` engines,
-and a request without an engine
-uses the engine last chosen in the app (`grok-imagine-2` before any choice)
-instead of `app-server-image`.
+The native project later departed from three rows above. It added the
+`grok-imagine`, `grok-imagine-2`, `openai-image-api`, and `gpt-image` engines.
+It dropped the default `engine` and the default `aspectRatio`: a request that
+leaves the engine open, or a generation that leaves the aspect ratio open, is
+rejected with a message asking the caller to set it (and to ask the user when
+nobody has decided), because one engine bills each image and the app's own
+controls must not decide for another caller.
 
 Validation rules:
 

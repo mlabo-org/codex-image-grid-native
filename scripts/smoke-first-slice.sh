@@ -51,6 +51,10 @@ printf '%s\n' \
   '      request_id="$(printf "%s" "$line" | jq --raw-output ".id")"' \
   '      printf '"'"'{"id":%s,"result":{"userAgent":"fixture","codexHome":"/tmp/fixture","platformFamily":"unix","platformOs":"macos"}}\n'"'"' "$request_id"' \
   '      ;;' \
+  '    *'"'"'"method":"account/read"'"'"'*)' \
+  '      request_id="$(printf "%s" "$line" | jq --raw-output ".id")"' \
+  '      printf '"'"'{"id":%s,"result":{"account":{"type":"chatgpt","email":null,"planType":"plus"},"requiresOpenaiAuth":true}}\n'"'"' "$request_id"' \
+  '      ;;' \
   '    *'"'"'"method":"initialized"'"'"'*)' \
   '      ;;' \
   '    *'"'"'"method":"thread/unsubscribe"'"'"'*)' \

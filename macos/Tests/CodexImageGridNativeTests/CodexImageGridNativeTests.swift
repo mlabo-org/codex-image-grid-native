@@ -53,6 +53,9 @@ import Foundation
     #expect(object["prompts"] as? [String] == ["first", "second"])
     #expect(object["referenceImagePath"] as? String == "/tmp/reference.png")
     #expect(object["referenceImage"] == nil)
+    // Marks the run as the user's own pick, which the server needs before
+    // GPT Image (auto) may take the billed API route.
+    #expect(object["engineChosenInApp"] as? Bool == true)
 }
 
 @Test func runEnvelopeDecodesArtifactWriteFailureWithoutChangingJobs() throws {

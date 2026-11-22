@@ -5,15 +5,16 @@ SwiftUI. It provides Prompt Batch generation and editing, reference-image analys
 Japanese/English UI, light/dark themes, run history, and artifact handoff
 through the `codex_image_grid/generate_image_grid` MCP tool. Images are drawn
 with Grok Imagine (2.0 or the older model) through the local Grok CLI, with
-Codex image generation, or as SVG with `codex-svg`; a call that names no engine
-uses the one last chosen in the app, which is Grok Imagine 2.0 before any choice.
+Codex image generation, with the OpenAI Image API, or as SVG with `codex-svg`.
+A call names its engine and aspect ratio; Image Grid chooses neither and
+answers a call that leaves one open with the question.
 
 Codex・Claude Code向けのmacOSネイティブ画像生成ワークスペースです。RustとSwiftUIで
 実装され、Prompt Batchでの生成・編集、参照画像解析、日英UI、ライト/ダークテーマ、
 生成履歴、成果物の受け渡しに対応しています。画像はローカルのGrok CLIを通した
-Grok Imagine（2.0・旧モデル）、Codexの画像生成、`codex-svg`でのSVGで描けます。エンジンを
-指定しない呼び出しは、アプリで最後に選んだエンジンを使います（一度も選んでいないときは
-Grok Imagine 2.0）。
+Grok Imagine（2.0・旧モデル）、Codexの画像生成、OpenAIのImage API、`codex-svg`でのSVGで
+描けます。エンジンと縦横比は呼び出し側が指定します。Image Gridはどちらも自分では選ばず、
+指定のない呼び出しには何も描かずに聞き返します。
 
 [English](#english) · [日本語](#日本語)
 
@@ -42,7 +43,7 @@ Grok Imagine 2.0）。
 - Apple Swift 6.3 toolchain
 - Rust 1.99.1 (selected automatically by `rust-toolchain.toml`)
 - The Grok CLI (`grok`), installed and signed in, for the `grok-imagine-2`
-  engine (the one used before any choice in the app) and `grok-imagine`
+  and `grok-imagine` engines
 - Codex CLI installed and signed in, for the `app-server-image` and `codex-svg`
   engines, the `gpt-image` engine's plan lookup, and reference-image analysis
 - An OpenAI API key with credit, for the `openai-image-api` engine (and for
@@ -184,7 +185,7 @@ sends two prompts with two variants each as one batch of four image jobs:
 }
 ```
 
-For generation, only `prompts` is required. A batch may contain up to 12 prompts and 6
+For generation, `prompts`, `engine`, and `aspectRatio` are required. A batch may contain up to 12 prompts and 6
 variants per prompt, with at most 24 image jobs in total
 (`prompts.length * count`). `referenceImagePath`, when supplied, must be an
 absolute path to a local PNG, JPEG, or WebP file no larger than 100 MiB. Use
@@ -194,13 +195,16 @@ absolute path to a local PNG, JPEG, or WebP file no larger than 100 MiB. Use
 described below, or `engine: "codex-svg"` for SVG output. `waitMs` may be from 0 through
 120,000.
 
-Omit `engine` unless the user names one. A call without `engine` uses the
-engine last chosen in the app's engine picker: the app records its choice at
-launch and on every change, the server keeps it in `preferences.json` in the
-data directory and reports it as `defaultEngine` in `/api/health`, and before
-any choice it is `grok-imagine-2`. Callers such as RelayPress and CodexVideo
-must not fix an engine of their own. An edit without `engine` while the default
-is `codex-svg` is rejected rather than moved to another engine.
+Image Grid does not choose the engine or the aspect ratio. A call that leaves
+`engine` open, or a generation that leaves `aspectRatio` open, draws nothing
+and gets a message back (`EngineRequired` or `AspectRatioRequired` over HTTP)
+that lists the values and tells the caller to use what the user or the calling
+workflow decided, and to ask the user when neither has. The MCP tool answers
+this before it launches the app. The app's own engine picker and aspect-ratio
+control apply only to runs started in the app; nothing chosen there reaches
+another caller's request. Callers such as RelayPress and CodexVideo set both
+values themselves and call again when they are asked. An edit keeps its
+source's ratio and needs no `aspectRatio`.
 
 `mood` adds a style line to the prompt (`warm-mascot` by default).
 `mood: "none"` adds no style line, so the prompt alone sets the look.
@@ -215,6 +219,7 @@ the source as `referenceImagePath` with `engine: "grok-imagine-2"`,
 {
   "operation": "edit",
   "prompts": ["Replace the hamburger with a strawberry crepe. Preserve everything else."],
+  "engine": "grok-imagine-2",
   "referenceImagePath": "/Users/you/Pictures/park.png",
   "waitMs": 120000
 }
@@ -241,17 +246,25 @@ GPT Image has two routes and one engine that picks between them.
   there in memory, and never written to a
   manifest, handoff, log, or response. A run without a key is rejected with
   `OpenAiApiKeyMissing` before anything is created.
-- `gpt-image` picks one of the two when a run is admitted. It asks the Codex
-  App Server for the signed-in account: a paid ChatGPT plan draws through
-  `app-server-image`; a free plan, an API-key login, or no login draws through
-  `openai-image-api`. When Codex cannot report the plan, the run is rejected
-  with `GptImageRouteUnknown` instead of guessing. The run's `engine` is the
-  route that was picked, and its manifest keeps `requestedEngine: "gpt-image"`.
-  `GET /api/gpt-image-route` reports the route a run would take now.
+- `gpt-image` is the app's "GPT Image (auto)" choice. When a run is admitted it
+  asks the Codex App Server for the signed-in account: a paid ChatGPT plan
+  draws through `app-server-image`; a free plan, an API-key login, or no login
+  draws through `openai-image-api`. When Codex cannot report the plan, the run
+  is rejected with `GptImageRouteUnknown` instead of guessing. The run's
+  `engine` is the route that was picked, and its manifest keeps
+  `requestedEngine: "gpt-image"`. `GET /api/gpt-image-route` reports the route
+  a run would take now.
 
-An `app-server-image` failure, including a rate limit, never moves a job to the
-API route: the API bills each image, so it draws only when it was picked before
-the run started.
+The billed API route draws in two cases only: a request names
+`openai-image-api`, or the user picked "GPT Image (auto)" in the app (the app
+marks its own requests with `engineChosenInApp`). For every other caller,
+`gpt-image` and `app-server-image` are subscription engines: when Codex has no
+paid ChatGPT plan, the run is rejected with `OpenAiApiNeedsApproval` and
+nothing is drawn. The message tells the caller to ask the user whether to draw
+with the API and, only on a yes, to call again with `openai-image-api`. An
+`app-server-image` failure, including a rate limit, never moves a job to the
+API route either; its message names the API as an option the user has to agree
+to.
 
 The API route sends the same prompt as the App Server route without the lines
 that tell a Codex agent to call its image tool. Sizes are 1536×864 (16:9),
@@ -266,11 +279,10 @@ not.
 #### Grok Imagine engines
 
 `engine: "grok-imagine-2"` and `engine: "grok-imagine"` draw through the local
-Grok CLI's Imagine tools. `grok-imagine-2` is the engine used before any choice
-in the app. When an
-`app-server-image` job fails on a rate limit, its error message says so and
-suggests rerunning the prompts with a Grok engine; the engine is never switched
-automatically.
+Grok CLI's Imagine tools. When an `app-server-image` job fails on a rate limit,
+its error message says so and names the Grok engines, and the billed
+`openai-image-api` engine if the user agrees to its charge, as ways to rerun
+the prompts; the engine is never switched automatically.
 
 - `grok-imagine-2` asks the CLI for Grok Imagine 2.0 (`grok-imagine-image-2.0`)
   by setting `GROK_IMAGE_GEN_MODEL_OVERRIDE` and `GROK_IMAGE_EDIT_MODEL_OVERRIDE`.
@@ -541,7 +553,7 @@ MCPから呼び出した場合もネイティブアプリが開き、両方の�
 }
 ```
 
-新規生成の必須項目は`prompts`だけです。1つのバッチには最大12プロンプト、各プロンプトには最大
+新規生成の必須項目は`prompts`・`engine`・`aspectRatio`です。1つのバッチには最大12プロンプト、各プロンプトには最大
 6バリエーションを指定でき、合計24画像ジョブまでです
 (`prompts.length * count`)。`referenceImagePath`には、100 MiB以下のローカルPNG・JPEG・
 WebPファイルの絶対パスを指定します。Grok Imagineで描く場合は
@@ -550,12 +562,14 @@ WebPファイルの絶対パスを指定します。Grok Imagineで描く場合�
 `engine: "openai-image-api"`か`"gpt-image"`、SVGが必要な場合は`engine: "codex-svg"`を使用します。
 `waitMs`には0から120,000までを指定できます。
 
-`engine`は、ユーザーがエンジンを名指ししたときだけ指定します。`engine`のない呼び出しは、
-アプリのエンジン選択で最後に選んだエンジンを使います。アプリは起動時と切り替えのたびに
-選択を記録し、サーバーはそれをデータフォルダの`preferences.json`に保存して、`/api/health`の
-`defaultEngine`で返します。一度も選んでいないときは`grok-imagine-2`です。RelayPressや
-CodexVideoなどの呼び出し側は、独自にエンジンを決め打ちしません。既定が`codex-svg`のときに
-`engine`なしで編集を頼むと、別のエンジンに切り替えずにエラーにします。
+Image Gridは、エンジンも縦横比も自分では選びません。`engine`のない呼び出しと、
+`aspectRatio`のない新規生成は、何も描かずにメッセージを返します（HTTPでは`EngineRequired`
+または`AspectRatioRequired`）。メッセージには選べる値の一覧と、「ユーザーか呼び出し元の
+ワークフローが決めた値を入れ、どちらも決めていなければユーザーに聞く」という指示が入ります。
+MCPツールは、アプリを起動する前にこの返答をします。アプリのエンジン選択と縦横比の設定は、
+アプリから始めた実行にだけ効き、ほかの呼び出しには一切影響しません。RelayPressやCodexVideo
+などの呼び出し側は、両方の値を自分で指定し、聞き返されたら値を入れて呼び直します。
+編集は元画像の縦横比を保つので、`aspectRatio`は要りません。
 
 `mood`は、プロンプトに雰囲気の指定を1行足します（既定は`warm-mascot`）。
 `mood: "none"`では何も足さず、プロンプトだけで画風が決まります。
@@ -570,6 +584,7 @@ CodexVideoなどの呼び出し側は、独自にエンジンを決め打ちし�
 {
   "operation": "edit",
   "prompts": ["ハンバーガーだけをいちごクレープに変更して。他の部分は維持して。"],
+  "engine": "grok-imagine-2",
   "referenceImagePath": "/Users/you/Pictures/park.png",
   "waitMs": 120000
 }
@@ -592,15 +607,21 @@ GPT Imageには2つの経路と、そのどちらかを選ぶエンジンがあ�
   サーバーだけです（起動時は標準入力、変更時はループバック通信。引数や環境変数には入れません）。サーバーはキーをメモリにだけ
   持ち、マニフェスト・handoff・ログ・応答には書きません。キーがないときは、何も作る前に
   `OpenAiApiKeyMissing`で断ります。
-- `gpt-image`は、実行を受け付けるときに上の2つから1つを選びます。Codex App Serverに
+- `gpt-image`は、アプリの「GPT Image（自動）」です。実行を受け付けるときにCodex App Serverへ
   ログイン中のアカウントを問い合わせ、ChatGPTの有料プランなら`app-server-image`、無料プラン・
   APIキーでのログイン・未ログインなら`openai-image-api`で描きます。Codexがプランを返せない
   ときは、推測せずに`GptImageRouteUnknown`で断ります。実行の`engine`には選ばれた経路が入り、
   マニフェストには`requestedEngine: "gpt-image"`が残ります。いま実行するとどちらになるかは
   `GET /api/gpt-image-route`で分かります。
 
+課金されるAPIの経路で描くのは、次の2つの場合だけです。リクエストが`openai-image-api`を
+名指ししたときと、ユーザーがアプリで「GPT Image（自動）」を選んだとき（アプリは自分の
+リクエストに`engineChosenInApp`を付けます）。それ以外の呼び出しでは、`gpt-image`と
+`app-server-image`はサブスクリプションのエンジンです。CodexにChatGPTの有料プランがないときは
+`OpenAiApiNeedsApproval`で断り、何も描きません。メッセージは、APIで描くかをユーザーに聞き、
+同意があったときだけ`openai-image-api`で呼び直すよう呼び出し側に伝えます。
 `app-server-image`が失敗しても（上限による失敗を含む）、ジョブをAPIの経路へ移すことは
-ありません。APIは1枚ごとに料金がかかるため、実行の開始前に選ばれたときだけ描きます。
+ありません。そのときのメッセージは、ユーザーの同意が要る選択肢としてAPIを挙げます。
 
 APIの経路には、App Serverの経路と同じプロンプトから、Codexのエージェントに画像ツールを
 呼ばせるための行を除いたものを送ります。サイズは1536×864（16:9）、1408×1056（4:3）、
@@ -613,10 +634,9 @@ APIの経路には、App Serverの経路と同じプロンプトから、Codex�
 #### Grok Imagineエンジン
 
 `engine: "grok-imagine-2"`と`engine: "grok-imagine"`は、ローカルのGrok CLIの
-Imagineで描きます。`grok-imagine-2`は、アプリで一度も選んでいないときに使うエンジンです。
-`app-server-image`のジョブが上限で失敗したときは、
-エラーメッセージにその旨とGrokエンジンでの再実行の案内が出ます。エンジンが自動で
-切り替わることはありません。
+Imagineで描きます。`app-server-image`のジョブが上限で失敗したときは、エラーメッセージに
+その旨と、描き直す手段としてGrokエンジンと、課金にユーザーが同意した場合の
+`openai-image-api`が挙がります。エンジンが自動で切り替わることはありません。
 
 - `grok-imagine-2`は、`GROK_IMAGE_GEN_MODEL_OVERRIDE`と`GROK_IMAGE_EDIT_MODEL_OVERRIDE`を
   設定して、Grok Imagine 2.0（`grok-imagine-image-2.0`）で描くようCLIに指定します。

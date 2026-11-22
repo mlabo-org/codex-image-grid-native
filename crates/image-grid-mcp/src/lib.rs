@@ -1,6 +1,6 @@
 use image_grid_core::{
     BatchValidationError, ImageOperation, MAX_PROMPTS, MAX_REFERENCE_IMAGE_BYTES, MAX_RUN_JOBS,
-    MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS, validate_batch_shape,
+    MAX_VARIANTS_PER_PROMPT, MAX_WAIT_MS, missing_choices_message, validate_batch_shape,
 };
 use serde_json::{Value, json};
 use std::env;
@@ -165,8 +165,9 @@ struct NormalizedArguments {
     prompts: Vec<String>,
     count: usize,
     mood: String,
-    engine: Option<String>,
-    aspect_ratio: String,
+    engine: String,
+    /// Absent only on an edit, which keeps its source's ratio.
+    aspect_ratio: Option<String>,
     reference_premise: Option<String>,
     reference_image: Option<InlineReferenceImage>,
     wait_ms: u64,
@@ -455,31 +456,17 @@ fn submit_generate_image_grid(
     config: &BridgeConfig,
 ) -> Result<Value, String> {
     let mut server = start_or_join_native_server(config)?;
-    // An omitted engine is the server's to choose, so readiness follows the
-    // default the running server reports.
-    let engine = match &arguments.engine {
-        Some(engine) => engine.clone(),
-        None => server
-            .health
-            .get("defaultEngine")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                "Image Grid server did not report a default engine; quit and reopen Codex Image Grid"
-                    .to_owned()
-            })?,
-    };
-    server.health = assert_engine_ready(config, server.health, &engine)?;
+    server.health = assert_engine_ready(config, server.health, &arguments.engine)?;
 
     let mut body = serde_json::Map::new();
     body.insert("operation".to_owned(), json!(arguments.operation));
     body.insert("prompts".to_owned(), json!(arguments.prompts));
     body.insert("count".to_owned(), json!(arguments.count));
     body.insert("mood".to_owned(), json!(arguments.mood));
-    if let Some(engine) = &arguments.engine {
-        body.insert("engine".to_owned(), json!(engine));
+    body.insert("engine".to_owned(), json!(arguments.engine));
+    if let Some(aspect_ratio) = &arguments.aspect_ratio {
+        body.insert("aspectRatio".to_owned(), json!(aspect_ratio));
     }
-    body.insert("aspectRatio".to_owned(), json!(arguments.aspect_ratio));
     body.insert("waitMs".to_owned(), json!(arguments.wait_ms));
     if let Some(reference_premise) = &arguments.reference_premise {
         body.insert(
@@ -562,12 +549,12 @@ fn normalize_tool_arguments(
         engine: arguments
             .get("engine")
             .and_then(Value::as_str)
-            .map(str::to_owned),
+            .expect("validated engine")
+            .to_owned(),
         aspect_ratio: arguments
             .get("aspectRatio")
             .and_then(Value::as_str)
-            .unwrap_or("16:9")
-            .to_owned(),
+            .map(str::to_owned),
         reference_premise: arguments
             .get("referencePremise")
             .and_then(Value::as_str)
@@ -2024,6 +2011,16 @@ fn validate_tool_arguments(arguments: &Value) -> Result<(), String> {
         "aspectRatio",
         &["16:9", "4:3", "1:1", "3:4", "9:16"],
     )?;
+    // Image Grid picks neither the engine nor a generation's aspect ratio, so
+    // a call that leaves one open is answered with the question, before the
+    // app is launched. An edit keeps its source's ratio.
+    let is_edit = arguments.get("operation").and_then(Value::as_str) == Some("edit");
+    if let Some(message) = missing_choices_message(
+        arguments.get("engine").is_none(),
+        arguments.get("aspectRatio").is_none() && !is_edit,
+    ) {
+        return Err(message);
+    }
 
     if let Some(wait_ms) = arguments.get("waitMs") {
         let valid = json_integer(wait_ms)
@@ -2128,13 +2125,12 @@ pub fn tool_record() -> Value {
                 "engine": {
                     "type": "string",
                     "enum": ["app-server-image", "codex-svg", "grok-imagine-2", "grok-imagine", "gpt-image", "openai-image-api"],
-                    "description": "Omit unless the user names an engine; an omitted engine uses the one last chosen in the Image Grid app. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI and is the engine used before any choice in the app. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style. app-server-image draws with Codex image generation on the ChatGPT subscription. openai-image-api draws with the OpenAI Image API (gpt-image-2) using the API key saved in the app and is billed per image. gpt-image picks between those two when the run starts: app-server-image on a paid ChatGPT plan, openai-image-api otherwise; the returned engine is the one that drew. codex-svg writes SVG."
+                    "description": "Always set this; Image Grid does not choose an engine and rejects a call without one. Use the engine the user or the calling workflow decided on; if neither has, ask the user instead of picking. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style. app-server-image draws with Codex image generation on the ChatGPT subscription. openai-image-api draws with the OpenAI Image API (gpt-image-2) using the API key saved in the app and bills each image: use it only when the user agreed to that charge. gpt-image is app-server-image under another name for callers: both stop with a question for the user, and never bill, when Codex has no paid ChatGPT plan. codex-svg writes SVG."
                 },
                 "aspectRatio": {
                     "type": "string",
-                    "description": "Generation-only target ratio. edit preserves source ratio unless the prompt requests a change.",
-                    "enum": ["16:9", "4:3", "1:1", "3:4", "9:16"],
-                    "default": "16:9"
+                    "description": "Target ratio of a generation. Always set it for generate; Image Grid does not choose one and rejects a generation without it. Use the ratio the user or the calling workflow decided on; if neither has, ask the user. edit preserves the source ratio and needs none.",
+                    "enum": ["16:9", "4:3", "1:1", "3:4", "9:16"]
                 },
                 "referencePremise": {
                     "type": "string",
@@ -2471,15 +2467,16 @@ mod tests {
     #[test]
     fn strict_argument_errors_match_the_frozen_messages() {
         assert_eq!(
-            validate_tool_arguments(&json!({"prompts": ["valid"], "count": 1.5})),
+            validate_tool_arguments(&json!({"engine": "app-server-image", "aspectRatio": "16:9", "prompts": ["valid"], "count": 1.5})),
             Err("count must be an integer".to_owned())
         );
         assert_eq!(
-            validate_tool_arguments(&json!({"prompts": ["valid"], "waitMs": -1})),
+            validate_tool_arguments(&json!({"engine": "app-server-image", "aspectRatio": "16:9", "prompts": ["valid"], "waitMs": -1})),
             Err("waitMs must be an integer between 0 and 120000".to_owned())
         );
         assert_eq!(
             prepare_tool_arguments(&json!({
+                "engine": "app-server-image", "aspectRatio": "16:9",
                 "prompts": ["valid"],
                 "referenceImagePath": "relative.png"
             }))
@@ -2491,11 +2488,12 @@ mod tests {
     #[test]
     fn batch_shape_errors_are_mapped_from_the_shared_core_contract() {
         assert_eq!(
-            validate_tool_arguments(&json!({"prompts": [" "]})),
+            validate_tool_arguments(&json!({"engine": "app-server-image", "aspectRatio": "16:9", "prompts": [" "]})),
             Err("prompt 1 must not be empty".to_owned())
         );
         assert_eq!(
             validate_tool_arguments(&json!({
+                "engine": "app-server-image", "aspectRatio": "16:9",
                 "prompts": ["one", "two", "three", "four", "five"],
                 "count": 5
             })),
@@ -2724,6 +2722,7 @@ skipped PATH=(none): PATH is unavailable."
             }),
         );
         let input = json!({
+            "engine": "app-server-image", "aspectRatio": "16:9",
             "prompts": ["project visual"],
             "referenceImagePath": missing_reference
         });
@@ -2754,11 +2753,11 @@ skipped PATH=(none): PATH is unavailable."
         }));
         for (arguments, expected) in [
             (
-                json!({"prompts": ["replace burger"], "operation": "edit"}),
+                json!({"engine": "app-server-image", "prompts": ["replace burger"], "operation": "edit"}),
                 "edit requires a reference image",
             ),
             (
-                json!({"prompts": ["replace burger"], "operation": "edit", "referenceImagePath": "  "}),
+                json!({"engine": "app-server-image", "prompts": ["replace burger"], "operation": "edit", "referenceImagePath": "  "}),
                 "edit requires a reference image",
             ),
             (
@@ -2766,7 +2765,7 @@ skipped PATH=(none): PATH is unavailable."
                 "edit requires the app-server-image, grok-imagine-2, grok-imagine, gpt-image, or openai-image-api engine",
             ),
             (
-                json!({"prompts": ["replace burger"], "operation": "edti"}),
+                json!({"engine": "app-server-image", "aspectRatio": "16:9", "prompts": ["replace burger"], "operation": "edti"}),
                 "operation must be one of: generate, edit",
             ),
         ] {
@@ -2785,29 +2784,39 @@ skipped PATH=(none): PATH is unavailable."
     }
 
     #[test]
-    fn omitted_engine_is_left_to_the_server_default() {
-        let directory = TestDirectory::new("default-engine");
-        let root = fs::canonicalize(&directory.path).expect("canonical root");
-        let fake = FakeServer::running(root.clone(), 3);
-        let config = test_config(&fake.url, Some(root), None);
+    fn a_call_that_leaves_the_engine_or_aspect_ratio_open_is_asked_before_any_launch() {
+        // No server is running: a rejection here proves nothing was launched.
+        let config = test_config("http://127.0.0.1:9", None, None);
+        let call = |arguments: Value| {
+            call_generate_image_grid_with_config(&arguments, &config).expect_err("open choice")
+        };
 
-        call_generate_image_grid_with_config(&json!({"prompts": ["project visual"]}), &config)
-            .expect("generation without an engine");
-        let requests = fake.finish();
+        let neither = call(parts(&[("prompts", json!(["project visual"]))]));
+        assert!(neither.contains("did not set engine and aspectRatio"), "{neither}");
+        assert!(neither.contains("ask the user"), "{neither}");
 
-        assert_eq!(
-            requests
+        let no_engine = call(parts(&[
+            ("prompts", json!(["project visual"])),
+            ("aspectRatio", json!("16:9")),
+        ]));
+        assert!(no_engine.contains("did not set engine,"), "{no_engine}");
+        assert!(no_engine.contains("openai-image-api"), "{no_engine}");
+
+        let no_ratio = call(parts(&[
+            ("prompts", json!(["project visual"])),
+            ("engine", json!("grok-imagine-2")),
+        ]));
+        assert!(no_ratio.contains("did not set aspectRatio"), "{no_ratio}");
+    }
+
+    /// A tool call built from exactly the listed arguments.
+    fn parts(arguments: &[(&str, Value)]) -> Value {
+        Value::Object(
+            arguments
                 .iter()
-                .map(|request| format!("{} {}", request.method, request.path))
-                .collect::<Vec<_>>(),
-            vec![
-                "GET /api/health",
-                "POST /api/preflight/app-server-image",
-                "POST /api/run-batch"
-            ],
-            "the reported default engine decides readiness"
-        );
-        assert!(requests[2].body.get("engine").is_none());
+                .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                .collect(),
+        )
     }
 
     fn reference_operation_payload(operation: Option<&str>) {
@@ -2964,6 +2973,7 @@ skipped PATH=(none): PATH is unavailable."
         });
         config.launch_timeout = Duration::from_secs(5);
         let input = json!({
+            "aspectRatio": "16:9",
             "prompts": ["vector mark"],
             "engine": "codex-svg",
             "waitMs": 0
@@ -3020,6 +3030,7 @@ skipped PATH=(none): PATH is unavailable."
         config.launch_timeout = Duration::from_secs(5);
         config.launch_probe = Duration::from_millis(50);
         let input = json!({
+            "aspectRatio": "16:9",
             "prompts": ["vector mark"],
             "engine": "codex-svg",
             "waitMs": 0
@@ -3186,7 +3197,6 @@ skipped PATH=(none): PATH is unavailable."
                 },
                 "appServerImage": false,
                 "appServerImageReady": false,
-                "defaultEngine": "app-server-image"
             }),
             "/api/preflight/app-server-image" => json!({
                 "ok": true,

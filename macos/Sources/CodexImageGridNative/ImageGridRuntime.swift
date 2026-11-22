@@ -191,6 +191,10 @@ struct ImageGridGenerationRequest: Encodable, Equatable, Sendable {
     let aspectRatio: String
     var referenceImagePath: String?
     var operation: ImageGridOperation = .generate
+    /// Tells the server the user picked this engine in the app themselves, so
+    /// it runs as chosen: GPT Image (auto) may draw through the billed API,
+    /// where the same engine from any other caller stops and asks first.
+    var engineChosenInApp = true
 
     func usingReferenceImagePath(_ path: String?) -> Self {
         var copy = self
@@ -236,14 +240,6 @@ private struct ImageGridRunEvent: Decodable {
 
 private struct ImageGridDeleteRunsRequest: Encodable {
     let runIds: [String]
-}
-
-private struct ImageGridDefaultEngineRequest: Encodable {
-    let engine: String
-}
-
-private struct ImageGridDefaultEngineResponse: Decodable {
-    let defaultEngine: String
 }
 
 private struct ImageGridOpenAIAPIKeyRequest: Encodable {
@@ -536,14 +532,6 @@ struct ImageGridAPIClient: Sendable {
             path: "/api/delete-runs",
             method: "POST",
             body: ImageGridDeleteRunsRequest(runIds: runIDs)
-        )
-    }
-
-    func setDefaultEngine(_ engine: String) async throws {
-        let _: ImageGridDefaultEngineResponse = try await send(
-            path: "/api/preferences/default-engine",
-            method: "PUT",
-            body: ImageGridDefaultEngineRequest(engine: engine)
         )
     }
 
@@ -996,14 +984,6 @@ final class ImageGridStore: ObservableObject {
             return .failure(error)
         } catch {
             return .failure(ImageGridAPIError(message: error.localizedDescription))
-        }
-    }
-
-    func recordDefaultEngine(_ engine: ImageEngine) async {
-        do {
-            try await client.setDefaultEngine(engine.rawValue)
-        } catch {
-            generationMessage = error.localizedDescription
         }
     }
 
