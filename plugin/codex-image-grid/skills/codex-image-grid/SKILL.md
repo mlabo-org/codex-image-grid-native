@@ -37,9 +37,11 @@ source independently. To edit a preceding result, supply that result's path.
 Image Grid does not choose the engine or a generation's aspect ratio, and
 nothing selected in its app applies to a tool call. Set `engine` and
 `aspectRatio` from what the user or the calling workflow decided. When neither
-has decided one, ask the user; do not pick a value yourself. A call that leaves
-one open returns that question instead of images: answer it by asking the user,
-then call again.
+has decided an engine, pass `engine: grok-imagine-2` (Grok Imagine 2.0, the
+user's standing default); do not leave `engine` out. When neither has decided an aspect
+ratio, ask the user; do not pick one yourself. A call that leaves one open
+returns that question instead of images: answer it by asking the user, then
+call again.
 
 Both Grok engines draw through the local Grok CLI. `grok-imagine-2` draws with
 Grok Imagine 2.0, the web version's style, and is the one to use when the user
