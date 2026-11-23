@@ -4568,6 +4568,7 @@ fn build_svg_prompt(job: &ImageGridJob) -> String {
     } else {
         format!("Variant {} of {}", job.variant, job.total)
     };
+    let (width, height) = svg_canvas(&job.aspect_ratio);
     format!(
         "Create one polished thumbnail-like image as a self-contained SVG file.\n\n\
 Write the SVG to this exact absolute path:\n{}\n\n\
@@ -4577,15 +4578,30 @@ Reference premise:\n{premise}\n\n\
 Batch position:\n{prompt_label}\n\n\
 Hard requirements:\n\
 - Create exactly one valid SVG file at the path above.\n\
-- Use a 16:9 canvas: viewBox=\"0 0 1280 720\".\n\
+- Use a {aspect} canvas: viewBox=\"0 0 {width} {height}\" width=\"{width}\" height=\"{height}\".\n\
 - Keep all assets inline. Do not use remote images, external fonts, or network downloads.\n\
 - Make the composition visibly different from the other variants: vary layout, focal object, accent color, and typographic rhythm.\n\
 - Use readable Japanese text only when useful; keep it short and non-overlapping.\n\
 - Include subtle texture, depth, and a clear focal hierarchy.\n\
 - Do not ask follow-up questions.\n\
 - Finish with one concise sentence that includes \"{}\".\n",
-        job.output_path, job.prompt, job.filename
+        job.output_path,
+        job.prompt,
+        job.filename,
+        aspect = job.aspect_ratio,
     )
+}
+
+/// The SVG canvas size for one of `ASPECT_RATIOS`; 16:9 keeps the original
+/// 1280×720 canvas and the long side stays 1280 for the others.
+fn svg_canvas(aspect_ratio: &str) -> (u32, u32) {
+    match aspect_ratio {
+        "4:3" => (1280, 960),
+        "1:1" => (1280, 1280),
+        "3:4" => (960, 1280),
+        "9:16" => (720, 1280),
+        _ => (1280, 720),
+    }
 }
 
 /// The style line for a mood; `none` adds no style line to the prompt.
@@ -5434,6 +5450,32 @@ Keep the round glasses and blue scarf.\n\nA calm SVG mascot"
     }
 
     #[test]
+    fn codex_svg_prompt_uses_the_requested_aspect_ratio() {
+        let output_path = Path::new("/tmp/variant-01.svg");
+        for (aspect, canvas) in [
+            ("16:9", "viewBox=\"0 0 1280 720\""),
+            ("4:3", "viewBox=\"0 0 1280 960\""),
+            ("1:1", "viewBox=\"0 0 1280 1280\""),
+            ("3:4", "viewBox=\"0 0 960 1280\""),
+            ("9:16", "viewBox=\"0 0 720 1280\""),
+        ] {
+            let mut job = svg_fixture_job("feedface", output_path, now_millis());
+            job.aspect_ratio = aspect.to_owned();
+            let prompt = build_svg_prompt(&job);
+            assert!(
+                prompt.contains(&format!("- Use a {aspect} canvas: {canvas}")),
+                "{aspect}: {prompt}"
+            );
+        }
+        for aspect in ASPECT_RATIOS {
+            let (width, height) = svg_canvas(aspect);
+            let (w, h) = aspect.split_once(':').expect("ratio");
+            let (w, h): (u32, u32) = (w.parse().unwrap(), h.parse().unwrap());
+            assert_eq!(width * h, height * w, "{aspect} canvas keeps its ratio");
+        }
+    }
+
+    #[test]
     fn codex_svg_prompt_builder_matches_the_frozen_contract() {
         let output_path = Path::new("/tmp/variant-01.svg");
         let job = svg_fixture_job("feedface", output_path, now_millis());
@@ -5448,7 +5490,7 @@ Style direction:\nwarm anime blog mascot portrait, soft desk lighting, charming 
 Batch position:\nVariant 1 of 2\n\n\
 Hard requirements:\n\
 - Create exactly one valid SVG file at the path above.\n\
-- Use a 16:9 canvas: viewBox=\"0 0 1280 720\".\n\
+- Use a 16:9 canvas: viewBox=\"0 0 1280 720\" width=\"1280\" height=\"720\".\n\
 - Keep all assets inline. Do not use remote images, external fonts, or network downloads.\n\
 - Make the composition visibly different from the other variants: vary layout, focal object, accent color, and typographic rhythm.\n\
 - Use readable Japanese text only when useful; keep it short and non-overlapping.\n\
