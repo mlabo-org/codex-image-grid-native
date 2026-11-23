@@ -208,7 +208,7 @@ struct ResultCardView: View {
             ZStack(alignment: .topLeading) {
                 Color(nsColor: .underPageBackgroundColor)
                 if let imageURL {
-                    AsyncImage(url: imageURL) { phase in
+                    GeneratedImageLoader(url: imageURL) { phase in
                         switch phase {
                         case .empty:
                             if job.isActive {

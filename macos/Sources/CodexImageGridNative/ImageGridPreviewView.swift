@@ -76,7 +76,7 @@ struct ImageGridPreviewView: View {
     private var imageCanvas: some View {
         ZStack {
             Color(nsColor: .underPageBackgroundColor)
-            AsyncImage(url: payload.imageURL) { phase in
+            GeneratedImageLoader(url: payload.imageURL) { phase in
                 switch phase {
                 case .empty:
                     ProgressView(strings.loading)
