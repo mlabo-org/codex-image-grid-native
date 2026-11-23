@@ -1635,11 +1635,32 @@ fn render_tool_result(data: &Value, server: &ServerStartup, base_url: &str) -> V
         codex_markdown.clone()
     });
 
+    // A fully successful run omits bulky records the caller already holds or
+    // can read from the manifest: the echoed prompt, per-job timing, nested
+    // runtime diagnostics, and whole-output copies inside `diagnostics`.
+    // Any other state keeps the full records for troubleshooting.
+    let compact = data.get("completed").and_then(Value::as_bool) == Some(true)
+        && status == "done"
+        && artifact_error.is_null()
+        && !outputs.iter().any(|output| {
+            ["errorCode", "errorMessage"]
+                .iter()
+                .any(|key| output.get(*key).is_some_and(|value| !value.is_null()))
+        });
+    let diagnostics = if compact {
+        diagnostics.iter().map(compact_diagnostic).collect()
+    } else {
+        diagnostics
+    };
     let structured_outputs = outputs
         .iter()
         .map(|output| {
             let mut output = output.clone();
             if let Some(object) = output.as_object_mut() {
+                if compact {
+                    object.remove("prompt");
+                    object.remove("timing");
+                }
                 object.insert(
                     "absoluteImageUrl".to_owned(),
                     output_image_url(&Value::Object(object.clone()), base_url)
@@ -1666,8 +1687,23 @@ fn render_tool_result(data: &Value, server: &ServerStartup, base_url: &str) -> V
             data.get("completed").cloned().unwrap_or(Value::Null),
         ),
         ("serverStarted", Value::Bool(server.started)),
-        ("health", server.health.clone()),
-        ("server", data.get("server").cloned().unwrap_or(Value::Null)),
+        ("compact", Value::Bool(compact)),
+        (
+            "health",
+            if compact {
+                scalar_fields(&server.health)
+            } else {
+                server.health.clone()
+            },
+        ),
+        (
+            "server",
+            match data.get("server") {
+                Some(value) if compact => scalar_fields(value),
+                Some(value) => value.clone(),
+                None => Value::Null,
+            },
+        ),
         (
             "statusUrl",
             status_url.map(Value::String).unwrap_or(Value::Null),
@@ -1725,6 +1761,46 @@ fn render_tool_result(data: &Value, server: &ServerStartup, base_url: &str) -> V
         "structuredContent": Value::Object(structured),
         "isError": false
     })
+}
+
+/// Keeps only the string, number, boolean, and null members of a JSON object.
+fn scalar_fields(value: &Value) -> Value {
+    match value.as_object() {
+        Some(object) => Value::Object(
+            object
+                .iter()
+                .filter(|(_, member)| !member.is_object() && !member.is_array())
+                .map(|(key, member)| (key.clone(), member.clone()))
+                .collect(),
+        ),
+        None => value.clone(),
+    }
+}
+
+/// Reduces a diagnostic entry to the fields the output schema declares for it.
+fn compact_diagnostic(entry: &Value) -> Value {
+    const FIELDS: [&str; 11] = [
+        "id",
+        "promptIndex",
+        "variant",
+        "status",
+        "statusText",
+        "errorCode",
+        "errorMessage",
+        "upstreamStatus",
+        "threadId",
+        "turnId",
+        "diagnosticLog",
+    ];
+    match entry.as_object() {
+        Some(object) => Value::Object(
+            FIELDS
+                .iter()
+                .filter_map(|key| object.get(*key).map(|v| ((*key).to_owned(), v.clone())))
+                .collect(),
+        ),
+        None => entry.clone(),
+    }
 }
 
 fn output_label(output: &Value) -> String {
@@ -2949,6 +3025,126 @@ skipped PATH=(none): PATH is unavailable."
                 .expect("summary")
                 .contains("artifactError: ArtifactWriteFailed: manifest write failed")
         );
+    }
+
+    fn finished_run(output_error: Value) -> Value {
+        let runtime = json!({
+            "app": "codex-image-grid",
+            "generatedDir": "/tmp/generated",
+            "codexAppServer": { "status": "ready", "candidates": [{ "source": "path" }] },
+            "appServerImageScheduler": { "configuredMax": 2, "active": 0 }
+        });
+        json!({
+            "runId": "abc12345",
+            "status": "done",
+            "completed": true,
+            "artifactError": null,
+            "manifestPath": "/tmp/generated/abc12345/manifest.json",
+            "server": runtime,
+            "outputs": [{
+                "id": "job-1",
+                "prompt": "a long prompt the caller already sent",
+                "promptIndex": 1,
+                "promptTotal": 1,
+                "variant": 1,
+                "total": 1,
+                "status": "done",
+                "statusText": "done",
+                "outputPath": "/tmp/generated/abc12345/variant-01.png",
+                "webpPath": "/tmp/generated/abc12345/variant-01.webp",
+                "imageUrl": "/generated/abc12345/variant-01.png",
+                "referenceImagePath": "/tmp/reference.jpg",
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "errorCode": output_error,
+                "errorMessage": null,
+                "upstreamStatus": null,
+                "diagnosticLog": "attempt 1 ok",
+                "timing": { "phase": "done", "totalMs": 1200 }
+            }]
+        })
+    }
+
+    fn startup_with_full_health() -> ServerStartup {
+        ServerStartup {
+            started: false,
+            launch_plan: None,
+            health: json!({
+                "ok": true,
+                "app": "codex-image-grid",
+                "appServerImageReady": true,
+                "appServerImageDiagnostics": { "status": "ready", "candidates": [] },
+                "identity": { "app": "codex-image-grid", "serverRoot": "/tmp" }
+            }),
+        }
+    }
+
+    #[test]
+    fn render_tool_result_compacts_a_fully_successful_run() {
+        let result = render_tool_result(
+            &finished_run(Value::Null),
+            &startup_with_full_health(),
+            "http://127.0.0.1:4322",
+        );
+        let structured = &result["structuredContent"];
+
+        assert_eq!(structured["compact"], true);
+        assert_eq!(
+            structured["health"],
+            json!({ "ok": true, "app": "codex-image-grid", "appServerImageReady": true })
+        );
+        assert_eq!(
+            structured["server"],
+            json!({ "app": "codex-image-grid", "generatedDir": "/tmp/generated" })
+        );
+        let output = &structured["outputs"][0];
+        assert!(output.get("prompt").is_none());
+        assert!(output.get("timing").is_none());
+        // Fields that callers map and verify by stay in every output.
+        assert_eq!(output["promptIndex"], 1);
+        assert_eq!(output["webpPath"], "/tmp/generated/abc12345/variant-01.webp");
+        assert_eq!(output["outputPath"], "/tmp/generated/abc12345/variant-01.png");
+        assert_eq!(output["referenceImagePath"], "/tmp/reference.jpg");
+        assert_eq!(
+            output["absoluteImageUrl"],
+            "http://127.0.0.1:4322/generated/abc12345/variant-01.png"
+        );
+        assert_eq!(
+            structured["diagnostics"],
+            json!([{
+                "id": "job-1",
+                "promptIndex": 1,
+                "variant": 1,
+                "status": "done",
+                "statusText": "done",
+                "errorCode": null,
+                "errorMessage": null,
+                "upstreamStatus": null,
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "diagnosticLog": "attempt 1 ok"
+            }])
+        );
+    }
+
+    #[test]
+    fn render_tool_result_keeps_full_records_when_an_output_failed() {
+        let result = render_tool_result(
+            &finished_run(json!("UpstreamError")),
+            &startup_with_full_health(),
+            "http://127.0.0.1:4322",
+        );
+        let structured = &result["structuredContent"];
+
+        assert_eq!(structured["compact"], false);
+        assert!(structured["health"]["appServerImageDiagnostics"].is_object());
+        assert!(structured["server"]["codexAppServer"].is_object());
+        assert_eq!(
+            structured["outputs"][0]["prompt"],
+            "a long prompt the caller already sent"
+        );
+        assert!(structured["outputs"][0]["timing"].is_object());
+        assert!(structured["diagnostics"][0]["timing"].is_object());
     }
 
     #[test]
