@@ -296,6 +296,8 @@ listing models (HTTP 403) gets the IDs documented on 2026-11-24 with
 `"listed": false`. Give the key the "List models: Read" permission for the live
 list. The app's model picker shows this list and also takes a typed ID.
 
+![The app's Model menu listing the GPT Image models the API key can use](./docs/assets/codex-image-grid-model-picker.png)
+
 **Spend.** Each API job records the token usage the response reported as
 `apiUsage` (`inputTokens`, `outputTokens`, the text/image split of the input,
 and `estimatedUsd`) in its result and manifest. The estimate uses the published
@@ -695,6 +697,8 @@ APIが知らないIDは`OpenAiImageModelUnavailable`で失敗し、料金はか�
 （HTTP 403）には、2026-11-24時点で公式文書にあるIDを`"listed": false`付きで返します。
 最新の一覧にするには、キーに「List models: Read」の権限を付けます。アプリのモデル選択は
 この一覧を出し、IDの直接入力も受け付けます。
+
+![APIキーで使えるGPT Imageのモデルを並べた、アプリのモデル選択メニュー](./docs/assets/codex-image-grid-model-picker.png)
 
 **料金**　APIのジョブは、応答に入っていた使用トークンを`apiUsage`（`inputTokens`・
 `outputTokens`・入力のテキストと画像の内訳・`estimatedUsd`）として結果とマニフェストに
