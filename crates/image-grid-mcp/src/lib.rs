@@ -39,6 +39,15 @@ Grok CLI; the app-server-image engine runs through the Codex App Server and its 
 WebP copy saved beside each PNG or JPEG for web upload, display-safe image URLs, \
 and Markdown image links in the codexMarkdown field for Claude Code."
         }
+        AgentHost::Antigravity => {
+            "Generate images or edit a supplied image, singly or in Prompt Batch. \
+Use operation=generate for new images and reference-character variations; use operation=edit \
+with referenceImagePath for requested changes preserving the rest of the source. \
+Activates the installed native Codex Image Grid app (the Grok engines run through the local \
+Grok CLI; the app-server-image engine runs through the Codex App Server and its Codex account; the openai-image-api engine calls the OpenAI Image API and is billed per image), then returns handoff.md, absolute output paths, webpPaths for the lossy \
+WebP copy saved beside each PNG or JPEG for web upload, display-safe image URLs, \
+and Markdown image links in the codexMarkdown field for Antigravity."
+        }
     }
 }
 
@@ -57,6 +66,13 @@ for changes to an existing image. Return and reuse handoff.md, absolute output p
 and the Markdown image links in codexMarkdown. To show results in Claude Code, read the absolute \
 output paths or open imageUrls in the Claude Code browser pane \
 (mcp__Claude_Browser__preview_start or mcp__Claude_Browser__navigate)."
+        }
+        AgentHost::Antigravity => {
+            "Use generate_image_grid for image generation, reference-character \
+variations, partial image edits, and Prompt Batch. Select operation=edit with referenceImagePath \
+for changes to an existing image. Return and reuse handoff.md, absolute output paths, imageUrls, \
+and the Markdown image links in codexMarkdown. To show results in Antigravity, read the absolute \
+output paths with read_file or open imageUrls in the built-in browser subagent."
         }
     }
 }
@@ -2435,6 +2451,13 @@ mod tests {
         assert!(!tool_description(AgentHost::ClaudeCode).contains("Codex Markdown"));
         assert!(
             server_instructions(AgentHost::ClaudeCode).contains("mcp__Claude_Browser__navigate")
+        );
+        assert!(
+            tool_description(AgentHost::Antigravity).contains("codexMarkdown field for Antigravity")
+        );
+        assert!(!tool_description(AgentHost::Antigravity).contains("Codex Markdown"));
+        assert!(
+            server_instructions(AgentHost::Antigravity).contains("built-in browser subagent")
         );
     }
 

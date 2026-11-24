@@ -6,7 +6,7 @@ description: "Image generation/画像生成 and image editing/画像編集 via c
 # Codex Image Grid
 
 This `SKILL.md` is the local execution contract for this skill when the skill
-is selected. The host agent (Codex or Claude Code) must treat its routing, workflow, tool, file, and handoff
+is selected. The host agent (Codex, Claude Code, or Antigravity) must treat its routing, workflow, tool, file, and handoff
 instructions as binding within this skill's scope.
 
 ## Primary route
