@@ -281,6 +281,9 @@ struct NormalizedRunRequest {
     /// route, and `app-server-image` is tried without a plan check.
     chosen_in_app: bool,
     aspect_ratio: String,
+    /// The OpenAI image model an `openai-image-api` run draws with, when the
+    /// request named one; otherwise the run uses `openai_image::DEFAULT_MODEL`.
+    image_model: Option<String>,
     reference_premise: String,
     inline_reference_image: Option<InlineReferenceImage>,
     reference_image_path: Option<PathBuf>,
@@ -997,7 +1000,10 @@ app's settings",
                 "app-server-image" => "app-server-image",
                 "grok-imagine" => "grok-imagine",
                 "grok-imagine-2" => GROK_IMAGINE_2_MODEL,
-                openai_image::API_ENGINE => openai_image::MODEL,
+                openai_image::API_ENGINE => request
+                    .image_model
+                    .as_deref()
+                    .unwrap_or(openai_image::DEFAULT_MODEL),
                 _ => "codex-app-server",
             }
             .to_owned();
@@ -2069,6 +2075,7 @@ app's settings",
             None => None,
         };
         let request = match openai_image::build_request(
+            &job.model,
             &build_openai_image_prompt(&job),
             &job.aspect_ratio,
             job.operation == ImageOperation::Edit,
@@ -2161,8 +2168,7 @@ app's settings",
             bytes,
             format!(
                 "[openai-image-api] model={} endpoint={}",
-                openai_image::MODEL,
-                request.path
+                job.model, request.path
             ),
         )
         .await;
@@ -3859,6 +3865,28 @@ fn normalize_request(
     let engine = engine.unwrap_or_default().to_owned();
     let aspect_ratio = aspect_ratio.unwrap_or(EDIT_UNUSED_ASPECT_RATIO).to_owned();
     let chosen_in_app = body.get("engineChosenInApp").and_then(Value::as_bool) == Some(true);
+    // Only the OpenAI Image API takes a model from the request: the other
+    // engines draw with the model their own route sets, so a model sent with
+    // them is refused rather than silently dropped.
+    let image_model = match body.get("model") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(model)) if engine == openai_image::API_ENGINE => {
+            let model = model.trim();
+            openai_image::validate_model(model)
+                .map_err(|message| RunApiError::new(message, "invalid_model"))?;
+            Some(model.to_owned())
+        }
+        Some(Value::String(_)) => {
+            return Err(RunApiError::new(
+                format!(
+                    "model applies only to the {} engine; {engine} draws with the model its own route sets",
+                    openai_image::API_ENGINE
+                ),
+                "model_not_supported_for_engine",
+            ));
+        }
+        Some(_) => return Err(RunApiError::new("model must be a string", "invalid_model")),
+    };
     let reference_premise = body
         .get("referencePremise")
         .and_then(Value::as_str)
@@ -3900,6 +3928,7 @@ fn normalize_request(
         engine,
         chosen_in_app,
         aspect_ratio,
+        image_model,
         reference_premise,
         inline_reference_image,
         reference_image_path,
@@ -6709,7 +6738,7 @@ done
         let output = &run["outputs"][0];
         assert_eq!(output["status"], "done", "{output}");
         assert_eq!(output["engine"], "openai-image-api");
-        assert_eq!(output["model"], "gpt-image-2");
+        assert_eq!(output["model"], "gpt-image-2.6-sunburst");
         let run_id = run["runId"].as_str().expect("run ID");
         let directory = config.generated_dir.join(run_id);
         assert_eq!(
@@ -6723,7 +6752,7 @@ done
         let (path, authorization, body) = &calls[0];
         assert_eq!(path, "/v1/images/generations");
         assert_eq!(authorization, "Bearer sk-test-secret");
-        assert_eq!(body["model"], "gpt-image-2");
+        assert_eq!(body["model"], "gpt-image-2.6-sunburst");
         assert_eq!(body["size"], "1056x1408");
         let prompt = body["prompt"].as_str().expect("prompt");
         assert!(prompt.starts_with("Create exactly one polished thumbnail image."));
@@ -6741,6 +6770,69 @@ done
         .expect("manifest JSON");
         assert_eq!(manifest["request"]["engine"], "openai-image-api");
         assert!(manifest["request"].get("requestedEngine").is_none());
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_named_model_reaches_the_image_api_and_the_records_and_other_engines_refuse_one() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (runtime, config) =
+            provider_free_runtime(&temporary, "#!/bin/sh\nexit 1\n", RecoveryConfig::default());
+        let (base_url, calls) = fake_image_api(vec![(
+            200,
+            json!({"data": [{"b64_json": ONE_PIXEL_PNG}]}),
+        )])
+        .await;
+        point_openai_at(&runtime, base_url);
+        assert!(runtime.set_openai_api_key(Some("sk-test")));
+
+        let (_, run) = runtime
+            .create_run(
+                &json!({
+                    "prompts": ["a cat"], "engine": "openai-image-api", "model": "gpt-image-2.6-flare",
+                    "aspectRatio": "1:1", "mood": "none", "waitMs": 20000
+                }),
+                true,
+                None,
+            )
+            .await
+            .expect("accepted run");
+        let output = &run["outputs"][0];
+        assert_eq!(output["status"], "done", "{output}");
+        assert_eq!(output["model"], "gpt-image-2.6-flare");
+        assert!(
+            output["diagnosticLog"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("model=gpt-image-2.6-flare"),
+            "{output}"
+        );
+        assert_eq!(calls.lock().expect("recorded calls")[0].2["model"], "gpt-image-2.6-flare");
+        let run_id = run["runId"].as_str().expect("run ID");
+        let manifest: Value = serde_json::from_str(
+            &std_fs::read_to_string(config.generated_dir.join(run_id).join("manifest.json"))
+                .expect("manifest"),
+        )
+        .expect("manifest JSON");
+        assert_eq!(manifest["request"]["model"], "gpt-image-2.6-flare");
+
+        for (body, code) in [
+            (
+                json!({"prompts": ["a cat"], "engine": "grok-imagine-2", "model": "gpt-image-2", "aspectRatio": "1:1"}),
+                "model_not_supported_for_engine",
+            ),
+            (
+                json!({"prompts": ["a cat"], "engine": "openai-image-api", "model": "gpt image", "aspectRatio": "1:1"}),
+                "invalid_model",
+            ),
+        ] {
+            let error = runtime
+                .create_run(&body, true, None)
+                .await
+                .expect_err("refused model");
+            assert_eq!(error.code.as_deref(), Some(code), "{body}");
+        }
+        assert_eq!(calls.lock().expect("recorded calls").len(), 1);
         runtime.shutdown().await;
     }
 

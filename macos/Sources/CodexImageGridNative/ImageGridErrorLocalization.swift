@@ -33,6 +33,7 @@ enum ImageGridErrorCodeTitles {
         "OpenAiApiKeyRejected": "OpenAI に API キーを拒否されました",
         "OpenAiCreditExhausted": "OpenAI API の残高がないか、上限に達しました",
         "OpenAiImageApiFailed": "OpenAI Image API の呼び出しに失敗しました",
+        "OpenAiImageModelUnavailable": "この API キーでは、指定した画像モデルを使えません",
         "OpenAiImageRequestRejected": "OpenAI にこの画像の依頼を拒否されました",
         "RateLimit": "画像生成のレート制限に達しました",
         "ReferenceImageTooLarge": "元画像が大きすぎます（OpenAI API は約15MBまで）",

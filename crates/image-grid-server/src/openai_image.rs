@@ -12,9 +12,10 @@ pub(crate) const API_ENGINE: &str = "openai-image-api";
 /// run is admitted. A run never keeps this name: its record carries the engine
 /// that was picked.
 pub(crate) const AUTO_ENGINE: &str = "gpt-image";
-/// The model Codex image generation draws with on a ChatGPT login, so both
-/// GPT Image routes produce the same kind of image.
-pub(crate) const MODEL: &str = "gpt-image-2";
+/// The model a run draws with when the request names none.
+pub(crate) const DEFAULT_MODEL: &str = "gpt-image-2.6-sunburst";
+/// The longest model ID a request may name.
+const MAX_MODEL_CHARS: usize = 64;
 const QUALITY: &str = "medium";
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// The Image API's `image_url` length limit for one input image.
@@ -87,6 +88,25 @@ pub(crate) struct ImageRequest {
     pub body: Value,
 }
 
+/// Checks a model ID named by a request. Any ID made of letters, digits,
+/// dots, dashes, and underscores is passed through unchanged, so a GPT Image
+/// version released later works without a change here; whether the ID exists
+/// is OpenAI's to answer when the job runs.
+pub(crate) fn validate_model(model: &str) -> Result<(), String> {
+    let valid = !model.is_empty()
+        && model.len() <= MAX_MODEL_CHARS
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "model must be an OpenAI image model ID of at most {MAX_MODEL_CHARS} letters, digits, dots, dashes, or underscores (for example {DEFAULT_MODEL})"
+        ))
+    }
+}
+
 /// The pixel size sent for each aspect ratio. Both edges are multiples of 16
 /// and the total stays inside the Image API's pixel range.
 pub(crate) fn size_for_aspect_ratio(aspect_ratio: &str) -> &'static str {
@@ -103,6 +123,7 @@ pub(crate) fn size_for_aspect_ratio(aspect_ratio: &str) -> &'static str {
 /// edits endpoint; an edit keeps the source's own size, and a
 /// reference-guided generation asks for the run's aspect ratio.
 pub(crate) fn build_request(
+    model: &str,
     prompt: &str,
     aspect_ratio: &str,
     is_edit: bool,
@@ -114,7 +135,7 @@ pub(crate) fn build_request(
         size_for_aspect_ratio(aspect_ratio)
     };
     let mut body = json!({
-        "model": MODEL,
+        "model": model,
         "prompt": prompt,
         "size": size,
         "quality": QUALITY,
@@ -187,6 +208,15 @@ pub(crate) fn classify_error(
         ApiFailure::new(
             "OpenAiApiKeyRejected",
             "OpenAI rejected the API key (HTTP 401). Save a valid key in the Image Grid app's settings.",
+        )
+    } else if code == "model_not_found"
+        || (upstream.contains("model") && (status == 404 || upstream.contains("does not exist")))
+    {
+        ApiFailure::new(
+            "OpenAiImageModelUnavailable",
+            format!(
+                "OpenAI has no image model by this ID for this API key ({detail}). GPT Image 2.5 and 2.6 IDs carry a variant, such as gpt-image-2.6-sunburst or gpt-image-2.6-flare."
+            ),
         )
     } else if code == "moderation_blocked" {
         ApiFailure::new(
@@ -316,34 +346,51 @@ mod tests {
 
     #[test]
     fn requests_take_the_generation_or_edit_endpoint_by_whether_an_image_is_attached() {
-        let generate = build_request("a cat", "3:4", false, None).expect("generate");
+        let generate = build_request("gpt-image-2.6-sunburst", "a cat", "3:4", false, None).expect("generate");
         assert_eq!(generate.path, "/images/generations");
         assert_eq!(
             generate.body,
             json!({
-                "model": "gpt-image-2", "prompt": "a cat", "size": "1056x1408",
+                "model": "gpt-image-2.6-sunburst", "prompt": "a cat", "size": "1056x1408",
                 "quality": "medium", "n": 1, "output_format": "png"
             })
         );
 
         let guided =
-            build_request("a cat", "1:1", false, Some(("image/png", b"abc"))).expect("guided");
+            build_request("gpt-image-2", "a cat", "1:1", false, Some(("image/png", b"abc"))).expect("guided");
         assert_eq!(guided.path, "/images/edits");
+        assert_eq!(guided.body["model"], "gpt-image-2");
         assert_eq!(guided.body["size"], "1024x1024");
         assert_eq!(
             guided.body["images"],
             json!([{"image_url": "data:image/png;base64,YWJj"}])
         );
 
-        let edit = build_request("red hat", "16:9", true, Some(("image/jpeg", b"abc")))
+        let edit = build_request(DEFAULT_MODEL, "red hat", "16:9", true, Some(("image/jpeg", b"abc")))
             .expect("edit");
         assert_eq!(edit.path, "/images/edits");
         assert_eq!(edit.body["size"], "auto");
 
         let too_large = vec![0_u8; 16 * 1024 * 1024];
-        let failure = build_request("x", "1:1", true, Some(("image/png", &too_large)))
+        let failure = build_request(DEFAULT_MODEL, "x", "1:1", true, Some(("image/png", &too_large)))
             .expect_err("over the input limit");
         assert_eq!(failure.code, "ReferenceImageTooLarge");
+    }
+
+    #[test]
+    fn any_well_formed_model_id_is_accepted_and_malformed_ones_are_not() {
+        for model in [
+            "gpt-image-2.6-sunburst",
+            "gpt-image-2.6-flare",
+            "gpt-image-2.5-flare-2026-09-08",
+            "gpt-image-2",
+            "gpt-image-9.1-nova",
+        ] {
+            assert_eq!(validate_model(model), Ok(()), "{model}");
+        }
+        for model in ["", "gpt image 2", "gpt-image-2/../x", &"a".repeat(65)] {
+            assert!(validate_model(model).is_err(), "{model:?}");
+        }
     }
 
     #[test]
@@ -392,6 +439,20 @@ mod tests {
         assert_eq!(limited.retry_after, Some(RETRY_DELAY_MAX));
 
         assert_eq!(classify(503, "upstream down").retry_after, Some(RETRY_DELAY));
+        let unknown = classify(
+            404,
+            r#"{"error":{"message":"The model `gpt-image-2.6` does not exist","code":"model_not_found"}}"#,
+        );
+        assert_eq!(unknown.code, "OpenAiImageModelUnavailable");
+        assert_eq!(unknown.retry_after, None);
+        assert!(unknown.message.contains("gpt-image-2.6-sunburst"));
+        // What the API returned for `gpt-image-2.6` on 2026-11-24.
+        let bare = classify(
+            400,
+            r#"{"error":{"message":"The model 'gpt-image-2.6' does not exist.","type":"image_generation_user_error"}}"#,
+        );
+        assert_eq!(bare.code, "OpenAiImageModelUnavailable");
+
         let refused = classify(400, r#"{"error":{"message":"bad size"}}"#);
         assert_eq!(refused.code, "OpenAiImageApiFailed");
         assert_eq!(refused.retry_after, None);

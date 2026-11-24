@@ -168,6 +168,8 @@ struct NormalizedArguments {
     engine: String,
     /// Absent only on an edit, which keeps its source's ratio.
     aspect_ratio: Option<String>,
+    /// The OpenAI image model for `openai-image-api`; the server checks it.
+    model: Option<String>,
     reference_premise: Option<String>,
     reference_image: Option<InlineReferenceImage>,
     wait_ms: u64,
@@ -467,6 +469,9 @@ fn submit_generate_image_grid(
     if let Some(aspect_ratio) = &arguments.aspect_ratio {
         body.insert("aspectRatio".to_owned(), json!(aspect_ratio));
     }
+    if let Some(model) = &arguments.model {
+        body.insert("model".to_owned(), json!(model));
+    }
     body.insert("waitMs".to_owned(), json!(arguments.wait_ms));
     if let Some(reference_premise) = &arguments.reference_premise {
         body.insert(
@@ -553,6 +558,10 @@ fn normalize_tool_arguments(
             .to_owned(),
         aspect_ratio: arguments
             .get("aspectRatio")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        model: arguments
+            .get("model")
             .and_then(Value::as_str)
             .map(str::to_owned),
         reference_premise: arguments
@@ -2107,6 +2116,19 @@ fn validate_tool_arguments(arguments: &Value) -> Result<(), String> {
             ));
         }
     }
+    if let Some(model) = arguments.get("model") {
+        if !model.is_string() {
+            return Err("model must be a string".to_owned());
+        }
+        // Checked here as well as in the server so the question comes back
+        // before the app is launched.
+        if arguments.get("engine").and_then(Value::as_str) != Some("openai-image-api") {
+            return Err(
+                "model applies only to the openai-image-api engine; the other engines draw with the model their own route sets"
+                    .to_owned(),
+            );
+        }
+    }
     if arguments
         .get("referencePremise")
         .is_some_and(|value| !value.is_string())
@@ -2201,12 +2223,19 @@ pub fn tool_record() -> Value {
                 "engine": {
                     "type": "string",
                     "enum": ["app-server-image", "codex-svg", "grok-imagine-2", "grok-imagine", "gpt-image", "openai-image-api"],
-                    "description": "Always set this; Image Grid does not choose an engine and rejects a call without one. Use the engine the user or the calling workflow decided on; if neither has, ask the user instead of picking. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style. app-server-image draws with Codex image generation on the ChatGPT subscription. openai-image-api draws with the OpenAI Image API (gpt-image-2) using the API key saved in the app and bills each image: use it only when the user agreed to that charge. gpt-image is app-server-image under another name for callers: both stop with a question for the user, and never bill, when Codex has no paid ChatGPT plan. codex-svg writes SVG."
+                    "description": "Always set this; Image Grid does not choose an engine and rejects a call without one. Use the engine the user or the calling workflow decided on; if neither has, ask the user instead of picking. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style. app-server-image draws with Codex image generation on the ChatGPT subscription. openai-image-api draws with the OpenAI Image API using the API key saved in the app and bills each image: use it only when the user agreed to that charge; its model is set by model. gpt-image is app-server-image under another name for callers: both stop with a question for the user, and never bill, when Codex has no paid ChatGPT plan. codex-svg writes SVG."
                 },
                 "aspectRatio": {
                     "type": "string",
                     "description": "Target ratio of a generation. Always set it for generate; Image Grid does not choose one and rejects a generation without it. Use the ratio the user or the calling workflow decided on; if neither has, ask the user. edit preserves the source ratio and needs none.",
                     "enum": ["16:9", "4:3", "1:1", "3:4", "9:16"]
+                },
+                "model": {
+                    "type": "string",
+                    "description": "OpenAI image model ID for the openai-image-api engine only; other engines refuse it. Omitted, the run draws with gpt-image-2.6-sunburst. Any ID is passed to the API unchanged, so a newer version works as soon as OpenAI offers it, and an ID that does not exist fails with OpenAiImageModelUnavailable. GPT Image 2.5 and 2.6 IDs carry a variant: gpt-image-2.6-sunburst, gpt-image-2.6-flare, gpt-image-2.5-sunburst, gpt-image-2.5-flare; gpt-image-2 has none. Older IDs may reject the custom pixel size Image Grid sends.",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[A-Za-z0-9._-]+$"
                 },
                 "referencePremise": {
                     "type": "string",

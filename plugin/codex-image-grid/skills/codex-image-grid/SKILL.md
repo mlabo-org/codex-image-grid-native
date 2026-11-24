@@ -49,7 +49,10 @@ just says Grok. `grok-imagine` is the CLI's older default model; use it only
 when the user asks for the older model. `app-server-image` draws GPT Image on
 the ChatGPT subscription. `openai-image-api` draws GPT Image through the OpenAI
 API and bills each image: use it only when the user has agreed to that charge
-for this request. When a result says the subscription cannot draw the run, or
+for this request. When the user names a GPT Image version for it, pass the
+exact OpenAI model ID as `model` (2.5 and 2.6 need a variant, such as
+`gpt-image-2.6-sunburst` or `gpt-image-2.6-flare`); ask which variant when
+the user names only the version. When a result says the subscription cannot draw the run, or
 that Codex image generation is rate-limited, tell the user and offer the
 options it names; do not rerun with another engine until the user says so.
 
