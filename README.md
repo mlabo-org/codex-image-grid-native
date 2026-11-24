@@ -158,7 +158,7 @@ image jobs in the same run.
 
 | Route | Best for |
 | --- | --- |
-| Native SwiftUI app | Editing Prompt Batches interactively, choosing the engine (GPT Image through App Server, the API, or picked automatically; Codex SVG; Grok Imagine 2.0; or the older Grok Imagine model), choosing a reference image with the macOS file picker, and watching progress or run history. |
+| Native SwiftUI app | Editing Prompt Batches interactively, choosing the engine (GPT Image through App Server, the API, or picked automatically; Codex SVG; Grok Imagine 2.0; or the older Grok Imagine model) and, for the API, its model, choosing a reference image with the macOS file picker, and watching progress or run history. |
 | Codex or Claude Code/MCP | Generating from a Codex task or Claude Code session, passing project-specific prompts or local reference files, and handing absolute artifact paths to another workflow. |
 
 Calling the MCP tool also opens the native app, so both routes use the same
@@ -238,8 +238,9 @@ GPT Image has two routes and one engine that picks between them.
 
 - `app-server-image` draws through the Codex App Server on the ChatGPT
   subscription.
-- `openai-image-api` calls the OpenAI Image API directly (`gpt-image-2`,
-  `quality: "medium"`) and is billed per image to an API key. Save the key in
+- `openai-image-api` calls the OpenAI Image API directly (`quality: "medium"`)
+  and is billed per image to an API key. It draws with `gpt-image-2.6-sunburst`
+  unless the request names another model in `model` (see below). Save the key in
   the app under Settings › OpenAI API. It is stored in the macOS keychain,
   handed only to the app's own server (on its standard input at launch and
   over loopback when it changes, never in its arguments or environment), held
@@ -266,6 +267,44 @@ with the API and, only on a yes, to call again with `openai-image-api`. An
 API route either; its message names the API as an option the user has to agree
 to.
 
+The refusal carries a machine-readable `fallback` beside `code`, for example
+`{"engine": "openai-image-api", "reason": "no_paid_chatgpt_plan",
+"billedPerImage": true, "apiKeyConfigured": true, "defaultModel":
+"gpt-image-2.6-sunburst"}`. The MCP tool passes the code and the fallback to
+the calling agent, which asks the user and, on a yes, calls again with the
+fallback engine; nothing depends on the app being open. A Grok job that fails
+because the CLI reports a lost sign-in, an ended plan, or a used-up allowance
+ends with the same code (see the Grok section). In the app, a run on
+"GPT Image (App Server)" first reads `GET /api/gpt-image-route`; when the
+subscription cannot draw, and when a Grok job of a run started in the app ends
+with that code, the app asks in a dialog whether to draw the same run with the
+OpenAI API, and draws it only on a yes.
+
+**Model.** An `openai-image-api` run may name the OpenAI image model in
+`model`; other engines refuse the field (`model_not_supported_for_engine`)
+instead of dropping it. Any ID of letters, digits, dots, dashes, and
+underscores is passed to the API unchanged, so a later GPT Image version works
+as soon as OpenAI offers it. GPT Image 2.5 and 2.6 have no bare IDs, only
+variants: `gpt-image-2.6-sunburst`, `gpt-image-2.6-flare`,
+`gpt-image-2.5-sunburst`, `gpt-image-2.5-flare` (plus dated snapshots);
+`gpt-image-2` has none. An ID the API does not know fails with
+`OpenAiImageModelUnavailable`, which costs nothing. Older models such as
+`gpt-image-1.5` may refuse the custom sizes below.
+`GET /api/openai-image-models` lists the `gpt-image` IDs the saved key can use
+(from OpenAI's `GET /v1/models`) with the default model; a key restricted from
+listing models (HTTP 403) gets the IDs documented on 2026-11-24 with
+`"listed": false`. Give the key the "List models: Read" permission for the live
+list. The app's model picker shows this list and also takes a typed ID.
+
+**Spend.** Each API job records the token usage the response reported as
+`apiUsage` (`inputTokens`, `outputTokens`, the text/image split of the input,
+and `estimatedUsd`) in its result and manifest. The estimate uses the published
+standard rates for `gpt-image-2`, 2.5, and 2.6 ($5 text input, $8 image input,
+$30 image output per million tokens); other models get no estimate. The app
+shows it on each card and today's total above the results. OpenAI offers no
+balance endpoint to a project API key, so the app links to OpenAI's usage page
+for the balance.
+
 The API route sends the same prompt as the App Server route without the lines
 that tell a Codex agent to call its image tool. Sizes are 1536×864 (16:9),
 1408×1056 (4:3), 1024×1024 (1:1), 1056×1408 (3:4), and 864×1536 (9:16); an
@@ -283,6 +322,14 @@ Grok CLI's Imagine tools. When an `app-server-image` job fails on a rate limit,
 its error message says so and names the Grok engines, and the billed
 `openai-image-api` engine if the user agrees to its charge, as ways to rerun
 the prompts; the engine is never switched automatically.
+
+The Grok CLI cannot report its plan, so a lost sign-in, an ended plan, or a
+used-up Imagine allowance (free plans have one) shows only when a job fails: a
+CLI run that exits with an error whose output says so (not logged in,
+unauthorized, 401/402/403, subscription, upgrade, usage limit, quota) ends
+with `OpenAiApiNeedsApproval` instead of `ImageOutputMissing`, so the caller
+offers the OpenAI API as for the App Server route. The check reads the CLI's
+wording, which has not yet been seen for a real lapse.
 
 - `grok-imagine-2` asks the CLI for Grok Imagine 2.0 (`grok-imagine-image-2.0`)
   by setting `GROK_IMAGE_GEN_MODEL_OVERRIDE` and `GROK_IMAGE_EDIT_MODEL_OVERRIDE`.
@@ -526,7 +573,7 @@ GitHubから入れた場合は、新しい版を取り込むときに
 
 | 利用方法 | 適している場面 |
 | --- | --- |
-| ネイティブSwiftUIアプリ | Prompt Batchを画面で調整する、エンジン（GPT ImageのApp Server・API・自動、Codex SVG・Grok Imagine 2.0・Grok Imagine旧モデル）を選ぶ、macOSのファイル選択から参照画像を指定する、進行状況や生成履歴を確認する場合 |
+| ネイティブSwiftUIアプリ | Prompt Batchを画面で調整する、エンジン（GPT ImageのApp Server・API・自動、Codex SVG・Grok Imagine 2.0・Grok Imagine旧モデル）とAPIのモデルを選ぶ、macOSのファイル選択から参照画像を指定する、進行状況や生成履歴を確認する場合 |
 | Codex・Claude Code/MCP | CodexタスクやClaude Codeセッションの文脈から生成する、プロジェクト固有のプロンプトやローカル参照ファイルを渡す、絶対パス付きの成果物を別工程へ引き渡す場合 |
 
 MCPから呼び出した場合もネイティブアプリが開き、両方の経路が同じローカルランタイムと
@@ -601,8 +648,9 @@ MCPツールは、アプリを起動する前にこの返答をします。ア�
 GPT Imageには2つの経路と、そのどちらかを選ぶエンジンがあります。
 
 - `app-server-image`は、ChatGPTのサブスクリプションでCodex App Server経由で描きます。
-- `openai-image-api`は、OpenAIのImage APIを直接呼びます（`gpt-image-2`、
-  `quality: "medium"`）。1枚ごとにAPIキーへ料金がかかります。キーはアプリの
+- `openai-image-api`は、OpenAIのImage APIを直接呼びます（`quality: "medium"`）。
+  リクエストが`model`で別のモデルを指定しない限り、`gpt-image-2.6-sunburst`で描きます
+  （後述）。1枚ごとにAPIキーへ料金がかかります。キーはアプリの
   「設定 › OpenAI API」で保存します。保存先はmacOSのキーチェーンで、渡す先はこのアプリの
   サーバーだけです（起動時は標準入力、変更時はループバック通信。引数や環境変数には入れません）。サーバーはキーをメモリにだけ
   持ち、マニフェスト・handoff・ログ・応答には書きません。キーがないときは、何も作る前に
@@ -623,6 +671,38 @@ GPT Imageには2つの経路と、そのどちらかを選ぶエンジンがあ�
 `app-server-image`が失敗しても（上限による失敗を含む）、ジョブをAPIの経路へ移すことは
 ありません。そのときのメッセージは、ユーザーの同意が要る選択肢としてAPIを挙げます。
 
+この断りには、`code`と並んで機械が読める`fallback`が付きます（例：`{"engine":
+"openai-image-api", "reason": "no_paid_chatgpt_plan", "billedPerImage": true,
+"apiKeyConfigured": true, "defaultModel": "gpt-image-2.6-sunburst"}`）。MCPツールは
+コードと`fallback`を呼び出し元のエージェントにそのまま渡し、エージェントはユーザーに聞いて、
+同意があればその経路で呼び直します。アプリが開いているかには左右されません。Grok CLIが
+サインイン切れ・プラン切れ・利用枠切れを返して失敗したGrokのジョブも、同じコードで終わります
+（Grokの節を参照）。アプリでは、「GPT Image（App Server）」の実行の前に
+`GET /api/gpt-image-route`を読みます。サブスクリプションで描けないとき、またはアプリから
+始めた実行のGrokジョブがこのコードで終わったときは、同じ内容をOpenAI APIで描き直すかを
+ダイアログで聞き、同意したときだけ描きます。
+
+**モデル**　`openai-image-api`の実行は、`model`でOpenAIの画像モデルを指定できます。
+ほかのエンジンにこの欄を付けると、黙って捨てずに`model_not_supported_for_engine`で断ります。
+英数字・ドット・ハイフン・アンダースコアだけのIDはそのままAPIへ送るので、GPT Imageの
+新しい版もOpenAIが出した時点で使えます。GPT Image 2.5と2.6には種類なしのIDがなく、
+`gpt-image-2.6-sunburst`・`gpt-image-2.6-flare`・`gpt-image-2.5-sunburst`・
+`gpt-image-2.5-flare`（と日付付きの版）のように種類が付きます。`gpt-image-2`には付きません。
+APIが知らないIDは`OpenAiImageModelUnavailable`で失敗し、料金はかかりません。
+`gpt-image-1.5`などの古いモデルは、下記の自由なサイズを断ることがあります。
+`GET /api/openai-image-models`は、保存したキーで使える`gpt-image`のIDを（OpenAIの
+`GET /v1/models`から）既定のモデルと一緒に返します。モデル一覧を読めない制限付きのキー
+（HTTP 403）には、2026-11-24時点で公式文書にあるIDを`"listed": false`付きで返します。
+最新の一覧にするには、キーに「List models: Read」の権限を付けます。アプリのモデル選択は
+この一覧を出し、IDの直接入力も受け付けます。
+
+**料金**　APIのジョブは、応答に入っていた使用トークンを`apiUsage`（`inputTokens`・
+`outputTokens`・入力のテキストと画像の内訳・`estimatedUsd`）として結果とマニフェストに
+記録します。推定額は、`gpt-image-2`・2.5・2.6の公式の標準単価（100万トークンあたり
+テキスト入力5ドル、画像入力8ドル、画像出力30ドル）で計算し、ほかのモデルには付けません。
+アプリは各カードと、結果一覧の上の今日の合計に表示します。普通のAPIキーで残高を読める
+公式の窓口はないため、残高はアプリからOpenAIの使用量の画面を開いて確認します。
+
 APIの経路には、App Serverの経路と同じプロンプトから、Codexのエージェントに画像ツールを
 呼ばせるための行を除いたものを送ります。サイズは1536×864（16:9）、1408×1056（4:3）、
 1024×1024（1:1）、1056×1408（3:4）、864×1536（9:16）で、編集は元画像のサイズのままです。
@@ -637,6 +717,13 @@ APIの経路には、App Serverの経路と同じプロンプトから、Codex�
 Imagineで描きます。`app-server-image`のジョブが上限で失敗したときは、エラーメッセージに
 その旨と、描き直す手段としてGrokエンジンと、課金にユーザーが同意した場合の
 `openai-image-api`が挙がります。エンジンが自動で切り替わることはありません。
+
+Grok CLIはプランの状態を外から返せないため、サインイン切れ・プラン切れ・Imagineの利用枠切れ
+（無料プランにも枠があります）は、ジョブが失敗したときに初めて分かります。CLIがエラーで
+終わり、その出力にそうした内容（not logged in、unauthorized、401/402/403、subscription、
+upgrade、usage limit、quotaなど）があるときは、`ImageOutputMissing`ではなく
+`OpenAiApiNeedsApproval`で終わり、App Serverの経路と同じようにOpenAI APIを提案できます。
+この判定はCLIの文言を読むもので、実際にプランが切れたときの文面はまだ確かめていません。
 
 - `grok-imagine-2`は、`GROK_IMAGE_GEN_MODEL_OVERRIDE`と`GROK_IMAGE_EDIT_MODEL_OVERRIDE`を
   設定して、Grok Imagine 2.0（`grok-imagine-image-2.0`）で描くようCLIに指定します。

@@ -67,8 +67,11 @@ Rust owns:
 - reference-image validation and staging;
 - manifest, handoff, and generated-file paths;
 - Codex App Server JSON-RPC transport and notification routing;
-- the OpenAI Image API call of the `openai-image-api` engine, and the choice
-  between it and the App Server route for `gpt-image`.
+- the OpenAI Image API call of the `openai-image-api` engine (its model, the
+  key's model list, and each job's usage and estimated price), and the choice
+  between it and the App Server route for `gpt-image`;
+- the `OpenAiApiNeedsApproval` answer and its `fallback` when a subscription
+  engine cannot draw, which the app and an agent both act on.
 
 The OpenAI API key belongs to the SwiftUI app, which keeps it in the macOS
 keychain and hands it to the server: on the server's standard input at launch
@@ -147,7 +150,12 @@ The following are public behavior and must remain stable at cutover:
   without an engine, once `app-server-image` and for a time the engine last
   chosen in the app, is now sent back with the question, and so is a
   generation without an aspect ratio, once `16:9`: Image Grid chooses neither,
-  and nothing chosen in the app reaches another caller's request);
+  and nothing chosen in the app reaches another caller's request;
+  `openai-image-api` first drew only with `gpt-image-2` and later took a
+  `model`, defaulting to `gpt-image-2.6-sunburst`, and records each job's
+  `apiUsage`; a subscription engine that cannot draw now answers with a
+  `fallback` beside `OpenAiApiNeedsApproval`, which a Grok job that lost its
+  access also ends with);
 - maximums: 12 prompts, 6 variants per prompt, 24 total jobs;
 - retry, timeout, rate-limit, missing-output, and diagnostic semantics;
 - manifest, handoff, generated image paths, and display-safe URLs (a lossy
