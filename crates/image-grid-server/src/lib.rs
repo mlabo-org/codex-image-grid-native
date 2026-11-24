@@ -321,6 +321,7 @@ fn router_with_state(state: RuntimeState) -> Router {
             axum::routing::put(set_openai_api_key),
         )
         .route("/api/gpt-image-route", get(gpt_image_route))
+        .route("/api/openai-image-models", get(openai_image_models))
         .layer(middleware::from_fn(reject_non_loopback_origin))
         .with_state(state)
 }
@@ -389,6 +390,23 @@ async fn set_openai_api_key(State(state): State<RuntimeState>, request: AxumRequ
         Json(json!({ "openaiApiKeyConfigured": configured })),
     )
         .into_response()
+}
+
+/// Lists the GPT Image models the saved API key can use, newest first, with
+/// the model a run uses when none is named.
+async fn openai_image_models(State(state): State<RuntimeState>) -> Response {
+    match state.generation.openai_image_models().await {
+        Ok(choices) => (
+            StatusCode::OK,
+            Json(json!({
+                "models": choices.models,
+                "listed": choices.listed,
+                "defaultModel": openai_image::DEFAULT_MODEL,
+            })),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, Json(error.body())).into_response(),
+    }
 }
 
 /// Reports which route a `gpt-image` run would take right now.
@@ -2162,6 +2180,7 @@ done
             upstream_status: Some("completed".to_owned()),
             diagnostic_log: String::new(),
             retry_count: 0,
+            api_usage: None,
             timing: runtime::JobTiming {
                 phase: "done".to_owned(),
                 phase_changed_at: 1,

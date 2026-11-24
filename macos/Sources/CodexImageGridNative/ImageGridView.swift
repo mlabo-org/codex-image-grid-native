@@ -104,6 +104,12 @@ struct ImageGridView: View {
     @AppStorage("imageGrid.resultLimit") private var resultLimit = ResultLimit.twentyFour
     @AppStorage("imageGrid.showFailed") private var showFailed = false
     @AppStorage("imageGrid.promptHistory") private var promptHistoryData = "[]"
+    /// The OpenAI image model picked for the API engine; empty means the
+    /// server's default.
+    @AppStorage("imageGrid.openAIImageModel") private var openAIImageModel = ""
+    @State private var openAIImageModels: [String] = []
+    @State private var openAIDefaultModel = "gpt-image-2.6-sunburst"
+    @State private var openAIImageModelsNote: String?
 
     @ObservedObject var store: ImageGridStore
     @StateObject private var draftPersistence = ImageGridDraftPersistence()
@@ -188,6 +194,27 @@ struct ImageGridView: View {
         .onPasteCommand(of: [.fileURL, .png, .jpeg, .webP]) { providers in
             pasteReference(providers: providers)
         }
+        .alert(
+            strings.apiFallbackTitle,
+            isPresented: Binding(
+                get: { store.apiFallbackOffer != nil },
+                set: { if !$0 { store.apiFallbackOffer = nil } }
+            ),
+            presenting: store.apiFallbackOffer
+        ) { offer in
+            Button(strings.apiFallbackAccept(model: selectedOpenAIImageModel)) {
+                Task { await store.acceptAPIFallback(offer, model: selectedOpenAIImageModel) }
+            }
+            Button(strings.cancel, role: .cancel) {}
+        } message: { offer in
+            Text(strings.apiFallbackMessage(offer))
+        }
+    }
+
+    /// The model an API run draws with: the user's pick when the key can
+    /// still use it, else the server's default.
+    private var selectedOpenAIImageModel: String {
+        openAIImageModel.isEmpty ? openAIDefaultModel : openAIImageModel
     }
 
     private var mainWorkspace: some View {
@@ -356,6 +383,31 @@ struct ImageGridView: View {
             await refreshEngineNote()
         }
 
+        if engine == .openAIImageAPI {
+            LabeledControl(strings.model) {
+                Picker(strings.model, selection: $openAIImageModel) {
+                    Text(strings.defaultModel(openAIDefaultModel)).tag("")
+                    ForEach(openAIImageModels.filter { $0 != openAIDefaultModel }, id: \.self) { model in
+                        Text(model).tag(model)
+                    }
+                    if !openAIImageModel.isEmpty, !openAIImageModels.contains(openAIImageModel) {
+                        Text(openAIImageModel).tag(openAIImageModel)
+                    }
+                }
+                .labelsHidden()
+                TextField(strings.customModelPlaceholder, text: $openAIImageModel)
+                    .textFieldStyle(.roundedBorder)
+                    .appFont(.caption)
+                if let openAIImageModelsNote {
+                    Text(openAIImageModelsNote)
+                        .appFont(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+
         LabeledControl(strings.count) {
             Picker(strings.count, selection: $count) {
                 ForEach(ImageGridContract.counts, id: \.self) { value in
@@ -381,6 +433,14 @@ struct ImageGridView: View {
         switch engine {
         case .openAIImageAPI:
             engineNote = strings.openAIImageAPINote
+            switch await store.openAIImageModels() {
+            case let .success(list):
+                openAIImageModels = list.models
+                openAIDefaultModel = list.defaultModel
+                openAIImageModelsNote = list.listed ? nil : strings.modelListNotPermitted
+            case let .failure(error):
+                openAIImageModelsNote = strings.modelListUnavailable(error.message)
+            }
         case .gptImage:
             engineNote = strings.gptImageRouteNote(await store.gptImageRoute())
         default:
@@ -639,7 +699,8 @@ struct ImageGridView: View {
             count: count,
             aspectRatio: aspectRatio.rawValue,
             referenceImagePath: referenceImage?.url.path,
-            operation: operation
+            operation: operation,
+            model: engine == .openAIImageAPI ? selectedOpenAIImageModel : nil
         )
         Task {
             if await store.generate(request: request, batch: promptMode == .batch) {
@@ -1049,6 +1110,20 @@ struct ImageGridView: View {
             ))
                 .appFont(.caption)
                 .foregroundStyle(.secondary)
+            apiSpendRow
+        }
+    }
+
+    /// Today's estimated OpenAI Image API spend. The API reports no balance
+    /// to an ordinary key, so the balance link opens OpenAI's own page.
+    private var apiSpendRow: some View {
+        let spend = store.estimatedAPISpend(since: Calendar.current.startOfDay(for: Date()))
+        return HStack(spacing: 8) {
+            Text(strings.apiSpendToday(spend))
+                .appFont(.caption)
+                .foregroundStyle(.secondary)
+            Link(strings.openAIUsagePage, destination: ImageGridOpenAIBilling.usagePage)
+                .appFont(.caption)
         }
     }
 
@@ -1107,6 +1182,12 @@ struct ImageGridView: View {
         }
     }
 
+}
+
+/// OpenAI publishes no balance endpoint for an ordinary API key, so the
+/// balance is shown on OpenAI's own page.
+enum ImageGridOpenAIBilling {
+    static let usagePage = URL(string: "https://platform.openai.com/settings/organization/usage")!
 }
 
 struct ImageGridStrings {
@@ -1361,6 +1442,75 @@ struct ImageGridStrings {
         case .grokImagine:
             localized("Grok Imagine（旧モデル）", "Grok Imagine (older model)")
         }
+    }
+
+    var model: String { localized("モデル", "Model") }
+
+    func defaultModel(_ model: String) -> String {
+        localized("既定（\(model)）", "Default (\(model))")
+    }
+
+    var customModelPlaceholder: String {
+        localized("モデル ID を直接入力（空なら既定）", "Type a model ID (empty: default)")
+    }
+
+    var modelListNotPermitted: String {
+        localized(
+            "この API キーにはモデル一覧を読む権限がないため、公式文書の一覧（2026-11-24 時点）を出しています。キーに Models の読み取り権限を足すと最新の一覧になります。新しい ID は上の欄に直接入力できます。",
+            "This API key may not list models, so the documented IDs (as of 2026-11-24) are shown. Give the key read access to Models for the live list, or type a newer ID above."
+        )
+    }
+
+    func modelListUnavailable(_ reason: String) -> String {
+        localized(
+            "使えるモデルの一覧を読めませんでした。既定のモデルで描きます（\(reason)）",
+            "Could not read the model list; the default model draws (\(reason))."
+        )
+    }
+
+    var apiFallbackTitle: String {
+        localized("サブスクでは描けませんでした", "The subscription could not draw this")
+    }
+
+    func apiFallbackMessage(_ offer: ImageGridAPIFallbackOffer) -> String {
+        let reason = offer.reason == "no_paid_chatgpt_plan"
+            ? localized(
+                "ChatGPT の有料プランが見つからないため、Codex では描けません。",
+                "Codex has no paid ChatGPT plan to draw with."
+            )
+            : localized(
+                "Grok のサインイン・プラン・利用枠のいずれかが切れて、描けませんでした。",
+                "Grok lost its sign-in, plan, or usage allowance and drew nothing."
+            )
+        let key = offer.apiKeyConfigured == false
+            ? localized(
+                " API キーが未設定です。先に「設定 › OpenAI API」で保存してください。",
+                " No API key is saved yet: save one under Settings › OpenAI API first."
+            )
+            : ""
+        return reason + localized(
+            "同じ内容を OpenAI API で描き直しますか？ 1枚ごとに料金がかかります（2.6 で約 $0.04/枚）。",
+            " Draw the same run with the OpenAI API? Each image is billed (about $0.04 each on 2.6)."
+        ) + key
+    }
+
+    func apiFallbackAccept(model: String) -> String {
+        localized("API で描く（\(model)）", "Draw with the API (\(model))")
+    }
+
+    func apiSpendToday(_ spend: ImageGridAPISpend) -> String {
+        let amount = String(format: "$%.3f", spend.usd)
+        let unpriced = spend.unpricedImages > 0
+            ? localized("、うち \(spend.unpricedImages) 枚は料金不明", ", \(spend.unpricedImages) unpriced")
+            : ""
+        return localized(
+            "API の推定料金（今日）：\(amount)・\(spend.images) 枚\(unpriced)",
+            "Estimated API spend today: \(amount) for \(spend.images) images\(unpriced)"
+        )
+    }
+
+    var openAIUsagePage: String {
+        localized("使用量と残高を OpenAI で見る", "Usage and balance on OpenAI")
     }
 
     var openAIImageAPINote: String {

@@ -181,6 +181,9 @@ pub struct ImageGridJob {
     pub diagnostic_log: String,
     pub retry_count: u32,
     pub timing: JobTiming,
+    /// Tokens and estimated price of an `openai-image-api` job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_usage: Option<openai_image::ApiUsage>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -235,6 +238,10 @@ pub(crate) enum DeleteRunsError {
 pub(crate) struct RunApiError {
     pub error: String,
     pub code: Option<String>,
+    /// Another engine that can draw the refused run, for a caller to offer
+    /// the user: the app shows it in a dialog, and an agent reads the same
+    /// field from the MCP result.
+    pub fallback: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -250,6 +257,7 @@ impl RunApiError {
         Self {
             error: error.into(),
             code: Some(code.into()),
+            fallback: None,
         }
     }
 
@@ -257,6 +265,7 @@ impl RunApiError {
         Self {
             error: error.into(),
             code: None,
+            fallback: None,
         }
     }
 
@@ -264,6 +273,9 @@ impl RunApiError {
         let mut body = json!({ "error": self.error });
         if let Some(code) = &self.code {
             body["code"] = Value::String(code.clone());
+        }
+        if let Some(fallback) = &self.fallback {
+            body["fallback"] = fallback.clone();
         }
         body
     }
@@ -278,7 +290,8 @@ struct NormalizedRunRequest {
     engine: String,
     /// Set only by the app, where the user picks the engine themselves. Such
     /// a run uses the engine as chosen: `gpt-image` may take the billed API
-    /// route, and `app-server-image` is tried without a plan check.
+    /// route, and `app-server-image` is tried without a plan check here (the
+    /// app checks the route itself and asks its user first).
     chosen_in_app: bool,
     aspect_ratio: String,
     /// The OpenAI image model an `openai-image-api` run draws with, when the
@@ -413,6 +426,8 @@ struct PersistedOutput {
     #[serde(default)]
     retry_count: u32,
     timing: JobTiming,
+    #[serde(default)]
+    api_usage: Option<openai_image::ApiUsage>,
     created_at: String,
     updated_at: String,
 }
@@ -610,6 +625,28 @@ impl GenerationRuntime {
             .clone()
     }
 
+    /// Lists the GPT Image models the saved API key can use, for the app's
+    /// model picker. Listing models is free and bills nothing.
+    pub(crate) async fn openai_image_models(
+        &self,
+    ) -> Result<openai_image::ModelChoices, RunApiError> {
+        let Some(api_key) = self.openai_api_key() else {
+            return Err(RunApiError::new(
+                "no OpenAI API key is saved, so the model list cannot be read",
+                "OpenAiApiKeyMissing",
+            ));
+        };
+        let base_url = self
+            .inner
+            .openai_base_url
+            .read()
+            .expect("OpenAI base URL lock poisoned")
+            .clone();
+        openai_image::list_image_models(&self.inner.openai_client, &base_url, &api_key)
+            .await
+            .map_err(|failure| RunApiError::new(failure.message, failure.code))
+    }
+
     /// Asks the Codex App Server for the signed-in account and reads the GPT
     /// Image route from its plan. A Codex that cannot answer picks no route:
     /// drawing through the API on a failed lookup would bill the user for a
@@ -665,7 +702,7 @@ API and bills each image: use it only after asking the user and getting a yes."
                 " No API key is saved yet: the user saves one in the Image Grid app's settings \
 first."
             };
-            RunApiError::new(
+            let mut error = RunApiError::new(
                 format!(
                     "Nothing was generated: Codex is not signed in to a paid ChatGPT plan, so \
 the subscription route cannot draw this run. The OpenAI API can draw it but bills each image. \
@@ -673,7 +710,18 @@ Ask the user whether to draw with the API; only if they agree, call again with e
 openai-image-api.{key} Do not switch to it without asking."
                 ),
                 "OpenAiApiNeedsApproval",
-            )
+            );
+            // Machine-readable, so the app and an agent decide from the same
+            // facts: which engine can draw, that it bills, and whether a key
+            // is saved for it.
+            error.fallback = Some(json!({
+                "engine": openai_image::API_ENGINE,
+                "reason": "no_paid_chatgpt_plan",
+                "billedPerImage": true,
+                "apiKeyConfigured": self.openai_api_key_configured(),
+                "defaultModel": openai_image::DEFAULT_MODEL,
+            }));
+            error
         };
         let engine = match request.engine.as_str() {
             openai_image::AUTO_ENGINE => match self.gpt_image_route().await? {
@@ -682,7 +730,9 @@ openai-image-api.{key} Do not switch to it without asking."
                 openai_image::Route::Api => return Err(needs_approval()),
             },
             // A plan that cannot be read is left to the App Server run itself,
-            // which reports why Codex is not ready.
+            // which reports why Codex is not ready. The app reads the route
+            // from `/api/gpt-image-route` before it submits, and asks its user
+            // in a dialog when the subscription cannot draw.
             "app-server-image"
                 if !request.chosen_in_app
                     && matches!(self.gpt_image_route().await, Ok(openai_image::Route::Api)) =>
@@ -1079,6 +1129,7 @@ app's settings",
                         diagnostic_log: String::new(),
                         retry_count: 0,
                         timing: JobTiming::queued(now),
+                        api_usage: None,
                         created_at: now,
                         updated_at: now,
                     });
@@ -1942,9 +1993,25 @@ app's settings",
                 return;
             }
 
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             let reply = result
                 .map(|result| result.text)
-                .unwrap_or_else(|| String::from_utf8_lossy(&output.stderr).trim().to_owned());
+                .unwrap_or_else(|| stderr.clone());
+            if !output.status.success() && grok_reports_lost_access(&format!("{reply}\n{stderr}")) {
+                self.fail_job(
+                    job_id,
+                    "OpenAiApiNeedsApproval",
+                    &format!(
+                        "Nothing was generated: the Grok CLI reported a sign-in, subscription, or \
+usage-limit problem, so Grok cannot draw this run ({}). The OpenAI API can draw it but bills each image. Ask \
+the user whether to draw with the API; only if they agree, call again with engine \
+openai-image-api. Do not switch to it without asking.",
+                        truncate_chars(&reply, 300)
+                    ),
+                )
+                .await;
+                return;
+            }
             let reason = if output.status.success() {
                 "Grok finished without saving an image"
             } else {
@@ -2099,7 +2166,7 @@ app's settings",
         let deadline = Instant::now() + self.inner.recovery.job_timeout;
         let mut shutdown = self.shutdown_receiver();
         let mut attempt = 0;
-        let bytes = loop {
+        let (bytes, usage) = loop {
             attempt += 1;
             self.update_job(job_id, |job, now| {
                 job.status = "running".to_owned();
@@ -2116,7 +2183,7 @@ app's settings",
                 ) => sent,
             };
             let failure = match sent {
-                Ok(Ok(bytes)) => break bytes,
+                Ok(Ok(sent)) => break sent,
                 Ok(Err(failure)) => failure,
                 Err(_) => {
                     self.fail_job(
@@ -2162,6 +2229,9 @@ app's settings",
                 _ = sleep(retry_after) => {}
             }
         };
+        // Recorded before the image is installed, so the job is never seen
+        // done without the usage it was billed for.
+        self.update_job(job_id, |job, _| job.api_usage = usage).await;
         self.install_job_image(
             job_id,
             &job,
@@ -3699,6 +3769,7 @@ fn restore_persisted_output(
             diagnostic_log: output.diagnostic_log,
             retry_count: output.retry_count,
             timing,
+            api_usage: output.api_usage,
             created_at,
             updated_at,
         },
@@ -4143,6 +4214,7 @@ fn output_value(job: &ImageGridJob) -> Value {
         "diagnosticLog": job.diagnostic_log,
         "retryCount": job.retry_count,
         "timing": job.timing,
+        "apiUsage": job.api_usage,
         "createdAt": iso_time(job.created_at),
         "updatedAt": iso_time(job.updated_at)
     })
@@ -4665,6 +4737,37 @@ fn append_job_diagnostic(job: &mut ImageGridJob, entry: impl Into<String>) {
     };
     let reversed = combined.chars().rev().take(2400).collect::<String>();
     job.diagnostic_log = reversed.chars().rev().collect();
+}
+
+/// Whether a failed Grok CLI run says the account can no longer draw: signed
+/// out, or the plan that includes Grok Imagine has ended. Read only from a
+/// run that exited with an error, so a model reply that merely mentions a
+/// login is not taken for one.
+fn grok_reports_lost_access(output: &str) -> bool {
+    let text = output.to_ascii_lowercase();
+    [
+        "not logged in",
+        "not signed in",
+        "please log in",
+        "please sign in",
+        "grok login",
+        "unauthorized",
+        "401",
+        "402",
+        "403",
+        "payment required",
+        "subscription",
+        "supergrok",
+        "upgrade your plan",
+        "upgrade to",
+        // A free plan's Imagine allowance, or a paid plan's limit, used up.
+        "usage limit",
+        "limit reached",
+        "reached your limit",
+        "quota",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 fn rate_limit_code(code: &str, message: &str) -> Option<String> {
@@ -5210,6 +5313,7 @@ mod tests {
             diagnostic_log: String::new(),
             retry_count: 0,
             timing: JobTiming::queued(now),
+            api_usage: None,
             created_at: now,
             updated_at: now,
         }
@@ -5292,6 +5396,7 @@ mod tests {
             diagnostic_log: String::new(),
             retry_count: 0,
             timing: JobTiming::queued(now),
+            api_usage: None,
             created_at: now,
             updated_at: now,
         };
@@ -5752,6 +5857,7 @@ done
             diagnostic_log: "failure".to_owned(),
             retry_count: 0,
             timing,
+            api_usage: None,
             created_at: now,
             updated_at: now,
         };
@@ -6651,7 +6757,7 @@ done
                 let body = axum::body::to_bytes(request.into_body(), usize::MAX)
                     .await
                     .expect("request body");
-                let body = serde_json::from_slice(&body).expect("JSON request");
+                let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let index = {
                     let mut recorded = recorded.lock().expect("recorded calls");
                     recorded.push((path, authorization, body));
@@ -6774,13 +6880,56 @@ done
     }
 
     #[tokio::test]
+    async fn the_model_list_reads_the_key_listing_and_falls_back_when_the_key_may_not_list() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (runtime, _config) =
+            provider_free_runtime(&temporary, "#!/bin/sh\nexit 1\n", RecoveryConfig::default());
+        let (base_url, calls) = fake_image_api(vec![
+            (200, json!({"data": [{"id": "gpt-image-3-nova"}, {"id": "gpt-5.5"}]})),
+            (403, json!({})),
+        ])
+        .await;
+        point_openai_at(&runtime, base_url);
+        assert!(runtime.set_openai_api_key(Some("sk-test")));
+
+        let listed = runtime.openai_image_models().await.expect("listed");
+        assert!(listed.listed);
+        assert_eq!(listed.models, ["gpt-image-3-nova", "gpt-image-2.6-sunburst"]);
+        let restricted = runtime.openai_image_models().await.expect("restricted key");
+        assert!(!restricted.listed);
+        assert_eq!(restricted.models[0], openai_image::DEFAULT_MODEL);
+        assert_eq!(calls.lock().expect("calls")[0].0, "/v1/models");
+        runtime.shutdown().await;
+    }
+
+    #[test]
+    fn a_grok_run_that_lost_its_sign_in_or_plan_is_told_apart_from_other_failures() {
+        for output in [
+            "Error: not logged in. Run `grok login`.",
+            "HTTP 401 Unauthorized",
+            "Your SuperGrok subscription has ended",
+            "402 Payment Required",
+            "You have reached your limit for image generation",
+        ] {
+            assert!(grok_reports_lost_access(output), "{output}");
+        }
+        for output in ["model overloaded, try again", "Grok finished without a tool call", ""] {
+            assert!(!grok_reports_lost_access(output), "{output}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_named_model_reaches_the_image_api_and_the_records_and_other_engines_refuse_one() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let (runtime, config) =
             provider_free_runtime(&temporary, "#!/bin/sh\nexit 1\n", RecoveryConfig::default());
         let (base_url, calls) = fake_image_api(vec![(
             200,
-            json!({"data": [{"b64_json": ONE_PIXEL_PNG}]}),
+            json!({
+                "data": [{"b64_json": ONE_PIXEL_PNG}],
+                "usage": {"input_tokens": 1300, "output_tokens": 1000, "total_tokens": 2300,
+                    "input_tokens_details": {"text_tokens": 300, "image_tokens": 1000}}
+            }),
         )])
         .await;
         point_openai_at(&runtime, base_url);
@@ -6815,6 +6964,10 @@ done
         )
         .expect("manifest JSON");
         assert_eq!(manifest["request"]["model"], "gpt-image-2.6-flare");
+        assert_eq!(output["apiUsage"]["outputTokens"], 1000);
+        let usd = output["apiUsage"]["estimatedUsd"].as_f64().expect("estimate");
+        assert!((usd - 0.0395).abs() < 1e-9, "{usd}");
+        assert_eq!(manifest["outputs"][0]["apiUsage"]["inputTokens"], 1300);
 
         for (body, code) in [
             (
@@ -6964,6 +7117,10 @@ done
                 .await
                 .expect_err("no subscription to draw with");
             assert_eq!(error.code.as_deref(), Some("OpenAiApiNeedsApproval"), "{engine}");
+            let fallback = error.body()["fallback"].clone();
+            assert_eq!(fallback["engine"], "openai-image-api", "{engine}");
+            assert_eq!(fallback["reason"], "no_paid_chatgpt_plan", "{engine}");
+            assert_eq!(fallback["billedPerImage"], true, "{engine}");
             assert!(error.error.contains("Ask the user"), "{engine}");
             assert!(error.error.contains("openai-image-api"), "{engine}");
             assert!(!error.error.contains("No API key is saved"), "{engine}");

@@ -3,6 +3,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -80,6 +81,73 @@ impl ApiFailure {
             retry_after: None,
         }
     }
+}
+
+/// Tokens one Image API call used, as its response reported them, and the
+/// price they come to at the published rates when the model's rates are
+/// known.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub text_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub image_input_tokens: Option<u64>,
+    /// `None` when the model's rates are not in `rates_for_model`.
+    #[serde(default)]
+    pub estimated_usd: Option<f64>,
+}
+
+/// US dollars per million tokens.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rates {
+    text_input: f64,
+    image_input: f64,
+    image_output: f64,
+}
+
+/// The standard rates from developers.openai.com/api/docs/pricing, read on
+/// 2026-11-24: GPT Image 2, 2.5 and 2.6 (Sunburst and Flare) all charge $5
+/// text input, $8 image input and $30 image output per million tokens. A
+/// model outside that family gets no estimate rather than a guessed one.
+fn rates_for_model(model: &str) -> Option<Rates> {
+    model.starts_with("gpt-image-2").then_some(Rates {
+        text_input: 5.0,
+        image_input: 8.0,
+        image_output: 30.0,
+    })
+}
+
+/// Reads the `usage` object of a successful Image API response. Input tokens
+/// without a text/image split are priced at the image rate, the higher one,
+/// so an estimate never comes out below the bill.
+pub(crate) fn usage_from_response(model: &str, body: &[u8]) -> Option<ApiUsage> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let usage = value.get("usage")?;
+    let count = |pointer: &str| usage.pointer(pointer).and_then(Value::as_u64);
+    let input_tokens = count("/input_tokens")?;
+    let output_tokens = count("/output_tokens")?;
+    let text_input_tokens = count("/input_tokens_details/text_tokens");
+    let image_input_tokens = count("/input_tokens_details/image_tokens");
+    let estimated_usd = rates_for_model(model).map(|rates| {
+        let (text, image) = match (text_input_tokens, image_input_tokens) {
+            (Some(text), Some(image)) => (text, image),
+            _ => (0, input_tokens),
+        };
+        (text as f64 * rates.text_input
+            + image as f64 * rates.image_input
+            + output_tokens as f64 * rates.image_output)
+            / 1_000_000.0
+    });
+    Some(ApiUsage {
+        input_tokens,
+        output_tokens,
+        text_input_tokens,
+        image_input_tokens,
+        estimated_usd,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -267,13 +335,14 @@ pub(crate) fn classify_error(
     failure
 }
 
-/// Sends one Image API call and returns the image bytes.
+/// Sends one Image API call and returns the image bytes and the usage the
+/// response reported.
 pub(crate) async fn send(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     request: &ImageRequest,
-) -> Result<Vec<u8>, ApiFailure> {
+) -> Result<(Vec<u8>, Option<ApiUsage>), ApiFailure> {
     let transport = |error: reqwest::Error| {
         // `without_url` keeps the message to the failure itself; the request
         // carries the key only in a header, which reqwest never prints.
@@ -300,9 +369,101 @@ pub(crate) async fn send(
         .map(Duration::from_secs);
     let body = response.bytes().await.map_err(transport)?;
     if status.is_success() {
-        parse_image(&body)
+        let model = request.body["model"].as_str().unwrap_or_default();
+        Ok((parse_image(&body)?, usage_from_response(model, &body)))
     } else {
         Err(classify_error(status.as_u16(), &body, retry_after))
+    }
+}
+
+/// Keeps the image models from a `GET /models` listing, newest-looking first,
+/// with the default model always present so the app's picker can offer it
+/// even when the listing leaves it out.
+pub(crate) fn image_models_from_listing(body: &[u8]) -> Result<Vec<String>, ApiFailure> {
+    let value = serde_json::from_slice::<Value>(body).map_err(|_| {
+        ApiFailure::new(
+            "OpenAiImageApiFailed",
+            "the OpenAI model list was not valid JSON",
+        )
+    })?;
+    let mut models = value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model.get("id").and_then(Value::as_str))
+        .filter(|id| id.starts_with("gpt-image") || id.starts_with("chatgpt-image"))
+        .filter(|id| validate_model(id).is_ok())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if !models.iter().any(|id| id == DEFAULT_MODEL) {
+        models.push(DEFAULT_MODEL.to_owned());
+    }
+    models.sort_by(|a, b| b.cmp(a));
+    models.dedup();
+    Ok(models)
+}
+
+/// The GPT Image IDs in the OpenAI API reference on 2026-11-24, offered when
+/// the key may not list models. A newer ID still works when typed in, since
+/// runs pass any ID through.
+pub(crate) const KNOWN_MODELS: &[&str] = &[
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
+    "gpt-image-2",
+    "gpt-image-1.5",
+    "gpt-image-1-mini",
+];
+
+/// The models a picker can offer, and whether they came from the key's own
+/// listing (`false`: the key may not list models, so `KNOWN_MODELS`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelChoices {
+    pub models: Vec<String>,
+    pub listed: bool,
+}
+
+/// Lists the models the API key can use; free, and sends no image data. A
+/// key restricted from reading models (HTTP 401/403 on this endpoint only,
+/// while images still draw) gets the documented IDs instead of an error.
+pub(crate) async fn list_image_models(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<ModelChoices, ApiFailure> {
+    let response = client
+        .get(format!("{base_url}/models"))
+        .bearer_auth(api_key)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|error| {
+            ApiFailure::new(
+                "OpenAiImageApiFailed",
+                format!("could not reach the OpenAI API: {}", error.without_url()),
+            )
+        })?;
+    let status = response.status();
+    let body = response.bytes().await.map_err(|error| {
+        ApiFailure::new(
+            "OpenAiImageApiFailed",
+            format!("could not read the OpenAI model list: {}", error.without_url()),
+        )
+    })?;
+    if status.is_success() {
+        image_models_from_listing(&body).map(|models| ModelChoices {
+            models,
+            listed: true,
+        })
+    } else if status.as_u16() == 403 {
+        Ok(ModelChoices {
+            models: KNOWN_MODELS.iter().map(|id| (*id).to_owned()).collect(),
+            listed: false,
+        })
+    } else {
+        Err(classify_error(status.as_u16(), &body, None))
     }
 }
 
@@ -391,6 +552,50 @@ mod tests {
         for model in ["", "gpt image 2", "gpt-image-2/../x", &"a".repeat(65)] {
             assert!(validate_model(model).is_err(), "{model:?}");
         }
+    }
+
+    #[test]
+    fn the_model_list_keeps_image_models_and_always_offers_the_default() {
+        let listing = br#"{"object":"list","data":[
+            {"id":"gpt-5.5"},{"id":"gpt-image-2"},{"id":"gpt-image-2.6-flare"},
+            {"id":"dall-e-3"},{"id":"gpt-image-2.5-sunburst"},{"id":"chatgpt-image-latest"}
+        ]}"#;
+        assert_eq!(
+            image_models_from_listing(listing).expect("listing"),
+            [
+                "gpt-image-2.6-sunburst",
+                "gpt-image-2.6-flare",
+                "gpt-image-2.5-sunburst",
+                "gpt-image-2",
+                "chatgpt-image-latest"
+            ]
+        );
+        assert_eq!(
+            image_models_from_listing(br#"{"data":[]}"#).expect("empty"),
+            [DEFAULT_MODEL]
+        );
+        assert!(image_models_from_listing(b"x").is_err());
+    }
+
+    #[test]
+    fn usage_is_priced_at_the_published_rates_only_for_known_models() {
+        let body = br#"{"data":[],"usage":{"input_tokens":1300,"output_tokens":1000,"total_tokens":2300,
+            "input_tokens_details":{"text_tokens":300,"image_tokens":1000}}}"#;
+        let usage = usage_from_response("gpt-image-2.6-sunburst", body).expect("usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (1300, 1000));
+        // 300 x $5 + 1000 x $8 + 1000 x $30, per million tokens.
+        let usd = usage.estimated_usd.expect("estimate");
+        assert!((usd - 0.0395).abs() < 1e-9, "{usd}");
+
+        let unsplit = br#"{"usage":{"input_tokens":1000,"output_tokens":0}}"#;
+        let usd = usage_from_response("gpt-image-2", unsplit)
+            .and_then(|usage| usage.estimated_usd)
+            .expect("estimate");
+        assert!((usd - 0.008).abs() < 1e-9, "{usd}");
+
+        let unknown = usage_from_response("gpt-image-9-nova", body).expect("usage");
+        assert_eq!(unknown.estimated_usd, None);
+        assert_eq!(usage_from_response("gpt-image-2", br#"{"data":[]}"#), None);
     }
 
     #[test]

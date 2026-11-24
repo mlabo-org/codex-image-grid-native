@@ -86,6 +86,8 @@ struct ImageGridJob: Codable, Hashable, Identifiable, Sendable {
     var errorCode: String?
     var errorMessage: String?
     var diagnosticLog: String?
+    /// Tokens and estimated price of an OpenAI Image API job.
+    var apiUsage: ImageGridAPIUsage?
     var createdAt: ImageGridTimestamp?
     var updatedAt: ImageGridTimestamp?
 
@@ -142,9 +144,54 @@ struct ImageGridJob: Codable, Hashable, Identifiable, Sendable {
         errorCode = nil
         errorMessage = nil
         diagnosticLog = nil
+        apiUsage = nil
         createdAt = nil
         self.updatedAt = updatedAt
     }
+}
+
+/// What the server recorded from an OpenAI Image API response. The estimate
+/// is absent for a model whose published rates the server does not know.
+struct ImageGridAPIUsage: Codable, Hashable, Sendable {
+    let inputTokens: Int
+    let outputTokens: Int
+    var textInputTokens: Int?
+    var imageInputTokens: Int?
+    var estimatedUsd: Double?
+}
+
+/// The models the saved API key can use, from `/api/openai-image-models`.
+struct ImageGridOpenAIImageModels: Decodable, Equatable, Sendable {
+    let models: [String]
+    /// False when the key may not list models and these are the IDs the
+    /// server knows from OpenAI's documentation.
+    var listed: Bool = true
+    let defaultModel: String
+}
+
+/// A run the subscription could not draw, kept so the user can be asked
+/// whether to draw it again with the billed OpenAI API.
+struct ImageGridAPIFallbackOffer: Identifiable, Equatable, Sendable {
+    let id = UUID()
+    let request: ImageGridGenerationRequest
+    let batch: Bool
+    let reason: String
+    /// Nil when the window has not read it; drawing without a key is then
+    /// refused by the server with its own message.
+    let apiKeyConfigured: Bool?
+}
+
+struct ImageGridAPISpend: Equatable, Sendable {
+    var usd = 0.0
+    var images = 0
+    /// Images without a price: drawn before usage was recorded, or with a
+    /// model whose rates the server does not know.
+    var unpricedImages = 0
+}
+
+enum ImageGridAPIFallback {
+    /// The server's code for "nothing was drawn; the OpenAI API can draw it".
+    static let code = "OpenAiApiNeedsApproval"
 }
 
 struct ImageGridArtifactError: Codable, Equatable, Sendable {
@@ -186,11 +233,13 @@ struct ImageGridGenerationRequest: Encodable, Equatable, Sendable {
     let prompts: [String]?
     let referencePremise: String
     let mood: String
-    let engine: String
+    var engine: String
     let count: Int
     let aspectRatio: String
     var referenceImagePath: String?
     var operation: ImageGridOperation = .generate
+    /// The OpenAI image model, sent only with the `openai-image-api` engine.
+    var model: String?
     /// Tells the server the user picked this engine in the app themselves, so
     /// it runs as chosen: GPT Image (auto) may draw through the billed API,
     /// where the same engine from any other caller stops and asks first.
@@ -199,6 +248,14 @@ struct ImageGridGenerationRequest: Encodable, Equatable, Sendable {
     func usingReferenceImagePath(_ path: String?) -> Self {
         var copy = self
         copy.referenceImagePath = path
+        return copy
+    }
+
+    /// The same run drawn with the OpenAI Image API.
+    func usingOpenAIImageAPI(model: String?) -> Self {
+        var copy = self
+        copy.engine = "openai-image-api"
+        copy.model = model
         return copy
     }
 }
@@ -371,6 +428,10 @@ struct ImageGridSSEParser {
 
 struct ImageGridAPIError: LocalizedError, Equatable, Sendable {
     let message: String
+    /// The server's error code, when it sent one.
+    var code: String?
+    /// Whether the server named a fallback engine for a refused run.
+    var fallbackEngine: String?
 
     var errorDescription: String? { message }
 }
@@ -544,6 +605,10 @@ struct ImageGridAPIClient: Sendable {
         )
     }
 
+    func openAIImageModels() async throws -> ImageGridOpenAIImageModels {
+        try await send(path: "/api/openai-image-models")
+    }
+
     func gptImageRoute() async throws -> ImageGridGPTImageRoute {
         try await send(path: "/api/gpt-image-route")
     }
@@ -648,7 +713,12 @@ struct ImageGridAPIClient: Sendable {
             throw ImageGridAPIError(message: "The Image Grid server returned an invalid response.")
         }
         guard 200..<300 ~= http.statusCode else {
-            throw ImageGridAPIError(message: Self.errorMessage(from: data, status: http.statusCode))
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            throw ImageGridAPIError(
+                message: Self.errorMessage(from: data, status: http.statusCode),
+                code: object?["code"] as? String,
+                fallbackEngine: (object?["fallback"] as? [String: Any])?["engine"] as? String
+            )
         }
         do {
             return try decoder.decode(Response.self, from: data)
@@ -837,6 +907,9 @@ final class ImageGridStore: ObservableObject {
     @Published var generationMessage: String?
     @Published var referenceAnalysisMessage: String?
     @Published var deletionMessage: String?
+    /// A run the subscription could not draw, waiting for the user to say
+    /// whether to draw it with the billed OpenAI API.
+    @Published var apiFallbackOffer: ImageGridAPIFallbackOffer?
 
     let client: ImageGridAPIClient
     private var lifecycleTask: Task<Void, Never>?
@@ -850,6 +923,10 @@ final class ImageGridStore: ObservableObject {
     private var failureNoticeTracker = ImageGridFailureNoticeTracker()
     private var artifactErrorTracker = ImageGridArtifactErrorTracker()
     private var artifactErrorMessageOwnerRunID: String?
+    /// Runs this window submitted, so a job that later fails for lost
+    /// subscription access can be offered again through the API.
+    private var submittedRequests: [String: (request: ImageGridGenerationRequest, batch: Bool)] = [:]
+    private var offeredFallbackRunIDs: Set<String> = []
 
     init(
         client: ImageGridAPIClient = ImageGridAPIClient(),
@@ -936,9 +1013,24 @@ final class ImageGridStore: ObservableObject {
                 referenceLease?.path ?? request.referenceImagePath
             )
             if request.engine == "app-server-image" {
+                // The server leaves the plan check of an app run to the app,
+                // so its user can be asked before the billed API draws.
+                if case let .success(route) = await gptImageRoute(),
+                   route.engine == "openai-image-api"
+                {
+                    apiFallbackOffer = ImageGridAPIFallbackOffer(
+                        request: request, batch: batch,
+                        reason: "no_paid_chatgpt_plan",
+                        apiKeyConfigured: route.openaiApiKeyConfigured
+                    )
+                    return false
+                }
                 try await client.preflight()
             }
             let run = try await client.generate(request: request, batch: batch)
+            if let runID = run.runId {
+                submittedRequests[runID] = (request, batch)
+            }
             merge(run.hydratedJobs)
             recordArtifactError(runID: run.runId, run.artifactError)
             await refreshHealth()
@@ -946,10 +1038,68 @@ final class ImageGridStore: ObservableObject {
                 start()
             }
             return true
+        } catch let error as ImageGridAPIError where error.code == ImageGridAPIFallback.code {
+            apiFallbackOffer = ImageGridAPIFallbackOffer(
+                request: request, batch: batch,
+                reason: "no_paid_chatgpt_plan",
+                apiKeyConfigured: nil
+            )
+            return false
         } catch {
             generationMessage = error.localizedDescription
             return false
         }
+    }
+
+    /// Draws the offered run again with the OpenAI Image API.
+    func acceptAPIFallback(_ offer: ImageGridAPIFallbackOffer, model: String?) async {
+        apiFallbackOffer = nil
+        _ = await generate(request: offer.request.usingOpenAIImageAPI(model: model), batch: offer.batch)
+    }
+
+    /// The estimated OpenAI Image API spend of the jobs this window holds
+    /// that were created at or after `since`.
+    func estimatedAPISpend(since: Date) -> ImageGridAPISpend {
+        let threshold = Int64(since.timeIntervalSince1970 * 1000)
+        var spend = ImageGridAPISpend()
+        for job in jobs.values where job.engine == "openai-image-api" && job.status == "done" {
+            guard (job.createdAt?.milliseconds ?? job.eventTime) >= threshold else { continue }
+            spend.images += 1
+            if let usd = job.apiUsage?.estimatedUsd {
+                spend.usd += usd
+            } else {
+                spend.unpricedImages += 1
+            }
+        }
+        return spend
+    }
+
+    func openAIImageModels() async -> Result<ImageGridOpenAIImageModels, ImageGridAPIError> {
+        do {
+            return .success(try await client.openAIImageModels())
+        } catch let error as ImageGridAPIError {
+            return .failure(error)
+        } catch {
+            return .failure(ImageGridAPIError(message: error.localizedDescription))
+        }
+    }
+
+    /// Offers the API once per run when a job this window submitted failed
+    /// because its subscription engine could not draw (a Grok job that lost
+    /// its sign-in, plan, or allowance).
+    private func offerAPIFallbackIfNeeded(for job: ImageGridJob) {
+        guard job.errorCode == ImageGridAPIFallback.code,
+              apiFallbackOffer == nil,
+              let runID = job.runId,
+              !offeredFallbackRunIDs.contains(runID),
+              let submitted = submittedRequests[runID]
+        else { return }
+        offeredFallbackRunIDs.insert(runID)
+        apiFallbackOffer = ImageGridAPIFallbackOffer(
+            request: submitted.request, batch: submitted.batch,
+            reason: "subscription_engine_failed",
+            apiKeyConfigured: nil
+        )
     }
 
     func analyze(reference: ImageGridReference) async -> String? {
@@ -1208,6 +1358,7 @@ final class ImageGridStore: ObservableObject {
                 continue
             }
             failureNoticeTracker.observe(previous: existing, incoming: job)
+            offerAPIFallbackIfNeeded(for: job)
             mergedJobs[job.id] = job
         }
         let retained = ImageGridJobSelection.retained(

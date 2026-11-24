@@ -52,7 +52,12 @@ API and bills each image: use it only when the user has agreed to that charge
 for this request. When the user names a GPT Image version for it, pass the
 exact OpenAI model ID as `model` (2.5 and 2.6 need a variant, such as
 `gpt-image-2.6-sunburst` or `gpt-image-2.6-flare`); ask which variant when
-the user names only the version. When a result says the subscription cannot draw the run, or
+the user names only the version. A result with code `OpenAiApiNeedsApproval`
+(the subscription has no paid ChatGPT plan, or a Grok job lost its sign-in,
+plan, or usage allowance) means nothing was drawn and the OpenAI API can draw
+it: ask the user once whether to draw with `openai-image-api`, which bills
+each image, and only on a yes call again with that engine and the same
+prompts, reference, and aspect ratio. When a result says the subscription cannot draw the run, or
 that Codex image generation is rate-limited, tell the user and offer the
 options it names; do not rerun with another engine until the user says so.
 

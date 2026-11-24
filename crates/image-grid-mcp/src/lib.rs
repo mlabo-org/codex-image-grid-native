@@ -506,12 +506,7 @@ fn submit_generate_image_grid(
     )
     .map_err(|error| format!("Image Grid run submission failed: {error}"))?;
     if !(200..300).contains(&response.status) {
-        return Err(response
-            .data
-            .get("error")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("Image Grid HTTP {}", response.status)));
+        return Err(refusal_text(&response.data, response.status));
     }
     if !response.data.is_object() {
         return Err("Image Grid run submission returned an invalid JSON object".to_owned());
@@ -521,6 +516,25 @@ fn submit_generate_image_grid(
         &server,
         &config.image_grid_url,
     ))
+}
+
+/// Words a refused run for the calling agent. The code and any fallback the
+/// server named are kept, so an agent can act on them without the app: for
+/// `OpenAiApiNeedsApproval` it asks the user and, on a yes, calls again with
+/// the fallback engine.
+fn refusal_text(data: &Value, status: u16) -> String {
+    let mut text = data
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Image Grid HTTP {status}"));
+    if let Some(code) = data.get("code").and_then(Value::as_str) {
+        text.push_str(&format!("\ncode: {code}"));
+    }
+    if let Some(fallback) = data.get("fallback").filter(|value| value.is_object()) {
+        text.push_str(&format!("\nfallback: {fallback}"));
+    }
+    text
 }
 
 fn prepare_tool_arguments(arguments: &Value) -> Result<NormalizedArguments, String> {
@@ -2223,7 +2237,7 @@ pub fn tool_record() -> Value {
                 "engine": {
                     "type": "string",
                     "enum": ["app-server-image", "codex-svg", "grok-imagine-2", "grok-imagine", "gpt-image", "openai-image-api"],
-                    "description": "Always set this; Image Grid does not choose an engine and rejects a call without one. Use the engine the user or the calling workflow decided on; if neither has, ask the user instead of picking. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style. app-server-image draws with Codex image generation on the ChatGPT subscription. openai-image-api draws with the OpenAI Image API using the API key saved in the app and bills each image: use it only when the user agreed to that charge; its model is set by model. gpt-image is app-server-image under another name for callers: both stop with a question for the user, and never bill, when Codex has no paid ChatGPT plan. codex-svg writes SVG."
+                    "description": "Always set this; Image Grid does not choose an engine and rejects a call without one. Use the engine the user or the calling workflow decided on; if neither has, ask the user instead of picking. grok-imagine-2 draws with Grok Imagine 2.0 (grok-imagine-image-2.0) through the local Grok CLI. grok-imagine draws with the Grok CLI's older default Imagine model in a flatter cel style. app-server-image draws with Codex image generation on the ChatGPT subscription. openai-image-api draws with the OpenAI Image API using the API key saved in the app and bills each image: use it only when the user agreed to that charge; its model is set by model. gpt-image is app-server-image under another name for callers: both stop with a question for the user, and never bill, when Codex has no paid ChatGPT plan. That refusal, and a Grok job that failed for a lost sign-in, ended plan, or used-up limit, carry code OpenAiApiNeedsApproval (a refused call also names the fallback engine): ask the user whether to draw with openai-image-api, which bills each image, and only on a yes call again with that engine and the same prompts. codex-svg writes SVG."
                 },
                 "aspectRatio": {
                     "type": "string",
@@ -2362,6 +2376,22 @@ fn json_integer(value: &Value) -> Option<i128> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refusal_keeps_its_code_and_fallback_for_the_agent() {
+        let text = super::refusal_text(
+            &serde_json::json!({
+                "error": "Nothing was generated",
+                "code": "OpenAiApiNeedsApproval",
+                "fallback": {"engine": "openai-image-api", "billedPerImage": true}
+            }),
+            409,
+        );
+        assert!(text.starts_with("Nothing was generated"), "{text}");
+        assert!(text.contains("code: OpenAiApiNeedsApproval"), "{text}");
+        assert!(text.contains(r#""engine":"openai-image-api""#), "{text}");
+        assert_eq!(super::refusal_text(&serde_json::json!({}), 500), "Image Grid HTTP 500");
+    }
+
     use super::*;
     use std::io::Cursor;
     use std::net::TcpListener;

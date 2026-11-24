@@ -421,7 +421,8 @@ struct ResultCardView: View {
             ? "Prompt \(job.promptIndex ?? 1)/\(job.promptTotal ?? 1) · "
             : ""
         // The API route bills each image, so its cards say which route drew them.
-        let route = job.engine == "openai-image-api" ? " · API" : ""
+        let price = job.apiUsage?.estimatedUsd.map { String(format: " · ~$%.3f", $0) } ?? ""
+        let route = job.engine == "openai-image-api" ? " · API\(price)" : ""
         return "\(promptPart)Variant \(job.variant ?? 1)/\(job.total ?? 1) · \(job.model ?? job.engine ?? "job")\(route)"
     }
 
