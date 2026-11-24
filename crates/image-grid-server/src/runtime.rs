@@ -6905,7 +6905,11 @@ done
     #[test]
     fn a_grok_run_that_lost_its_sign_in_or_plan_is_told_apart_from_other_failures() {
         for output in [
-            "Error: not logged in. Run `grok login`.",
+            // What the Grok CLI printed when signed out (2026-11-24), as the
+            // run combines its reply and stderr.
+            "Not signed in. To authenticate without a browser, run:\n  grok login --device-code\n\n\
+Alternatively, set the XAI_API_KEY environment variable or run `grok login` on a machine with a browser.\n\
+Error: Not signed in. To authenticate without a browser, run:\n  grok login --device-code",
             "HTTP 401 Unauthorized",
             "Your SuperGrok subscription has ended",
             "402 Payment Required",
