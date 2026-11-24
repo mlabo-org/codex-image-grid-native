@@ -87,7 +87,11 @@ These hold for every call this skill makes, whichever engine draws.
   ponytail is on her left (viewer's right when she faces front); CodexVideo's
   chibi assets are drawn mirrored, so flip them before using one as a
   reference.
-- Anime women: state an average height (about 160 cm, 6 to 6.5 heads) and the
+- Anime women: with a character sheet as the reference, write no fixed head
+  count; tell the engine to keep the sheet's own proportions (head size, waist
+  height, torso-to-leg ratio), and check those against the sheet before small
+  details such as ribbons or fingers. Without a sheet, state about 160 cm and
+  5.5 heads, the user's taste. Either way add the
   line "NOT tall, NOT a model, NOT long-legged, NOT voluptuous", fix the style
   to clean 2D anime (no semi-real, 2.5D, or webtoon rendering), and do not
   stack glamour words or heels unless the user asks. "Not the generic face"
