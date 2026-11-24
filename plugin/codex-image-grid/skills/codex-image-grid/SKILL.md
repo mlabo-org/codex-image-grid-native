@@ -59,6 +59,42 @@ so a camera-angle change alone does not take effect. To change the angle,
 describe a clearly different pose in the same prompt. Check hands and small
 facial marks on Grok output before handing it over.
 
+## Prompt and result rules
+
+These hold for every call this skill makes, whichever engine draws.
+
+- Text in images: the engines invent fake characters wherever a label would
+  sit, even when the prompt excludes text, and the user never accepts them.
+  For any object that naturally carries text (breaker, switch, sign, screen,
+  button, book cover), either name the exact short text in the prompt
+  (「ラベルの文字は『非常停止』の4文字だけ、それ以外の文字は描かない」) or say the
+  plate is blank. Before handing results over, look at every label area; a
+  gibberish label means regenerating that image.
+- Variants: return every variant to the user. You may say which one you
+  recommend, but never drop one because it looks nearly identical to you. For
+  fine effects (blur, depth, line weight, skin texture) the user's eye decides;
+  describe what you see as an impression, not a fact.
+- Character references: choose each reference image one by one; never pass a
+  whole expression set. Drop images whose marks or props are not part of the
+  character's permanent look (anger marks, sweat drops, tears, blush effects):
+  the engines keep them as identity features. When the output will show the
+  full body and the references are bust-up icons, add one clean full-body
+  reference so the outfit below the chest is not invented.
+- Chibi じぴこ: pass her chibi character sheet,
+  `~/plugins/relaypress/skills/relaypress-image-builder/assets/jipiko-reference/chibi-character-sheet.jpg`,
+  as the only `referenceImagePath`, never her normal sheets (`variant-01.png`,
+  `variant-02.png`), which pull the figure back to full height. Her side
+  ponytail is on her left (viewer's right when she faces front); CodexVideo's
+  chibi assets are drawn mirrored, so flip them before using one as a
+  reference.
+- Anime women: state an average height (about 160 cm, 6 to 6.5 heads) and the
+  line "NOT tall, NOT a model, NOT long-legged, NOT voluptuous", fix the style
+  to clean 2D anime (no semi-real, 2.5D, or webtoon rendering), and do not
+  stack glamour words or heels unless the user asks. "Not the generic face"
+  means shifting the modern anime face's proportions toward human ones
+  (smaller eyes, a small visible nose bridge, a soft jaw), never adding
+  unhealthy or unkempt flaws; at most one small charm point such as a mole.
+
 For CodexVideo, RelayPress, or another parent workflow, return the tool's
 generated paths and handoff to the caller that requested the visuals. The
 native SwiftUI app opens automatically through this route. Do not start, call,
