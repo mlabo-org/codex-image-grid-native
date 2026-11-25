@@ -106,6 +106,29 @@ These hold for every call this skill makes, whichever engine draws.
   means shifting the modern anime face's proportions toward human ones
   (smaller eyes, a small visible nose bridge, a soft jaw), never adding
   unhealthy or unkempt flaws; at most one small charm point such as a mole.
+  The face the user accepted: eyes about 1/5 of the face width (do not enlarge
+  them), at the vertical middle of the head and one eye-width apart, one or
+  two small highlights; medium makeup (short eyeliner wing, brown shadow,
+  faint peach blush, rose-pink lips), no round red cheeks.
+- Camera and action: no low angle that looks up a skirt. Give a character one
+  action per image; a separate task for each hand has produced a third arm.
+- Laughing with tears (泣き笑い, 爆笑, 笑い泣き): describe the eye shape and the
+  tear position, not the emotion: 「目をぎゅっと閉じて笑い、目尻に小さな涙の粒」
+  plus the open laughing mouth. "Tears in the eyes" alone also comes back as
+  open eyes with tears running down the cheeks, which reads as crying.
+- DSLR-like blur (一眼レフ風): use `operation: edit` on the finished image and
+  ask for blur that grows with distance, not an evenly blurred background:
+  "physically correct depth of field, 85mm at f/2, blur increases smoothly and
+  continuously with distance"; focus plane at the subject, the ground under
+  the feet sharp and softening as it recedes; mid-distance objects only
+  moderately soft and still recognizable, far objects much more blurred; "Do
+  NOT blur everything evenly"; no out-of-focus leaves or objects in the
+  foreground or at the frame edges, no vignette, no fake bokeh balls; keep
+  the face, pose, outfit, colors, lighting and composition the same. Make 2
+  variants.
+- `app-server-image` batches: send 2–3 jobs per call and wait for each call to
+  finish before sending the next; parallel batches have hit
+  `429 Too Many Requests`.
 
 For CodexVideo, RelayPress, or another parent workflow, return the tool's
 generated paths and handoff to the caller that requested the visuals. The
