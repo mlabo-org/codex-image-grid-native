@@ -126,9 +126,11 @@ These hold for every call this skill makes, whichever engine draws.
   foreground or at the frame edges, no vignette, no fake bokeh balls; keep
   the face, pose, outfit, colors, lighting and composition the same. Make 2
   variants.
-- `app-server-image` batches: send 2–3 jobs per call and wait for each call to
-  finish before sending the next; parallel batches have hit
-  `429 Too Many Requests`.
+- `app-server-image` calls: never run calls in parallel, and wait for each
+  call to finish before sending the next; parallel batches have hit
+  `429 Too Many Requests`. A batch object prepared by a calling workflow
+  (RelayPress, CodexVideo) goes as it is, one call at a time. When you compose
+  the calls yourself, keep each to 2–3 jobs.
 
 For CodexVideo, RelayPress, or another parent workflow, return the tool's
 generated paths and handoff to the caller that requested the visuals. The
